@@ -9,7 +9,6 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using MimeKit;
-using vizo_backend.Data;
 using vizo_backend.Models;
 
 /* "Claim" is a warranty claim in this domain, so the security one needs a
@@ -29,11 +28,16 @@ public class AuthController : ControllerBase
 {
     private readonly AppDbContext _db;
     private readonly IConfiguration _cfg;
+    private readonly ILogger<AuthController> _logger;
+    private readonly IWebHostEnvironment _env;
 
-    public AuthController(AppDbContext db, IConfiguration cfg)
+    public AuthController(AppDbContext db, IConfiguration cfg,
+        ILogger<AuthController> logger, IWebHostEnvironment env)
     {
         _db = db;
         _cfg = cfg;
+        _logger = logger;
+        _env = env;
     }
 
     /* PostgreSQL columns here are "timestamp without time zone". Npgsql refuses
@@ -48,49 +52,56 @@ public class AuthController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> Login([FromBody] LoginRequest body)
     {
-        if (string.IsNullOrWhiteSpace(body.Email) || string.IsNullOrWhiteSpace(body.Password))
-            return BadRequest(new { message = "Email and password are required." });
-
-        var email = body.Email.Trim().ToLowerInvariant();
-
-        var user = await _db.Users
-            .Include(u => u.Role)
-            .Include(u => u.Employee)
-            .FirstOrDefaultAsync(u => u.Email != null && u.Email.ToLower() == email);
-
-        /* One message for "no such account" and "wrong password" alike -- a
-           different reply for each tells an attacker which addresses exist. */
-        if (user is null || string.IsNullOrEmpty(user.PasswordHash) ||
-            !BCrypt.Net.BCrypt.Verify(body.Password, user.PasswordHash))
-            return Unauthorized(new { message = "Email or password is incorrect." });
-
-        if (!user.IsActive)
-            return StatusCode(403, new { message = "This account has been deactivated. Contact your administrator." });
-
-        if (user.Employee is not null && user.Employee.IsLocked)
-            return StatusCode(423, new { message = "This account is locked.", locked = true });
-
-        /* Only staff sign in. Customers and suppliers are records, not logins. */
-        if (!user.Role.IsStaffRole)
-            return StatusCode(403, new { message = "This account cannot sign in to the portal." });
-
-        if (user.Employee is not null)
+        try
         {
-            user.Employee.LastLoginAt = Now();
-            await _db.SaveChangesAsync();
+            if (string.IsNullOrWhiteSpace(body.Email) || string.IsNullOrWhiteSpace(body.Password))
+                return BadRequest(new { message = "Email and password are required." });
+
+            var email = body.Email.Trim().ToLowerInvariant();
+
+            var user = await _db.Users
+                .Include(u => u.Role)
+                .Include(u => u.Employee)
+                .FirstOrDefaultAsync(u => u.Email != null && u.Email.ToLower() == email);
+
+            /* One message for "no such account" and "wrong password" alike -- a
+               different reply for each tells an attacker which addresses exist. */
+            if (user is null || string.IsNullOrEmpty(user.PasswordHash) ||
+                !BCrypt.Net.BCrypt.Verify(body.Password, user.PasswordHash))
+                return Unauthorized(new { message = "Email or password is incorrect." });
+
+            if (!user.IsActive)
+                return StatusCode(403, new { message = "This account has been deactivated. Contact your administrator." });
+
+            if (user.Employee is not null && user.Employee.IsLocked)
+                return StatusCode(423, new { message = "This account is locked.", locked = true });
+
+            /* Only staff sign in. Customers and suppliers are records, not logins. */
+            if (!user.Role.IsStaffRole)
+                return StatusCode(403, new { message = "This account cannot sign in to the portal." });
+
+            if (user.Employee is not null)
+            {
+                user.Employee.LastLoginAt = Now();
+                await _db.SaveChangesAsync();
+            }
+
+            await WriteLog(user.UserId, "LOGIN", "UserSession", user.Email!, "Signed in", 5);
+
+            var permissions = await PermissionsFor(user.RoleId);
+            var (token, expiresAt) = IssueToken(user, permissions);
+
+            return Ok(new
+            {
+                token,
+                expiresAt,
+                user = ShapeUser(user, permissions)
+            });
         }
-
-        await WriteLog(user.UserId, "LOGIN", "UserSession", user.Email!, "Signed in", 5);
-
-        var permissions = await PermissionsFor(user.RoleId);
-        var (token, expiresAt) = IssueToken(user, permissions);
-
-        return Ok(new
+        catch (Exception ex)
         {
-            token,
-            expiresAt,
-            user = ShapeUser(user, permissions)
-        });
+            return Fail(ex, "save C:/Program Files/Git/api/auth/login");
+        }
     }
 
     /* ═════════════════════════════ ME ════════════════════════════════ */
@@ -99,18 +110,25 @@ public class AuthController : ControllerBase
     [Authorize]
     public async Task<IActionResult> Me()
     {
-        var id = CurrentUserId();
-        if (id is null) return Unauthorized();
+        try
+        {
+            var id = CurrentUserId();
+            if (id is null) return Unauthorized();
 
-        var user = await _db.Users
-            .Include(u => u.Role)
-            .Include(u => u.Employee)
-            .FirstOrDefaultAsync(u => u.UserId == id);
+            var user = await _db.Users
+                .Include(u => u.Role)
+                .Include(u => u.Employee)
+                .FirstOrDefaultAsync(u => u.UserId == id);
 
-        if (user is null || !user.IsActive) return Unauthorized();
+            if (user is null || !user.IsActive) return Unauthorized();
 
-        var permissions = await PermissionsFor(user.RoleId);
-        return Ok(ShapeUser(user, permissions));
+            var permissions = await PermissionsFor(user.RoleId);
+            return Ok(ShapeUser(user, permissions));
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load C:/Program Files/Git/api/auth/me");
+        }
     }
 
     /* ══════════════════════ FORGOT PASSWORD ══════════════════════════ */
@@ -178,10 +196,17 @@ public class AuthController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> VerifyCode([FromBody] VerifyCodeRequest body)
     {
-        var check = await FindUsableCode(body.Email, body.Code);
-        if (check.Error is not null) return BadRequest(new { message = check.Error });
+        try
+        {
+            var check = await FindUsableCode(body.Email, body.Code);
+            if (check.Error is not null) return BadRequest(new { message = check.Error });
 
-        return Ok(new { message = "Code accepted.", valid = true });
+            return Ok(new { message = "Code accepted.", valid = true });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save C:/Program Files/Git/api/auth/verify-code");
+        }
     }
 
     /// <summary>Step 3. Spends the code and sets the new password.</summary>
@@ -189,29 +214,36 @@ public class AuthController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordRequest body)
     {
-        var problem = ValidatePassword(body.NewPassword);
-        if (problem is not null) return BadRequest(new { message = problem });
+        try
+        {
+            var problem = ValidatePassword(body.NewPassword);
+            if (problem is not null) return BadRequest(new { message = problem });
 
-        var check = await FindUsableCode(body.Email, body.Code);
-        if (check.Error is not null) return BadRequest(new { message = check.Error });
+            var check = await FindUsableCode(body.Email, body.Code);
+            if (check.Error is not null) return BadRequest(new { message = check.Error });
 
-        var entry = check.Entry!;
-        var user = await _db.Users.FirstAsync(u => u.UserId == entry.UserId);
+            var entry = check.Entry!;
+            var user = await _db.Users.FirstAsync(u => u.UserId == entry.UserId);
 
-        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(body.NewPassword, 11);
-        entry.ConsumedAt = Now();
+            user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(body.NewPassword, 11);
+            entry.ConsumedAt = Now();
 
-        /* Everything else outstanding dies with it. */
-        var others = await _db.PasswordResetCodes
-            .Where(c => c.UserId == user.UserId && c.ConsumedAt == null)
-            .ToListAsync();
-        foreach (var o in others) o.ConsumedAt = Now();
+            /* Everything else outstanding dies with it. */
+            var others = await _db.PasswordResetCodes
+                .Where(c => c.UserId == user.UserId && c.ConsumedAt == null)
+                .ToListAsync();
+            foreach (var o in others) o.ConsumedAt = Now();
 
-        await _db.SaveChangesAsync();
-        await WriteLog(user.UserId, "PASSWORD_RESET", "User", user.Email ?? user.FullName,
-                       "Password reset with an emailed code", 3);
+            await _db.SaveChangesAsync();
+            await WriteLog(user.UserId, "PASSWORD_RESET", "User", user.Email ?? user.FullName,
+                           "Password reset with an emailed code", 3);
 
-        return Ok(new { message = "Password updated. You can sign in with it now." });
+            return Ok(new { message = "Password updated. You can sign in with it now." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save C:/Program Files/Git/api/auth/reset-password");
+        }
     }
 
     /// <summary>Signed-in change, current password required.</summary>
@@ -219,25 +251,32 @@ public class AuthController : ControllerBase
     [Authorize]
     public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest body)
     {
-        var id = CurrentUserId();
-        if (id is null) return Unauthorized();
+        try
+        {
+            var id = CurrentUserId();
+            if (id is null) return Unauthorized();
 
-        var problem = ValidatePassword(body.NewPassword);
-        if (problem is not null) return BadRequest(new { message = problem });
+            var problem = ValidatePassword(body.NewPassword);
+            if (problem is not null) return BadRequest(new { message = problem });
 
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.UserId == id);
-        if (user is null) return Unauthorized();
+            var user = await _db.Users.FirstOrDefaultAsync(u => u.UserId == id);
+            if (user is null) return Unauthorized();
 
-        if (string.IsNullOrEmpty(user.PasswordHash) ||
-            !BCrypt.Net.BCrypt.Verify(body.CurrentPassword, user.PasswordHash))
-            return BadRequest(new { message = "Your current password is not right." });
+            if (string.IsNullOrEmpty(user.PasswordHash) ||
+                !BCrypt.Net.BCrypt.Verify(body.CurrentPassword, user.PasswordHash))
+                return BadRequest(new { message = "Your current password is not right." });
 
-        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(body.NewPassword, 11);
-        await _db.SaveChangesAsync();
-        await WriteLog(user.UserId, "PASSWORD_CHANGE", "User", user.Email ?? user.FullName,
-                       "Password changed from the profile screen", 1);
+            user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(body.NewPassword, 11);
+            await _db.SaveChangesAsync();
+            await WriteLog(user.UserId, "PASSWORD_CHANGE", "User", user.Email ?? user.FullName,
+                           "Password changed from the profile screen", 1);
 
-        return Ok(new { message = "Password updated." });
+            return Ok(new { message = "Password updated." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save C:/Program Files/Git/api/auth/change-password");
+        }
     }
 
     /// <summary>Bookkeeping only. The token is a bearer credential: the client
@@ -246,10 +285,17 @@ public class AuthController : ControllerBase
     [Authorize]
     public async Task<IActionResult> Logout()
     {
-        var id = CurrentUserId();
-        if (id is not null)
-            await WriteLog(id.Value, "LOGOUT", "UserSession", User.FindFirstValue(ClaimTypes.Email) ?? "", "Signed out", 5);
-        return Ok(new { message = "Signed out." });
+        try
+        {
+            var id = CurrentUserId();
+            if (id is not null)
+                await WriteLog(id.Value, "LOGOUT", "UserSession", User.FindFirstValue(ClaimTypes.Email) ?? "", "Signed out", 5);
+            return Ok(new { message = "Signed out." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save C:/Program Files/Git/api/auth/logout");
+        }
     }
 
     /* ═════════════════════════ helpers ═══════════════════════════════ */
@@ -438,4 +484,30 @@ public class AuthController : ControllerBase
     public record VerifyCodeRequest(string Email, string Code);
     public record ResetPasswordRequest(string Email, string Code, string NewPassword);
     public record ChangePasswordRequest(string CurrentPassword, string NewPassword);
+
+    /// <summary>
+    /// The single failure path for this controller.
+    ///
+    /// Logs the whole exception server-side, then answers with JSON the screen
+    /// can show: what was being attempted, and the real message off the BASE
+    /// exception -- Npgsql puts the useful text there (a constraint name, a
+    /// null violation) while the outer DbUpdateException only ever says
+    /// "An error occurred while saving the entity changes".
+    ///
+    /// The stack trace is attached in Development only.
+    /// </summary>
+    private IActionResult Fail(Exception ex, string what)
+    {
+        _logger.LogError(ex, "Failed to {What} ({Method} {Path})",
+            what, Request.Method, Request.Path);
+
+        return StatusCode(500, new
+        {
+            message = $"Could not {what}.",
+            error = ex.GetBaseException().Message,
+            type = ex.GetBaseException().GetType().Name,
+            detail = _env.IsDevelopment() ? ex.ToString() : null
+        });
+    }
+
 }

@@ -24,7 +24,16 @@ namespace vizo_backend.Controllers;
 public class UploadController : ControllerBase
 {
     private readonly IConfiguration _cfg;
-    public UploadController(IConfiguration cfg) => _cfg = cfg;
+    private readonly ILogger<UploadController> _logger;
+    private readonly IWebHostEnvironment _env;
+
+    public UploadController(IConfiguration cfg,
+        ILogger<UploadController> logger, IWebHostEnvironment env)
+    {
+        _cfg = cfg;
+        _logger = logger;
+        _env = env;
+    }
 
     private const long MaxImageBytes = 5 * 1024 * 1024;   //  5 MB
     private const long MaxPdfBytes = 15 * 1024 * 1024;    // 15 MB
@@ -46,47 +55,54 @@ public class UploadController : ControllerBase
     [RequestSizeLimit(MaxImageBytes + 1024)]
     public async Task<IActionResult> UploadImage(IFormFile? file, [FromQuery] string? folder)
     {
-        if (file is null || file.Length == 0)
-            return BadRequest(new { message = "Choose a file to upload." });
-
-        if (file.Length > MaxImageBytes)
-            return BadRequest(new { message = "Images must be 5 MB or smaller." });
-
-        var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
-        if (!ImageExtensions.Contains(ext))
-            return BadRequest(new { message = "Only JPG, PNG, WEBP and GIF images are accepted." });
-
-        await using var stream = file.OpenReadStream();
-        if (!await LooksLikeImage(stream))
-            return BadRequest(new { message = "That file is not a real image." });
-        stream.Position = 0;
-
-        var section = _cfg.GetSection("CloudinaryImages");
-        var target = string.IsNullOrWhiteSpace(folder)
-            ? section["Folder"] ?? "advpos/images"
-            : $"{section["Folder"]}/{folder.Trim('/')}";
-
-        var result = await BuildClient("CloudinaryImages").UploadAsync(new ImageUploadParams
+        try
         {
-            File = new FileDescription(file.FileName, stream),
-            Folder = target,
-            UseFilename = true,
-            UniqueFilename = true,
-            Overwrite = false
-        });
+            if (file is null || file.Length == 0)
+                return BadRequest(new { message = "Choose a file to upload." });
 
-        if (result.Error is not null)
-            return StatusCode(502, new { message = $"Cloudinary rejected the upload: {result.Error.Message}" });
+            if (file.Length > MaxImageBytes)
+                return BadRequest(new { message = "Images must be 5 MB or smaller." });
 
-        return Ok(new
+            var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
+            if (!ImageExtensions.Contains(ext))
+                return BadRequest(new { message = "Only JPG, PNG, WEBP and GIF images are accepted." });
+
+            await using var stream = file.OpenReadStream();
+            if (!await LooksLikeImage(stream))
+                return BadRequest(new { message = "That file is not a real image." });
+            stream.Position = 0;
+
+            var section = _cfg.GetSection("CloudinaryImages");
+            var target = string.IsNullOrWhiteSpace(folder)
+                ? section["Folder"] ?? "advpos/images"
+                : $"{section["Folder"]}/{folder.Trim('/')}";
+
+            var result = await BuildClient("CloudinaryImages").UploadAsync(new ImageUploadParams
+            {
+                File = new FileDescription(file.FileName, stream),
+                Folder = target,
+                UseFilename = true,
+                UniqueFilename = true,
+                Overwrite = false
+            });
+
+            if (result.Error is not null)
+                return StatusCode(502, new { message = $"Cloudinary rejected the upload: {result.Error.Message}" });
+
+            return Ok(new
+            {
+                url = result.SecureUrl?.ToString(),
+                publicId = result.PublicId,
+                width = result.Width,
+                height = result.Height,
+                format = result.Format,
+                bytes = result.Bytes
+            });
+        }
+        catch (Exception ex)
         {
-            url = result.SecureUrl?.ToString(),
-            publicId = result.PublicId,
-            width = result.Width,
-            height = result.Height,
-            format = result.Format,
-            bytes = result.Bytes
-        });
+            return Fail(ex, "save C:/Program Files/Git/api/upload/image");
+        }
     }
 
     /* ──────────────────────────── PDFs ──────────────────────────── */
@@ -96,46 +112,53 @@ public class UploadController : ControllerBase
     [RequestSizeLimit(MaxPdfBytes + 1024)]
     public async Task<IActionResult> UploadPdf(IFormFile? file, [FromQuery] string? folder)
     {
-        if (file is null || file.Length == 0)
-            return BadRequest(new { message = "Choose a file to upload." });
-
-        if (file.Length > MaxPdfBytes)
-            return BadRequest(new { message = "PDFs must be 15 MB or smaller." });
-
-        if (!Path.GetExtension(file.FileName).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
-            return BadRequest(new { message = "Only PDF files are accepted here." });
-
-        await using var stream = file.OpenReadStream();
-        if (!await LooksLikePdf(stream))
-            return BadRequest(new { message = "That file is not a real PDF." });
-        stream.Position = 0;
-
-        var section = _cfg.GetSection("CloudinaryPdfs");
-        var target = string.IsNullOrWhiteSpace(folder)
-            ? section["Folder"] ?? "advpos/documents"
-            : $"{section["Folder"]}/{folder.Trim('/')}";
-
-        /* A PDF is a raw asset, not an image, so it must not go through
-           ImageUploadParams -- Cloudinary would try to rasterise it. */
-        var result = await BuildClient("CloudinaryPdfs").UploadAsync(new RawUploadParams
+        try
         {
-            File = new FileDescription(file.FileName, stream),
-            Folder = target,
-            UseFilename = true,
-            UniqueFilename = true,
-            Overwrite = false
-        });
+            if (file is null || file.Length == 0)
+                return BadRequest(new { message = "Choose a file to upload." });
 
-        if (result.Error is not null)
-            return StatusCode(502, new { message = $"Cloudinary rejected the upload: {result.Error.Message}" });
+            if (file.Length > MaxPdfBytes)
+                return BadRequest(new { message = "PDFs must be 15 MB or smaller." });
 
-        return Ok(new
+            if (!Path.GetExtension(file.FileName).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+                return BadRequest(new { message = "Only PDF files are accepted here." });
+
+            await using var stream = file.OpenReadStream();
+            if (!await LooksLikePdf(stream))
+                return BadRequest(new { message = "That file is not a real PDF." });
+            stream.Position = 0;
+
+            var section = _cfg.GetSection("CloudinaryPdfs");
+            var target = string.IsNullOrWhiteSpace(folder)
+                ? section["Folder"] ?? "advpos/documents"
+                : $"{section["Folder"]}/{folder.Trim('/')}";
+
+            /* A PDF is a raw asset, not an image, so it must not go through
+               ImageUploadParams -- Cloudinary would try to rasterise it. */
+            var result = await BuildClient("CloudinaryPdfs").UploadAsync(new RawUploadParams
+            {
+                File = new FileDescription(file.FileName, stream),
+                Folder = target,
+                UseFilename = true,
+                UniqueFilename = true,
+                Overwrite = false
+            });
+
+            if (result.Error is not null)
+                return StatusCode(502, new { message = $"Cloudinary rejected the upload: {result.Error.Message}" });
+
+            return Ok(new
+            {
+                url = result.SecureUrl?.ToString(),
+                publicId = result.PublicId,
+                bytes = result.Bytes,
+                originalName = file.FileName
+            });
+        }
+        catch (Exception ex)
         {
-            url = result.SecureUrl?.ToString(),
-            publicId = result.PublicId,
-            bytes = result.Bytes,
-            originalName = file.FileName
-        });
+            return Fail(ex, "save C:/Program Files/Git/api/upload/pdf");
+        }
     }
 
     /* ─────────────────────────── DELETE ─────────────────────────── */
@@ -144,21 +167,35 @@ public class UploadController : ControllerBase
     [Authorize(Policy = "SuperAdmin")]
     public async Task<IActionResult> DeleteImage([FromQuery] string publicId)
     {
-        if (string.IsNullOrWhiteSpace(publicId)) return BadRequest(new { message = "publicId is required." });
-        var r = await BuildClient("CloudinaryImages").DestroyAsync(new DeletionParams(publicId));
-        return Ok(new { result = r.Result });
+        try
+        {
+            if (string.IsNullOrWhiteSpace(publicId)) return BadRequest(new { message = "publicId is required." });
+            var r = await BuildClient("CloudinaryImages").DestroyAsync(new DeletionParams(publicId));
+            return Ok(new { result = r.Result });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "delete C:/Program Files/Git/api/upload/image");
+        }
     }
 
     [HttpDelete("pdf")]
     [Authorize(Policy = "SuperAdmin")]
     public async Task<IActionResult> DeletePdf([FromQuery] string publicId)
     {
-        if (string.IsNullOrWhiteSpace(publicId)) return BadRequest(new { message = "publicId is required." });
-        var r = await BuildClient("CloudinaryPdfs").DestroyAsync(new DeletionParams(publicId)
+        try
         {
-            ResourceType = ResourceType.Raw
-        });
-        return Ok(new { result = r.Result });
+            if (string.IsNullOrWhiteSpace(publicId)) return BadRequest(new { message = "publicId is required." });
+            var r = await BuildClient("CloudinaryPdfs").DestroyAsync(new DeletionParams(publicId)
+            {
+                ResourceType = ResourceType.Raw
+            });
+            return Ok(new { result = r.Result });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "delete C:/Program Files/Git/api/upload/pdf");
+        }
     }
 
     /* ───────────────────── magic-byte checks ────────────────────── */
@@ -189,4 +226,30 @@ public class UploadController : ControllerBase
         // "%PDF-"
         return read == 5 && head[0] == 0x25 && head[1] == 0x50 && head[2] == 0x44 && head[3] == 0x46 && head[4] == 0x2D;
     }
+
+    /// <summary>
+    /// The single failure path for this controller.
+    ///
+    /// Logs the whole exception server-side, then answers with JSON the screen
+    /// can show: what was being attempted, and the real message off the BASE
+    /// exception -- Npgsql puts the useful text there (a constraint name, a
+    /// null violation) while the outer DbUpdateException only ever says
+    /// "An error occurred while saving the entity changes".
+    ///
+    /// The stack trace is attached in Development only.
+    /// </summary>
+    private IActionResult Fail(Exception ex, string what)
+    {
+        _logger.LogError(ex, "Failed to {What} ({Method} {Path})",
+            what, Request.Method, Request.Path);
+
+        return StatusCode(500, new
+        {
+            message = $"Could not {what}.",
+            error = ex.GetBaseException().Message,
+            type = ex.GetBaseException().GetType().Name,
+            detail = _env.IsDevelopment() ? ex.ToString() : null
+        });
+    }
+
 }

@@ -1517,9 +1517,17 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.HomePath)
                 .HasMaxLength(100)
                 .HasDefaultValueSql("'/dashboard'::character varying");
-            entity.Property(e => e.IsStaffRole).HasDefaultValue(true);
-            entity.Property(e => e.IsSystem).HasDefaultValue(true);
-            entity.Property(e => e.RequiresEmail).HasDefaultValue(true);
+            entity.Property(e => e.IsStaffRole)
+                .HasDefaultValue(true)
+                .ValueGeneratedNever();
+
+            entity.Property(e => e.IsSystem)
+                .HasDefaultValue(true)
+                .ValueGeneratedNever();
+
+            entity.Property(e => e.RequiresEmail)
+                .HasDefaultValue(true)
+                .ValueGeneratedNever();
             entity.Property(e => e.RoleKey).HasMaxLength(30);
             entity.Property(e => e.RoleName).HasMaxLength(60);
 

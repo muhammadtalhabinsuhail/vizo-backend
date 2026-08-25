@@ -626,12 +626,20 @@ public class AdminController : ControllerBase
 
         var perms = await _db.Permissions.Where(p => body.Permissions.Contains(p.PermissionKey)).ToListAsync();
         foreach (var p in perms) role.Permissions.Add(p);
+        try
+        {
+            _db.Roles.Add(role);
+            await _db.SaveChangesAsync();
+            await Log("CREATED", "Role", role.RoleName, $"{perms.Count} permissions", 1);
 
-        _db.Roles.Add(role);
-        await _db.SaveChangesAsync();
-        await Log("CREATED", "Role", role.RoleName, $"{perms.Count} permissions", 1);
+            return Ok(new { id = role.RoleId, message = $"{role.RoleName} created." });
 
-        return Ok(new { id = role.RoleId, message = $"{role.RoleName} created." });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex);
+            return BadRequest();
+        }
     }
 
     [HttpPut("roles/{id:int}")]

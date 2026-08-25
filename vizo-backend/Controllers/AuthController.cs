@@ -1,4 +1,4 @@
-using System.IdentityModel.Tokens.Jwt;
+﻿using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
@@ -9,7 +9,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using MimeKit;
-using vizo_backend.Data;
+//using vizo_backend.Data;
 using vizo_backend.Models;
 
 /* "Claim" is a warranty claim in this domain, so the security one needs a
@@ -48,6 +48,11 @@ public class AuthController : ControllerBase
     [AllowAnonymous]
     public async Task<IActionResult> Login([FromBody] LoginRequest body)
     {
+      //  var PasswordHash = BCrypt.Net.BCrypt.HashPassword(
+      //string.IsNullOrWhiteSpace(body.Password) ? Guid.NewGuid().ToString("N") : body.Password, 11);
+
+
+
         if (string.IsNullOrWhiteSpace(body.Email) || string.IsNullOrWhiteSpace(body.Password))
             return BadRequest(new { message = "Email and password are required." });
 
@@ -116,129 +121,129 @@ public class AuthController : ControllerBase
     /* ══════════════════════ FORGOT PASSWORD ══════════════════════════ */
 
     /// <summary>Step 1. Emails a six-digit code. Always answers 200.</summary>
-    [HttpPost("forgot-password")]
-    [AllowAnonymous]
-    public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequest body)
-    {
-        var expiryMinutes = _cfg.GetValue("PasswordReset:CodeExpiryMinutes", 30);
+    //[HttpPost("forgot-password")]
+    //[AllowAnonymous]
+    //public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequest body)
+    //{
+    //    var expiryMinutes = _cfg.GetValue("PasswordReset:CodeExpiryMinutes", 30);
 
-        /* Deliberately identical whatever happens next: a reply that differs
-           for a real address turns this endpoint into an account enumerator. */
-        var generic = Ok(new
-        {
-            message = "If that address belongs to an account, a reset code is on its way.",
-            expiresInMinutes = expiryMinutes
-        });
+    //    /* Deliberately identical whatever happens next: a reply that differs
+    //       for a real address turns this endpoint into an account enumerator. */
+    //    var generic = Ok(new
+    //    {
+    //        message = "If that address belongs to an account, a reset code is on its way.",
+    //        expiresInMinutes = expiryMinutes
+    //    });
 
-        if (string.IsNullOrWhiteSpace(body.Email)) return generic;
-        var email = body.Email.Trim().ToLowerInvariant();
+    //    if (string.IsNullOrWhiteSpace(body.Email)) return generic;
+    //    var email = body.Email.Trim().ToLowerInvariant();
 
-        var user = await _db.Users
-            .Include(u => u.Role)
-            .FirstOrDefaultAsync(u => u.Email != null && u.Email.ToLower() == email);
+    //    var user = await _db.Users
+    //        .Include(u => u.Role)
+    //        .FirstOrDefaultAsync(u => u.Email != null && u.Email.ToLower() == email);
 
-        if (user is null || !user.IsActive || !user.Role.IsStaffRole) return generic;
+    //    if (user is null || !user.IsActive || !user.Role.IsStaffRole) return generic;
 
-        /* Any code already outstanding for this person is dead the moment a
-           new one is asked for. */
-        var live = await _db.PasswordResetCodes
-            .Where(c => c.UserId == user.UserId && c.ConsumedAt == null)
-            .ToListAsync();
-        foreach (var c in live) c.ConsumedAt = Now();
+    //    /* Any code already outstanding for this person is dead the moment a
+    //       new one is asked for. */
+    //    var live = await _db.PasswordResetCodes
+    //        .Where(c => c.UserId == user.UserId && c.ConsumedAt == null)
+    //        .ToListAsync();
+    //    foreach (var c in live) c.ConsumedAt = Now();
 
-        var code = RandomNumberGenerator.GetInt32(100000, 1000000).ToString();
+    //    var code = RandomNumberGenerator.GetInt32(100000, 1000000).ToString();
 
-        _db.PasswordResetCodes.Add(new PasswordResetCode
-        {
-            UserId = user.UserId,
-            CodeHash = BCrypt.Net.BCrypt.HashPassword(code, 11),
-            ExpiresAt = Now().AddMinutes(expiryMinutes),
-            CreatedAt = Now(),
-            Attempts = 0
-        });
-        await _db.SaveChangesAsync();
+    //    _db.PasswordResetCodes.Add(new PasswordResetCode
+    //    {
+    //        UserId = user.UserId,
+    //        CodeHash = BCrypt.Net.BCrypt.HashPassword(code, 11),
+    //        ExpiresAt = Now().AddMinutes(expiryMinutes),
+    //        CreatedAt = Now(),
+    //        Attempts = 0
+    //    });
+    //    await _db.SaveChangesAsync();
 
-        try
-        {
-            await SendResetEmail(user.Email!, user.FullName, code, expiryMinutes);
-        }
-        catch (Exception ex)
-        {
-            /* The code is already stored. Report the delivery failure to the
-               log rather than to the caller, who must not learn anything. */
-            Console.WriteLine($"[forgot-password] SMTP failure for {user.Email}: {ex.Message}");
-        }
+    //    try
+    //    {
+    //        await SendResetEmail(user.Email!, user.FullName, code, expiryMinutes);
+    //    }
+    //    catch (Exception ex)
+    //    {
+    //        /* The code is already stored. Report the delivery failure to the
+    //           log rather than to the caller, who must not learn anything. */
+    //        Console.WriteLine($"[forgot-password] SMTP failure for {user.Email}: {ex.Message}");
+    //    }
 
-        return generic;
-    }
+    //    return generic;
+    //}
 
     /// <summary>Step 2. Checks the code without spending it, so the UI can
     /// move to the new-password screen before committing.</summary>
-    [HttpPost("verify-code")]
-    [AllowAnonymous]
-    public async Task<IActionResult> VerifyCode([FromBody] VerifyCodeRequest body)
-    {
-        var check = await FindUsableCode(body.Email, body.Code);
-        if (check.Error is not null) return BadRequest(new { message = check.Error });
+    //[HttpPost("verify-code")]
+    //[AllowAnonymous]
+    //public async Task<IActionResult> VerifyCode([FromBody] VerifyCodeRequest body)
+    //{
+    //    var check = await FindUsableCode(body.Email, body.Code);
+    //    if (check.Error is not null) return BadRequest(new { message = check.Error });
 
-        return Ok(new { message = "Code accepted.", valid = true });
-    }
+    //    return Ok(new { message = "Code accepted.", valid = true });
+    //}
 
     /// <summary>Step 3. Spends the code and sets the new password.</summary>
-    [HttpPost("reset-password")]
-    [AllowAnonymous]
-    public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordRequest body)
-    {
-        var problem = ValidatePassword(body.NewPassword);
-        if (problem is not null) return BadRequest(new { message = problem });
+    //[HttpPost("reset-password")]
+    //[AllowAnonymous]
+    //public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordRequest body)
+    //{
+    //    var problem = ValidatePassword(body.NewPassword);
+    //    if (problem is not null) return BadRequest(new { message = problem });
 
-        var check = await FindUsableCode(body.Email, body.Code);
-        if (check.Error is not null) return BadRequest(new { message = check.Error });
+    //    var check = await FindUsableCode(body.Email, body.Code);
+    //    if (check.Error is not null) return BadRequest(new { message = check.Error });
 
-        var entry = check.Entry!;
-        var user = await _db.Users.FirstAsync(u => u.UserId == entry.UserId);
+    //    var entry = check.Entry!;
+    //    var user = await _db.Users.FirstAsync(u => u.UserId == entry.UserId);
 
-        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(body.NewPassword, 11);
-        entry.ConsumedAt = Now();
+    //    user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(body.NewPassword, 11);
+    //    entry.ConsumedAt = Now();
 
-        /* Everything else outstanding dies with it. */
-        var others = await _db.PasswordResetCodes
-            .Where(c => c.UserId == user.UserId && c.ConsumedAt == null)
-            .ToListAsync();
-        foreach (var o in others) o.ConsumedAt = Now();
+    //    /* Everything else outstanding dies with it. */
+    //    var others = await _db.PasswordResetCodes
+    //        .Where(c => c.UserId == user.UserId && c.ConsumedAt == null)
+    //        .ToListAsync();
+    //    foreach (var o in others) o.ConsumedAt = Now();
 
-        await _db.SaveChangesAsync();
-        await WriteLog(user.UserId, "PASSWORD_RESET", "User", user.Email ?? user.FullName,
-                       "Password reset with an emailed code", 3);
+    //    await _db.SaveChangesAsync();
+    //    await WriteLog(user.UserId, "PASSWORD_RESET", "User", user.Email ?? user.FullName,
+    //                   "Password reset with an emailed code", 3);
 
-        return Ok(new { message = "Password updated. You can sign in with it now." });
-    }
+    //    return Ok(new { message = "Password updated. You can sign in with it now." });
+    //}
 
     /// <summary>Signed-in change, current password required.</summary>
-    [HttpPost("change-password")]
-    [Authorize]
-    public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest body)
-    {
-        var id = CurrentUserId();
-        if (id is null) return Unauthorized();
+    //[HttpPost("change-password")]
+    //[Authorize]
+    //public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest body)
+    //{
+    //    var id = CurrentUserId();
+    //    if (id is null) return Unauthorized();
 
-        var problem = ValidatePassword(body.NewPassword);
-        if (problem is not null) return BadRequest(new { message = problem });
+    //    var problem = ValidatePassword(body.NewPassword);
+    //    if (problem is not null) return BadRequest(new { message = problem });
 
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.UserId == id);
-        if (user is null) return Unauthorized();
+    //    var user = await _db.Users.FirstOrDefaultAsync(u => u.UserId == id);
+    //    if (user is null) return Unauthorized();
 
-        if (string.IsNullOrEmpty(user.PasswordHash) ||
-            !BCrypt.Net.BCrypt.Verify(body.CurrentPassword, user.PasswordHash))
-            return BadRequest(new { message = "Your current password is not right." });
+    //    if (string.IsNullOrEmpty(user.PasswordHash) ||
+    //        !BCrypt.Net.BCrypt.Verify(body.CurrentPassword, user.PasswordHash))
+    //        return BadRequest(new { message = "Your current password is not right." });
 
-        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(body.NewPassword, 11);
-        await _db.SaveChangesAsync();
-        await WriteLog(user.UserId, "PASSWORD_CHANGE", "User", user.Email ?? user.FullName,
-                       "Password changed from the profile screen", 1);
+    //    user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(body.NewPassword, 11);
+    //    await _db.SaveChangesAsync();
+    //    await WriteLog(user.UserId, "PASSWORD_CHANGE", "User", user.Email ?? user.FullName,
+    //                   "Password changed from the profile screen", 1);
 
-        return Ok(new { message = "Password updated." });
-    }
+    //    return Ok(new { message = "Password updated." });
+    //}
 
     /// <summary>Bookkeeping only. The token is a bearer credential: the client
     /// drops it, and it expires on its own.</summary>
@@ -340,48 +345,48 @@ public class AuthController : ControllerBase
     /// against its hash. Every failure burns an attempt, so a six-digit code
     /// cannot be walked through.
     /// </summary>
-    private async Task<(PasswordResetCode? Entry, string? Error)> FindUsableCode(string? email, string? code)
-    {
-        const string generic = "That code is not valid, or it has expired. Ask for a new one.";
+    //private async Task<(PasswordResetCode? Entry, string? Error)> FindUsableCode(string? email, string? code)
+    //{
+    //    const string generic = "That code is not valid, or it has expired. Ask for a new one.";
 
-        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(code))
-            return (null, generic);
+    //    if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(code))
+    //        return (null, generic);
 
-        var normalised = email.Trim().ToLowerInvariant();
-        var user = await _db.Users.FirstOrDefaultAsync(u => u.Email != null && u.Email.ToLower() == normalised);
-        if (user is null) return (null, generic);
+    //    var normalised = email.Trim().ToLowerInvariant();
+    //    var user = await _db.Users.FirstOrDefaultAsync(u => u.Email != null && u.Email.ToLower() == normalised);
+    //    if (user is null) return (null, generic);
 
-        var entry = await _db.PasswordResetCodes
-            .Where(c => c.UserId == user.UserId && c.ConsumedAt == null)
-            .OrderByDescending(c => c.ResetId)
-            .FirstOrDefaultAsync();
+    //    var entry = await _db.PasswordResetCodes
+    //        .Where(c => c.UserId == user.UserId && c.ConsumedAt == null)
+    //        .OrderByDescending(c => c.ResetId)
+    //        .FirstOrDefaultAsync();
 
-        if (entry is null) return (null, generic);
+    //    if (entry is null) return (null, generic);
 
-        if (entry.ExpiresAt < Now())
-        {
-            entry.ConsumedAt = Now();
-            await _db.SaveChangesAsync();
-            return (null, generic);
-        }
+    //    if (entry.ExpiresAt < Now())
+    //    {
+    //        entry.ConsumedAt = Now();
+    //        await _db.SaveChangesAsync();
+    //        return (null, generic);
+    //    }
 
-        var max = _cfg.GetValue("PasswordReset:MaxAttempts", 5);
-        if (entry.Attempts >= max)
-        {
-            entry.ConsumedAt = Now();
-            await _db.SaveChangesAsync();
-            return (null, "Too many wrong attempts. Ask for a new code.");
-        }
+    //    var max = _cfg.GetValue("PasswordReset:MaxAttempts", 5);
+    //    if (entry.Attempts >= max)
+    //    {
+    //        entry.ConsumedAt = Now();
+    //        await _db.SaveChangesAsync();
+    //        return (null, "Too many wrong attempts. Ask for a new code.");
+    //    }
 
-        if (!BCrypt.Net.BCrypt.Verify(code.Trim(), entry.CodeHash))
-        {
-            entry.Attempts++;
-            await _db.SaveChangesAsync();
-            return (null, generic);
-        }
+    //    if (!BCrypt.Net.BCrypt.Verify(code.Trim(), entry.CodeHash))
+    //    {
+    //        entry.Attempts++;
+    //        await _db.SaveChangesAsync();
+    //        return (null, generic);
+    //    }
 
-        return (entry, null);
-    }
+    //    return (entry, null);
+    //}
 
     private async Task SendResetEmail(string to, string name, string code, int minutes)
     {
@@ -417,6 +422,10 @@ public class AuthController : ControllerBase
 
     private async Task WriteLog(int? userId, string action, string entityType, string reference, string detail, int severityId)
     {
+        try
+        {
+
+        
         _db.ActivityLogs.Add(new ActivityLog
         {
             UserId = userId,
@@ -429,6 +438,10 @@ public class AuthController : ControllerBase
             LoggedAt = Now()
         });
         await _db.SaveChangesAsync();
+        }catch(Exception ex)
+        {
+            Console.WriteLine(ex);
+        }
     }
 
     /* ═══════════════════ request bodies (inline records) ═════════════ */

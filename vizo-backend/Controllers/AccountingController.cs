@@ -1104,6 +1104,57 @@ public class AccountingController : ApiControllerBase
         }
     }
 
+    /// <summary>
+    /// Reopens a closed period so a backdated correction can be posted.
+    ///
+    /// This is deliberately available rather than permanent: a month closed a
+    /// day early is a normal mistake, and the alternative is people posting the
+    /// correction into the wrong month, which is worse and much harder to spot
+    /// later. It is logged at warning severity with the name of whoever did it,
+    /// so /admin/audit-log shows every reopen.
+    /// </summary>
+    [HttpPost("periods/{id:int}/reopen")]
+    public async Task<IActionResult> ReopenPeriod(int id)
+    {
+        try
+        {
+            var period = await _db.FiscalPeriods.FirstOrDefaultAsync(p => p.PeriodId == id);
+            if (period is null) return NotFound(new { message = $"No period with id {id}." });
+            if (!period.IsClosed) return BadRequest(new { message = $"{period.PeriodName} is already open." });
+
+            /* A period cannot be reopened while a LATER one is still closed --
+               otherwise a correction lands in a month that a closed month has
+               already carried forward. */
+            var laterClosed = await _db.FiscalPeriods
+                .Where(p => p.IsClosed &&
+                           (p.PeriodYear > period.PeriodYear ||
+                           (p.PeriodYear == period.PeriodYear && p.PeriodMonth > period.PeriodMonth)))
+                .OrderBy(p => p.PeriodYear).ThenBy(p => p.PeriodMonth)
+                .Select(p => p.PeriodName)
+                .FirstOrDefaultAsync();
+
+            if (laterClosed is not null)
+                return BadRequest(new
+                {
+                    message = $"{laterClosed} is closed and comes after {period.PeriodName}. " +
+                              $"Reopen the later period first."
+                });
+
+            period.IsClosed = false;
+            period.ClosedAt = null;
+            period.ClosedByUserId = null;
+            await _db.SaveChangesAsync();
+            await Log("PERIOD_REOPENED", "FiscalPeriod", period.PeriodName,
+                      "Backdated postings allowed again", 3);
+
+            return Ok(new { id, message = $"{period.PeriodName} reopened." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"reopen period {id}");
+        }
+    }
+
     [HttpGet("reconciliation")]
     public async Task<IActionResult> GetReconciliation()
     {
@@ -1144,6 +1195,219 @@ public class AccountingController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
     //  LOOKUPS
     // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// One reconciliation opened up: the bank statement lines on the left, and
+    /// the POSTED ledger lines on this account over the same window on the
+    /// right, which is what the screen matches against each other.
+    ///
+    /// A statement line is matched when its MatchedLineId points at a journal
+    /// entry line -- there is no separate "isMatched" flag, so there is no
+    /// second copy of the truth to fall out of step.
+    /// </summary>
+    [HttpGet("reconciliation/{id:int}")]
+    public async Task<IActionResult> GetReconciliationDetail(int id)
+    {
+        try
+        {
+            var recon = await _db.BankReconciliations.AsNoTracking()
+                .Include(r => r.Account)
+                .Include(r => r.Status)
+                .Include(r => r.PreparedByUser).ThenInclude(e => e.User)
+                .FirstOrDefaultAsync(r => r.ReconciliationId == id);
+
+            if (recon is null) return NotFound(new { message = $"No reconciliation with id {id}." });
+
+            var statementLines = await _db.BankStatementLines.AsNoTracking()
+                .Where(l => l.ReconciliationId == id)
+                .OrderByDescending(l => l.LineDate).ThenBy(l => l.StatementLineId)
+                .Select(l => new
+                {
+                    id = l.StatementLineId,
+                    date = l.LineDate,
+                    description = l.Description,
+                    amount = l.Amount,
+                    matchedLineId = l.MatchedLineId
+                })
+                .ToListAsync();
+
+            /* Candidate ledger lines: posted journal lines on the same account,
+               within a month either side of the statement date. Anything already
+               claimed by ANOTHER reconciliation is left out so two statements
+               cannot both take the same ledger line. */
+            var from = recon.StatementDate.AddMonths(-1);
+            var to = recon.StatementDate.AddMonths(1);
+
+            var claimedElsewhere = await _db.BankStatementLines.AsNoTracking()
+                .Where(l => l.ReconciliationId != id && l.MatchedLineId != null)
+                .Select(l => l.MatchedLineId!.Value)
+                .ToListAsync();
+
+            var ledgerLines = await _db.JournalEntryLines.AsNoTracking()
+                .Where(l => l.AccountId == recon.AccountId
+                         && l.Entry.Status.StatusKey == Posted
+                         && l.Entry.EntryDate >= from && l.Entry.EntryDate <= to
+                         && !claimedElsewhere.Contains(l.LineId))
+                .OrderByDescending(l => l.Entry.EntryDate).ThenBy(l => l.LineId)
+                .Select(l => new
+                {
+                    id = l.LineId,
+                    date = l.Entry.EntryDate,
+                    entryNo = l.Entry.EntryNo,
+                    entryType = l.Entry.EntryType.TypeName,
+                    description = l.Description,
+                    party = l.PartyUser != null ? l.PartyUser.LegalName : null,
+                    /* Signed the way a bank statement reads it: money into the
+                       bank account is a debit in the ledger and a credit on the
+                       statement, so a positive amount means both. */
+                    amount = l.DebitAmount - l.CreditAmount
+                })
+                .ToListAsync();
+
+            return Ok(new
+            {
+                id = recon.ReconciliationId,
+                accountId = recon.AccountId,
+                accountName = recon.Account.AccountName,
+                accountCode = recon.Account.AccountCode,
+                statementDate = recon.StatementDate,
+                openingBalance = recon.OpeningBalance,
+                closingBalance = recon.ClosingBalance,
+                status = recon.Status.StatusKey,
+                statusName = recon.Status.StatusName,
+                finalizedOn = recon.FinalizedOn,
+                preparedBy = recon.PreparedByUser.User.FullName,
+                statementLines,
+                ledgerLines
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"load reconciliation {id}");
+        }
+    }
+
+    /// <summary>
+    /// Ties one statement line to one ledger line, or unties it when
+    /// JournalEntryLineId is null. Refuses once the reconciliation is finalised
+    /// -- that is the whole point of finalising it.
+    /// </summary>
+    [HttpPost("reconciliation/{id:int}/match")]
+    public async Task<IActionResult> MatchReconciliationLine(int id, [FromBody] MatchLineRequest body)
+    {
+        try
+        {
+            var recon = await _db.BankReconciliations
+                .Include(r => r.Status)
+                .FirstOrDefaultAsync(r => r.ReconciliationId == id);
+            if (recon is null) return NotFound(new { message = $"No reconciliation with id {id}." });
+
+            if (recon.FinalizedOn is not null)
+                return BadRequest(new { message = "This reconciliation is finalised and cannot be changed." });
+
+            var line = await _db.BankStatementLines
+                .FirstOrDefaultAsync(l => l.StatementLineId == body.StatementLineId && l.ReconciliationId == id);
+            if (line is null) return BadRequest(new { message = "That statement line is not on this reconciliation." });
+
+            if (body.JournalEntryLineId is int ledgerLineId)
+            {
+                var ledgerLine = await _db.JournalEntryLines
+                    .Include(l => l.Entry).ThenInclude(e => e.Status)
+                    .FirstOrDefaultAsync(l => l.LineId == ledgerLineId);
+
+                if (ledgerLine is null)
+                    return BadRequest(new { message = "That ledger line does not exist." });
+                if (ledgerLine.AccountId != recon.AccountId)
+                    return BadRequest(new { message = "That ledger line belongs to a different account." });
+                if (ledgerLine.Entry.Status.StatusKey != Posted)
+                    return BadRequest(new { message = "Only a posted entry can be reconciled." });
+
+                var taken = await _db.BankStatementLines.AnyAsync(l =>
+                    l.MatchedLineId == ledgerLineId && l.StatementLineId != line.StatementLineId);
+                if (taken)
+                    return BadRequest(new { message = "That ledger line is already matched to another statement line." });
+
+                line.MatchedLineId = ledgerLineId;
+            }
+            else
+            {
+                line.MatchedLineId = null;
+            }
+
+            await _db.SaveChangesAsync();
+
+            var remaining = await _db.BankStatementLines
+                .CountAsync(l => l.ReconciliationId == id && l.MatchedLineId == null);
+
+            return Ok(new
+            {
+                id,
+                statementLineId = line.StatementLineId,
+                matchedLineId = line.MatchedLineId,
+                unmatchedCount = remaining,
+                message = line.MatchedLineId is null ? "Match removed." : "Lines matched."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"match a line on reconciliation {id}");
+        }
+    }
+
+    /// <summary>
+    /// Finalises a reconciliation. Refuses while any statement line is still
+    /// unmatched, and refuses if the matched movement does not carry the opening
+    /// balance to the closing balance -- signing off a statement that does not
+    /// add up is the one thing this screen exists to prevent.
+    /// </summary>
+    [HttpPost("reconciliation/{id:int}/finalize")]
+    public async Task<IActionResult> FinalizeReconciliation(int id)
+    {
+        try
+        {
+            var recon = await _db.BankReconciliations
+                .Include(r => r.Status)
+                .Include(r => r.BankStatementLines)
+                .FirstOrDefaultAsync(r => r.ReconciliationId == id);
+            if (recon is null) return NotFound(new { message = $"No reconciliation with id {id}." });
+
+            if (recon.FinalizedOn is not null)
+                return BadRequest(new { message = "This reconciliation is already finalised." });
+
+            var unmatched = recon.BankStatementLines.Count(l => l.MatchedLineId == null);
+            if (unmatched > 0)
+                return BadRequest(new
+                {
+                    message = $"{unmatched} statement {(unmatched == 1 ? "line is" : "lines are")} " +
+                              $"still unmatched. Match or explain them before finalising."
+                });
+
+            var movement = recon.BankStatementLines.Sum(l => l.Amount);
+            var expected = recon.ClosingBalance - recon.OpeningBalance;
+            if (Math.Abs(movement - expected) > 0.01m)
+                return BadRequest(new
+                {
+                    message = $"The statement lines move {movement:N2} but the balances move {expected:N2}. " +
+                              $"A difference of {Math.Abs(movement - expected):N2} is unexplained."
+                });
+
+            var reconciled = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "RECONCILED");
+            if (reconciled is null)
+                return BadRequest(new { message = "No RECONCILED status is configured." });
+
+            recon.StatusId = reconciled.StatusId;
+            recon.FinalizedOn = Today();
+            await _db.SaveChangesAsync();
+            await Log("RECONCILIATION_FINALIZED", "BankReconciliation", recon.ReconciliationId.ToString(),
+                      $"Statement to {recon.StatementDate:yyyy-MM-dd} signed off", 2);
+
+            return Ok(new { id, message = "Reconciliation finalised." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"finalise reconciliation {id}");
+        }
+    }
 
     [HttpGet("lookups")]
     public async Task<IActionResult> Lookups()
@@ -1343,6 +1607,8 @@ public class AccountingController : ApiControllerBase
     // ══════════════════════ request bodies (part 2) ═════════════════════
 
     public record VoucherAllocationRequest(int? SalesInvoiceId, int? PurchaseInvoiceId, decimal Amount);
+
+    public record MatchLineRequest(int StatementLineId, int? JournalEntryLineId);
 
     public record VoucherRequest(
         int VoucherTypeId, DateOnly? VoucherDate, int LocationId, int? PartyId,

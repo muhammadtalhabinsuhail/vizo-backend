@@ -198,6 +198,90 @@ public class ClaimsController : ApiControllerBase
     /// Sends a claim on to the supplier. Stamps SentOn, which is what the
     /// "stuck with supplier" reminder counts from.
     /// </summary>
+    /// <summary>
+    /// A shopkeeper walks in with a dead piece. Recorded against the ITEM, not
+    /// an order -- the customer rarely knows which invoice it came on, and
+    /// "Claim" has no order FK, only a free-text OriginalOrderNo.
+    ///
+    /// UnitCost is taken from the product rather than the request: the value of
+    /// a claim is what the stock cost us, and letting the browser name that
+    /// figure would let the claim book be inflated from the front end.
+    ///
+    /// NOTE ON STOCK. This writes the claim row and nothing else. There is no
+    /// CLAIM movement type and none of the seeded claims carry a StockMovement,
+    /// so claim stock is tracked as a physical shelf rather than a system
+    /// balance. Posting a movement here would invent behaviour the schema does
+    /// not model.
+    ///
+    /// NOTE ON NUMBERING. "DocumentSeries" has no CLM row, so NextNumber falls
+    /// back to a timestamp. The one-line insert that fixes this is in
+    /// backend/database/db_code_changes.txt section 5.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> Create([FromBody] CreateClaimRequest body)
+    {
+        try
+        {
+            if (body.Quantity <= 0)
+                return BadRequest(new { message = "How many pieces came back?" });
+
+            var product = await _db.Products.FirstOrDefaultAsync(p => p.ProductId == body.ProductId);
+            if (product is null) return BadRequest(new { message = "Pick an item that exists." });
+
+            if (!await _db.Parties.AnyAsync(p => p.UserId == body.CustomerUserId))
+                return BadRequest(new { message = "Pick a customer that exists." });
+
+            var reason = await _db.ClaimReasons.FirstOrDefaultAsync(r => r.ReasonId == body.ReasonId);
+            if (reason is null) return BadRequest(new { message = "Pick a reason." });
+
+            var outcome = await _db.ClaimOutcomes.FirstOrDefaultAsync(o => o.OutcomeId == body.OutcomeId);
+            if (outcome is null) return BadRequest(new { message = "Say what the customer got." });
+
+            var stage = await _db.ClaimStages.FirstOrDefaultAsync(s => s.StageKey == "RECEIVED");
+            if (stage is null) return BadRequest(new { message = "No RECEIVED stage is configured." });
+
+            /* Claim.ReceivedByUserId points at Employee, not User -- they share
+               the key, but only staff have an Employee row. */
+            var employeeId = await CurrentEmployeeId();
+            if (employeeId is null)
+                return BadRequest(new { message = "Only staff accounts can receive a claim." });
+
+            var claim = new Claim
+            {
+                ClaimNo = await NextNumber("CLM"),
+                CustomerUserId = body.CustomerUserId,
+                ReceivedOn = Today(),
+                ReceivedByUserId = employeeId.Value,
+                ProductId = body.ProductId,
+                Quantity = body.Quantity,
+                UnitCost = product.CostPrice,
+                ReasonId = body.ReasonId,
+                ClaimNote = string.IsNullOrWhiteSpace(body.Note) ? null : body.Note.Trim(),
+                OriginalOrderNo = string.IsNullOrWhiteSpace(body.OriginalOrderNo) ? null : body.OriginalOrderNo.Trim(),
+                OutcomeId = body.OutcomeId,
+                StageId = stage.StageId,
+                RemindersSent = 0
+            };
+
+            _db.Claims.Add(claim);
+            await _db.SaveChangesAsync();
+            await Log("CLAIM_RECEIVED", "Claim", claim.ClaimNo,
+                      $"{claim.Quantity} x {product.ProductName} ({reason.ReasonName})", 1);
+
+            return Ok(new
+            {
+                id = claim.ClaimId,
+                claimNo = claim.ClaimNo,
+                value = claim.UnitCost * claim.Quantity,
+                message = $"{claim.ClaimNo} received into claim stock."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "receive the claim");
+        }
+    }
+
     [HttpPost("{id:int}/send")]
     public async Task<IActionResult> SendToSupplier(int id, [FromBody] SendClaimRequest body)
     {
@@ -232,6 +316,49 @@ public class ClaimsController : ApiControllerBase
         catch (Exception ex)
         {
             return Fail(ex, $"send claim {id} to the supplier");
+        }
+    }
+
+    /// <summary>
+    /// Records one more chase at the supplier. "Claim"."RemindersSent" is the
+    /// count the claim screens show next to "asked N times already", so the
+    /// button that says a reminder went out now actually moves that number.
+    ///
+    /// This bumps the counter and writes the activity row; it does not send the
+    /// message itself -- there is no outbound WhatsApp or SMS channel wired up,
+    /// and pretending otherwise is what this pass is removing.
+    /// </summary>
+    [HttpPost("{id:int}/remind")]
+    public async Task<IActionResult> Remind(int id, [FromBody] RemindClaimRequest? body)
+    {
+        try
+        {
+            var claim = await _db.Claims.FirstOrDefaultAsync(c => c.ClaimId == id);
+            if (claim is null) return NotFound(new { message = $"No claim with id {id}." });
+
+            if (claim.SentOn is null)
+                return BadRequest(new { message = $"{claim.ClaimNo} has not been sent to a supplier yet." });
+
+            if (claim.SettledOn is not null)
+                return BadRequest(new { message = $"{claim.ClaimNo} is already settled." });
+
+            claim.RemindersSent = (short)(claim.RemindersSent + 1);
+            if (!string.IsNullOrWhiteSpace(body?.Note)) claim.SupplierNote = body.Note;
+
+            await _db.SaveChangesAsync();
+            await Log("CLAIM_REMINDER", "Claim", claim.ClaimNo,
+                      $"Chased the supplier (reminder {claim.RemindersSent})", 3);
+
+            return Ok(new
+            {
+                id,
+                remindersSent = (int)claim.RemindersSent,
+                message = $"Chase number {claim.RemindersSent} recorded against {claim.ClaimNo}."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"record a reminder on claim {id}");
         }
     }
 
@@ -396,7 +523,15 @@ public class ClaimsController : ApiControllerBase
                 products = await _db.Products.AsNoTracking()
                     .Where(p => p.IsActive).OrderBy(p => p.ProductName)
                     .Select(p => new { id = p.ProductId, sku = p.Sku, name = p.ProductName, costPrice = p.CostPrice })
-                    .ToListAsync()
+                    .ToListAsync(),
+
+                /* The chase-and-write-off policy the claim screens quote back at
+                   the user. It lives in "AppSetting" under the "claim" group and
+                   is edited at /admin/settings, but that endpoint is
+                   SuperAdmin-only while claims are worked by the order desk and
+                   accounts too -- so the same rows are served here, read-only,
+                   to whoever may see a claim at all. */
+                policy = await ClaimPolicy()
             });
         }
         catch (Exception ex)
@@ -405,9 +540,42 @@ public class ClaimsController : ApiControllerBase
         }
     }
 
+    /// <summary>
+    /// The "claim" group out of AppSetting, shaped for the screens. Values are
+    /// stored as text, so each one is parsed with the same default the seed
+    /// carries -- a missing or mistyped row degrades to a sensible number
+    /// rather than throwing on a page that is only quoting a reminder period.
+    /// </summary>
+    private async Task<object> ClaimPolicy()
+    {
+        var rows = await _db.AppSettings.AsNoTracking()
+            .Where(s => s.SettingGroup == "claim")
+            .ToDictionaryAsync(s => s.SettingKey, s => s.SettingValue);
+
+        int num(string key, int fallback) =>
+            rows.TryGetValue(key, out var v) && int.TryParse(v, out var n) ? n : fallback;
+
+        return new
+        {
+            windowDays = num("claim.windowDays", 180),
+            remindSupplierAfterDays = num("claim.remindSupplierAfterDays", 14),
+            remindEveryHours = num("claim.remindEveryHours", 48),
+            remindUnsentAfterDays = num("claim.remindUnsentAfterDays", 3),
+            replaceUpfront = rows.TryGetValue("claim.replaceUpfront", out var r) &&
+                             (r.Equals("true", StringComparison.OrdinalIgnoreCase) || r == "1"),
+            writeOffAccount = rows.GetValueOrDefault("claim.writeOffAccount", "Warranty & Claims")
+        };
+    }
+
     // ══════════════════════════ request bodies ══════════════════════════
+
+    public record CreateClaimRequest(
+        int CustomerUserId, int ProductId, int Quantity, int ReasonId, int OutcomeId,
+        string? OriginalOrderNo, string? Note);
 
     public record SendClaimRequest(int? SupplierId, DateOnly? SentOn, string? Note);
 
     public record SettleClaimRequest(string StageKey, DateOnly? SettledOn, string? Note);
+
+    public record RemindClaimRequest(string? Note);
 }

@@ -277,5 +277,180 @@ WHERE "Email" IN ('nadia@vizo.com.pk', 'junaid@vizo.com.pk', 'ahmed@vizo.com.pk'
  so a fresh clone still knows what to create.
 
 ═══════════════════════════════════════════════════════════════════════════════
+ SECTION 5 — "CLM" DOCUMENT SERIES  (needed by the new POST /api/claims)
+═══════════════════════════════════════════════════════════════════════════════
+
+ WHO NEEDS IT
+   The claims screen can now receive a claim (Daily Work → Claims → "Receive
+   Claim"). It calls POST /api/claims, which asks NextNumber("CLM") for the
+   claim number.
+
+ THE PROBLEM
+   "DocumentSeries" has rows for ORD, INV, SR, PO, GRN, PI, PR, TRF, ADJ, RV,
+   PV, JV and DLV — but none for CLM. NextNumber() falls back to a timestamp
+   when a series is missing, so claims created through the app come out as
+     CLM-20260825174238
+   instead of matching the seeded claims, which read
+     CLM-26-0142
+
+   Nothing breaks. The number is unique and the claim is correct. It simply
+   does not match the house format, and it will keep not matching until this
+   row exists.
+
+ THE FIX — one INSERT, safe to re-run
+   Run this once against Neon. NextNumber picks it up immediately; no restart.
+
+     INSERT INTO "DocumentSeries"
+         ("DocumentType", "Prefix", "NextNumber", "Padding", "IncludeYear")
+     SELECT 'Claim', 'CLM', 143, 4, true
+     WHERE NOT EXISTS (
+         SELECT 1 FROM "DocumentSeries" WHERE "Prefix" = 'CLM'
+     );
+
+   NextNumber starts at 143 because the highest seeded claim is CLM-26-0142.
+   Check the column list against the live table first — it was read from the
+   scaffolded model, not from a describe:
+
+     SELECT column_name, data_type, is_nullable
+     FROM information_schema.columns
+     WHERE table_name = 'DocumentSeries'
+     ORDER BY ordinal_position;
+
+   If the table carries extra NOT NULL columns, add them to the INSERT.
+
+ ROLLBACK
+     DELETE FROM "DocumentSeries" WHERE "Prefix" = 'CLM';
+
+ STATUS: ⛔ NOT APPLIED — this is a write to the live database, so it is left
+         for you to run rather than done silently.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 6 — TABLES THAT TWO DISABLED FEATURES WOULD NEED  (optional)
+═══════════════════════════════════════════════════════════════════════════════
+
+ Two controls on /profile/security are switched OFF and say so on screen.
+ Neither had a backend: the 2FA toggle flipped a useState and toasted "Your
+ account is now less secure" without touching anything, and "Sign out all"
+ toasted success and signed nobody out. They now read "Not available yet"
+ rather than reporting success for work that never happened.
+
+ Making either real needs schema, so nothing was invented:
+
+ 6.1  TWO-FACTOR AUTHENTICATION
+      Needs somewhere to keep the enrolment secret and the recovery codes:
+
+        ALTER TABLE "User" ADD COLUMN "TwoFactorSecret"    text NULL;
+        ALTER TABLE "User" ADD COLUMN "TwoFactorEnabledAt" timestamp NULL;
+
+        CREATE TABLE "TwoFactorRecoveryCode" (
+            "CodeId"    serial PRIMARY KEY,
+            "UserId"    integer NOT NULL REFERENCES "User"("UserId"),
+            "CodeHash"  text    NOT NULL,
+            "UsedAt"    timestamp NULL
+        );
+
+      Rollback: drop the table, drop the two columns.
+
+ 6.2  "SIGN OUT EVERYWHERE"
+      The API issues a stateless JWT and keeps no record of it, so there is
+      nothing to revoke — a token stays valid until it expires no matter what
+      any button does. The cheapest honest fix is a token version:
+
+        ALTER TABLE "User" ADD COLUMN "TokenVersion" integer NOT NULL DEFAULT 0;
+
+      AuthController would then stamp the current value into the JWT at login
+      and compare it on every request; "sign out everywhere" is an increment.
+      That is a change to AuthController.cs, which is Talha's file — his call,
+      not something to do behind him.
+
+      Rollback: ALTER TABLE "User" DROP COLUMN "TokenVersion";
+
+ STATUS: ⛔ NOT APPLIED. Neither feature is promised anywhere in the UI now,
+         so there is no rush — this is here so the reason is on record.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 7 — ROWS THIS WIRING SESSION WROTE TO THE LIVE DATABASE
+═══════════════════════════════════════════════════════════════════════════════
+
+ Verifying that a Create button actually creates something means creating
+ something. Three rows were written to Neon on purpose, and they are listed
+ here so you can decide whether to keep them.
+
+ 7.1  ONE PRODUCT — "Product"."ProductId" = 34
+        Sku    ZZ-WIRING-TEST-01
+        Name   "Wiring session verification SKU (edited)"
+        IsActive = FALSE  — deliberately, so it cannot appear on an order,
+                            invoice or packing screen.
+      Created to prove POST /api/inventory/products, then edited to prove
+      PUT /api/inventory/products/34 (name, prices, min/max and the barcode
+      were all changed and re-read back).
+
+      There is no DELETE endpoint for products, so remove it with SQL if you
+      want it gone:
+
+        DELETE FROM "ProductBarcode" WHERE "ProductId" = 34;
+        DELETE FROM "Product"        WHERE "ProductId" = 34;
+
+      Leaving it costs nothing except one inactive row in the catalogue count.
+
+ 7.2  ONE CLAIM — "Claim"."ClaimId" = 13, ClaimNo CLM-20260825174238
+      Created to prove the whole claim lifecycle end to end: received → sent to
+      China Mobile Plaza Trading → chased twice → settled as REPLACED. Every
+      step persisted and every step is in the audit log.
+
+      It is a real claim against a real customer for 2 pieces at cost (PKR 700)
+      and it shows in the claims list and the supplier scorecard. Delete it if
+      that is unwanted:
+
+        DELETE FROM "Claim" WHERE "ClaimId" = 13;
+
+ 7.3  PREFERENCE ROWS — "UserPreference" for UserId 1
+      Saving the Preferences screen created the keys it owns:
+        fmt.date, fmt.number, list.density, list.pageSize, theme
+      These are per-user settings and are meant to be there. Nothing to undo.
+
+ REVERSED AND ALREADY CLEAN — no action needed:
+   • Umer Memon's phone and default location were changed and changed back.
+   • Bank reconciliation 1: statement line 2 was unmatched and re-matched to
+     ledger line 11, ending exactly as it started.
+   • Jun 2026 was closed and reopened. Closed periods are Mar / Feb / Jan 2026,
+     which is what they were before.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 8 — MANUAL STEPS FOR TALHA (no SQL)
+═══════════════════════════════════════════════════════════════════════════════
+
+ 8.1  .NET SDK 9.0.317 IS NOT INSTALLED ON THIS MACHINE
+      global.json pins 9.0.317. Only 8.0.419 and a 10.0 preview are present, and
+      with the pin in place `dotnet` will not load at all inside backend/ — it
+      fails with "The command could not be loaded", which does not look like an
+      SDK problem.
+
+      This session built and ran behind a TEMPORARY local override and then put
+      the file back. global.json is unchanged and still pins 9.0.317.
+      A copy of the original is at backend/global.json.talha.
+
+      Either install .NET 9 SDK 9.0.317, or relax the pin — but do not let a
+      stale override reach the repo.
+
+ 8.2  NOTHING WAS ADDED TO Program.cs
+      The new endpoints live in controllers that are discovered automatically.
+      No DI registration, no middleware, no configuration key was needed, so
+      Program.cs is byte-for-byte unchanged. Same for global.json,
+      vizo-backend.csproj, Models/AppDbContext.cs and Controllers/AuthController.cs
+      — all five of your files are untouched.
+
+ 8.3  NEW C# FILE ADDED
+      Controllers/ProfileController.cs is the only new backend file. It serves
+      /api/profile (the signed-in person's own record, preferences and sign-in
+      history) and is deliberately separate from AuthController so that pulling
+      your changes never conflicts. It defines no model class — it reads the
+      scaffolded "User", "Employee", "Location", "UserPreference" and
+      "ActivityLog" entities as they are, and adds no table.
+
+═══════════════════════════════════════════════════════════════════════════════
  END
 ═══════════════════════════════════════════════════════════════════════════════

@@ -722,32 +722,6 @@ public class SalesController : ApiControllerBase
         }
     }
 
-    // ════════════════════════ numbering helper ════════════════════════
-
-    /// <summary>
-    /// Next document number for a series, straight off "DocumentSeries" so the
-    /// prefix, padding and year setting a Super Admin picked at
-    /// /admin/numbering are the ones actually used.
-    ///
-    /// Increments NextNumber in the same call. Two orders taken in the same
-    /// second could still collide; the real fix is a database sequence per
-    /// series, which is a schema change and is noted rather than faked.
-    /// </summary>
-    private async Task<string> NextNumber(string prefix)
-    {
-        var series = await _db.DocumentSeries
-            .FirstOrDefaultAsync(s => s.Prefix == prefix);
-
-        if (series is null)
-            return $"{prefix}-{DateTime.UtcNow:yyyyMMddHHmmss}";
-
-        var n = series.NextNumber;
-        series.NextNumber = n + 1;
-        await _db.SaveChangesAsync();
-
-        var year = series.IncludeYear ? $"{DateTime.UtcNow:yyyy}-" : "";
-        return $"{series.Prefix}-{year}{n.ToString().PadLeft(series.Padding, '0')}";
-    }
 
     // ══════════════════════════ request bodies ══════════════════════════
 
@@ -760,4 +734,403 @@ public class SalesController : ApiControllerBase
         string? Notes, List<OrderLineRequest> Lines);
 
     public record StatusRequest(string StatusKey);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CREATE  --  invoice, return, counter sale
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Raises a sale invoice, either against an existing order or standalone.
+    /// UnitCost is captured on every line at invoice time: the margin reports
+    /// need what the item cost THAT DAY, and Product.CostPrice moves.
+    /// </summary>
+    [HttpPost("invoices")]
+    [Authorize(Policy = "BackOffice")]
+    public async Task<IActionResult> CreateInvoice([FromBody] InvoiceRequest body)
+    {
+        try
+        {
+            if (body.Lines is null || body.Lines.Count == 0)
+                return BadRequest(new { message = "An invoice needs at least one line." });
+            if (!await _db.Parties.AnyAsync(p => p.UserId == body.CustomerId))
+                return BadRequest(new { message = "Pick a valid customer." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+                return BadRequest(new { message = "Pick a valid location." });
+
+            foreach (var l in body.Lines)
+            {
+                if (l.Qty <= 0) return BadRequest(new { message = "Every line needs a quantity above zero." });
+                if (l.Rate < 0) return BadRequest(new { message = "A rate cannot be negative." });
+                if (!await _db.Products.AnyAsync(p => p.ProductId == l.ProductId))
+                    return BadRequest(new { message = $"Product {l.ProductId} does not exist." });
+            }
+
+            if (body.OrderId is not null)
+            {
+                if (!await _db.SalesOrders.AnyAsync(o => o.OrderId == body.OrderId))
+                    return BadRequest(new { message = "That order does not exist." });
+                if (await _db.SalesInvoices.AnyAsync(i => i.OrderId == body.OrderId))
+                    return BadRequest(new { message = "That order has already been invoiced." });
+            }
+
+            var status = await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "ISSUED")
+                         ?? await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
+            if (status is null) return BadRequest(new { message = "Invoice statuses are not configured." });
+
+            decimal subtotal = 0, discount = 0, tax = 0;
+            foreach (var l in body.Lines)
+            {
+                var gross = l.Qty * l.Rate;
+                var disc = gross * (l.DiscountPercent / 100m);
+                var net = gross - disc;
+                subtotal += gross;
+                discount += disc;
+                tax += net * (l.TaxPercent / 100m);
+            }
+            var total = subtotal - discount + tax;
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var inv = new SalesInvoice
+            {
+                InvoiceNo = await NextNumber("INV"),
+                OrderId = body.OrderId,
+                CustomerUserId = body.CustomerId,
+                LocationId = body.LocationId,
+                InvoiceDate = body.InvoiceDate ?? Today(),
+                DueDate = body.DueDate ?? (body.InvoiceDate ?? Today()).AddDays(30),
+                Subtotal = subtotal,
+                DiscountAmount = discount,
+                TaxAmount = tax,
+                TotalAmount = total,
+                StatusId = status.StatusId,
+                MethodId = body.MethodId,
+                CreatedByUserId = CurrentUserId()
+            };
+            _db.SalesInvoices.Add(inv);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                var gross = l.Qty * l.Rate;
+                var disc = gross * (l.DiscountPercent / 100m);
+                var net = gross - disc;
+                var cost = await _db.Products.Where(p => p.ProductId == l.ProductId)
+                    .Select(p => p.CostPrice).FirstAsync();
+
+                _db.SalesInvoiceItems.Add(new SalesInvoiceItem
+                {
+                    InvoiceId = inv.InvoiceId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    Quantity = l.Qty,
+                    UnitPrice = l.Rate,
+                    DiscountPercent = l.DiscountPercent,
+                    TaxPercent = l.TaxPercent,
+                    UnitCost = cost,
+                    LineTotal = net + net * (l.TaxPercent / 100m)
+                });
+            }
+
+            if (body.OrderId is not null)
+            {
+                var invoiced = await _db.OrderStatuses.FirstOrDefaultAsync(s => s.StatusKey == "INVOICED");
+                var order = await _db.SalesOrders.FirstOrDefaultAsync(o => o.OrderId == body.OrderId);
+                if (invoiced is not null && order is not null) order.StatusId = invoiced.StatusId;
+            }
+
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("INVOICE_CREATED", "SalesInvoice", inv.InvoiceNo, $"{total:N0}", 2);
+            return Ok(new { id = inv.InvoiceId, invoiceNo = inv.InvoiceNo, message = $"Invoice {inv.InvoiceNo} raised." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "raise the invoice");
+        }
+    }
+
+    /// <summary>
+    /// Takes goods back from a customer. Only RESALABLE lines go back on the
+    /// shelf -- damaged, expired and missing are recorded against the return so
+    /// the loss is visible, but putting them back would sell a broken item twice.
+    /// </summary>
+    [HttpPost("returns")]
+    [Authorize(Policy = "BackOffice")]
+    public async Task<IActionResult> CreateReturn([FromBody] ReturnRequest body)
+    {
+        try
+        {
+            if (body.Lines is null || body.Lines.Count == 0)
+                return BadRequest(new { message = "A return needs at least one line." });
+            if (string.IsNullOrWhiteSpace(body.Reason))
+                return BadRequest(new { message = "A reason is required." });
+
+            var inv = await _db.SalesInvoices.FirstOrDefaultAsync(i => i.InvoiceId == body.InvoiceId);
+            if (inv is null) return BadRequest(new { message = "Pick a valid invoice." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+                return BadRequest(new { message = "Pick a valid location." });
+
+            var status = await _db.ReturnStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
+            if (status is null) return BadRequest(new { message = "Return statuses are not configured." });
+
+            var backIn = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "SALE_RETURN");
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var ret = new SalesReturn
+            {
+                ReturnNo = await NextNumber("SR"),
+                InvoiceId = body.InvoiceId,
+                CustomerUserId = inv.CustomerUserId,
+                LocationId = body.LocationId,
+                ReturnDate = body.ReturnDate ?? Today(),
+                Reason = body.Reason.Trim(),
+                RefundMethodId = body.RefundMethodId,
+                StatusId = status.StatusId,
+                CreatedByUserId = CurrentUserId()
+            };
+            _db.SalesReturns.Add(ret);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                if (l.Qty <= 0) return BadRequest(new { message = "Every line needs a quantity above zero." });
+
+                var cond = await _db.ReturnConditions.FirstOrDefaultAsync(c => c.ConditionId == l.ConditionId);
+                if (cond is null) return BadRequest(new { message = "Pick a valid condition for every line." });
+
+                _db.SalesReturnItems.Add(new SalesReturnItem
+                {
+                    ReturnId = ret.ReturnId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    Quantity = l.Qty,
+                    UnitPrice = l.Rate,
+                    ConditionId = l.ConditionId,
+                    RestockLocationId = cond.IsResalable ? body.LocationId : null
+                });
+
+                if (!cond.IsResalable || backIn is null) continue;
+
+                var bal = await _db.StockBalances
+                    .FirstOrDefaultAsync(s => s.ProductId == l.ProductId && s.LocationId == body.LocationId);
+                if (bal is null)
+                {
+                    bal = new StockBalance { ProductId = l.ProductId, LocationId = body.LocationId, Quantity = 0 };
+                    _db.StockBalances.Add(bal);
+                    await _db.SaveChangesAsync();
+                }
+                bal.Quantity += l.Qty;
+
+                _db.StockMovements.Add(new StockMovement
+                {
+                    ProductId = l.ProductId,
+                    LocationId = body.LocationId,
+                    MovementTypeId = backIn.MovementTypeId,
+                    MovedAt = Now(),
+                    ReferenceNo = ret.ReturnNo,
+                    Quantity = l.Qty,
+                    BalanceAfter = bal.Quantity,
+                    UserId = CurrentUserId()
+                });
+            }
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("SALES_RETURN_CREATED", "SalesReturn", ret.ReturnNo, body.Reason, 2);
+            return Ok(new { id = ret.ReturnId, returnNo = ret.ReturnNo, message = $"Return {ret.ReturnNo} saved." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save the return");
+        }
+    }
+
+    /// <summary>
+    /// Counter sale: somebody walks in, pays, walks out. One call does the whole
+    /// thing -- order, invoice, stock out -- because there is no packing or
+    /// delivery step to wait for. Credit is refused here on purpose: a walk-in
+    /// with no account cannot be chased.
+    /// </summary>
+    [HttpPost("direct")]
+    [Authorize(Policy = "OrderDept")]
+    public async Task<IActionResult> CounterSale([FromBody] CounterSaleRequest body)
+    {
+        try
+        {
+            if (body.Lines is null || body.Lines.Count == 0)
+                return BadRequest(new { message = "A counter sale needs at least one line." });
+            if (!await _db.Parties.AnyAsync(p => p.UserId == body.CustomerId))
+                return BadRequest(new { message = "Pick a valid customer (use the walk-in account for cash sales)." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+                return BadRequest(new { message = "Pick a valid location." });
+
+            var method = await _db.PaymentMethods.FirstOrDefaultAsync(m => m.MethodId == body.MethodId);
+            if (method is null) return BadRequest(new { message = "Pick a valid payment method." });
+            if (method.MethodKey == "CREDIT")
+                return BadRequest(new { message = "A counter sale cannot be on credit. Take an order instead." });
+
+            foreach (var l in body.Lines)
+            {
+                if (l.Qty <= 0) return BadRequest(new { message = "Every line needs a quantity above zero." });
+                var have = await _db.StockBalances
+                    .Where(s => s.ProductId == l.ProductId && s.LocationId == body.LocationId)
+                    .Select(s => (int?)s.Quantity).FirstOrDefaultAsync() ?? 0;
+                if (have < l.Qty)
+                {
+                    var p = await _db.Products.AsNoTracking().FirstOrDefaultAsync(x => x.ProductId == l.ProductId);
+                    return BadRequest(new
+                    {
+                        message = $"{p?.ProductName ?? $"Product {l.ProductId}"}: asked for {l.Qty}, only {have} on the shelf."
+                    });
+                }
+            }
+
+            decimal subtotal = 0, discount = 0, tax = 0;
+            foreach (var l in body.Lines)
+            {
+                var gross = l.Qty * l.Rate;
+                var disc = gross * (l.DiscountPercent / 100m);
+                var net = gross - disc;
+                subtotal += gross;
+                discount += disc;
+                tax += net * (l.TaxPercent / 100m);
+            }
+            var total = subtotal - discount + tax;
+
+            var delivered = await _db.OrderStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DELIVERED");
+            var paid = await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "PAID")
+                       ?? await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "ISSUED");
+            var saleType = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "SALE");
+            if (delivered is null || paid is null || saleType is null)
+                return BadRequest(new { message = "DELIVERED / PAID statuses or the SALE movement type are not configured." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var order = new SalesOrder
+            {
+                OrderNo = await NextNumber("ORD"),
+                CustomerUserId = body.CustomerId,
+                LocationId = body.LocationId,
+                SalesPersonUserId = await CurrentEmployeeId(),
+                OrderDate = Today(),
+                DeliveryDate = Today(),
+                StatusId = delivered.StatusId,
+                MethodId = body.MethodId,
+                Subtotal = subtotal,
+                DiscountAmount = discount,
+                TaxAmount = tax,
+                TotalAmount = total,
+                Notes = body.Notes ?? "Counter sale",
+                CreatedByUserId = CurrentUserId(),
+                CreatedAt = Today()
+            };
+            _db.SalesOrders.Add(order);
+            await _db.SaveChangesAsync();
+
+            var inv = new SalesInvoice
+            {
+                InvoiceNo = await NextNumber("INV"),
+                OrderId = order.OrderId,
+                CustomerUserId = body.CustomerId,
+                LocationId = body.LocationId,
+                InvoiceDate = Today(),
+                DueDate = Today(),
+                Subtotal = subtotal,
+                DiscountAmount = discount,
+                TaxAmount = tax,
+                TotalAmount = total,
+                StatusId = paid.StatusId,
+                MethodId = body.MethodId,
+                CreatedByUserId = CurrentUserId()
+            };
+            _db.SalesInvoices.Add(inv);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                var gross = l.Qty * l.Rate;
+                var disc = gross * (l.DiscountPercent / 100m);
+                var net = gross - disc;
+                var lineTotal = net + net * (l.TaxPercent / 100m);
+                var cost = await _db.Products.Where(p => p.ProductId == l.ProductId)
+                    .Select(p => p.CostPrice).FirstAsync();
+
+                _db.SalesOrderItems.Add(new SalesOrderItem
+                {
+                    OrderId = order.OrderId, LineNo = n, ProductId = l.ProductId,
+                    Quantity = l.Qty, UnitPrice = l.Rate,
+                    DiscountPercent = l.DiscountPercent, TaxPercent = l.TaxPercent,
+                    LineTotal = lineTotal
+                });
+                _db.SalesInvoiceItems.Add(new SalesInvoiceItem
+                {
+                    InvoiceId = inv.InvoiceId, LineNo = n, ProductId = l.ProductId,
+                    Quantity = l.Qty, UnitPrice = l.Rate,
+                    DiscountPercent = l.DiscountPercent, TaxPercent = l.TaxPercent,
+                    UnitCost = cost, LineTotal = lineTotal
+                });
+                n++;
+
+                var bal = await _db.StockBalances
+                    .FirstAsync(s => s.ProductId == l.ProductId && s.LocationId == body.LocationId);
+                bal.Quantity -= l.Qty;
+
+                _db.StockMovements.Add(new StockMovement
+                {
+                    ProductId = l.ProductId,
+                    LocationId = body.LocationId,
+                    MovementTypeId = saleType.MovementTypeId,
+                    MovedAt = Now(),
+                    ReferenceNo = inv.InvoiceNo,
+                    Quantity = -l.Qty,
+                    BalanceAfter = bal.Quantity,
+                    UserId = CurrentUserId()
+                });
+            }
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("COUNTER_SALE", "SalesInvoice", inv.InvoiceNo, $"{total:N0} {method.MethodKey}", 1);
+
+            return Ok(new
+            {
+                orderId = order.OrderId,
+                orderNo = order.OrderNo,
+                invoiceId = inv.InvoiceId,
+                invoiceNo = inv.InvoiceNo,
+                total,
+                message = $"Counter sale done. Invoice {inv.InvoiceNo}, {total:N0} paid by {method.MethodName}."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "complete the counter sale");
+        }
+    }
+
+    // ══════════════════════ request bodies (part 2) ═════════════════════
+
+    public record InvoiceLineRequest(
+        int ProductId, int Qty, decimal Rate, decimal DiscountPercent, decimal TaxPercent);
+
+    public record InvoiceRequest(
+        int? OrderId, int CustomerId, int LocationId,
+        DateOnly? InvoiceDate, DateOnly? DueDate, int MethodId,
+        List<InvoiceLineRequest> Lines);
+
+    public record ReturnLineRequest(int ProductId, int Qty, decimal Rate, int ConditionId);
+
+    public record ReturnRequest(
+        int InvoiceId, int LocationId, DateOnly? ReturnDate, string Reason,
+        int RefundMethodId, List<ReturnLineRequest> Lines);
+
+    public record CounterSaleRequest(
+        int CustomerId, int LocationId, int MethodId, string? Notes,
+        List<InvoiceLineRequest> Lines);
 }

@@ -421,10 +421,37 @@ public class PartiesController : ApiControllerBase
     {
         try
         {
+            var roleId = RoleFor(body.Type);
+
+            /* The form does not have to invent a party code. If it arrives blank
+               we allocate the next one in the VZ-C-#### / VZ-S-#### / VZ-B-####
+               series, matching the codes already in the database. Doing it here
+               rather than in the browser is what stops two people opening an
+               account at the same time and picking the same number. */
+            if (string.IsNullOrWhiteSpace(body.PartyCode))
+            {
+                var prefix = roleId switch
+                {
+                    RoleSupplier => "VZ-S-",
+                    RoleBoth => "VZ-B-",
+                    _ => "VZ-C-"
+                };
+
+                var used = await _db.Parties
+                    .Where(p => p.PartyCode.StartsWith(prefix))
+                    .Select(p => p.PartyCode)
+                    .ToListAsync();
+
+                var next = used
+                    .Select(c => int.TryParse(c[prefix.Length..], out var n) ? n : 0)
+                    .DefaultIfEmpty(0)
+                    .Max() + 1;
+
+                body = body with { PartyCode = $"{prefix}{next:0000}" };
+            }
+
             var error = await ValidateParty(body, null);
             if (error is not null) return BadRequest(new { message = error });
-
-            var roleId = RoleFor(body.Type);
 
             await using var tx = await _db.Database.BeginTransactionAsync();
 
@@ -446,7 +473,7 @@ public class PartiesController : ApiControllerBase
             _db.Parties.Add(new Party
             {
                 UserId = user.UserId,
-                PartyCode = body.PartyCode.Trim().ToUpperInvariant(),
+                PartyCode = body.PartyCode!.Trim().ToUpperInvariant(),
                 LegalName = body.LegalName.Trim(),
                 DisplayName = string.IsNullOrWhiteSpace(body.DisplayName) ? null : body.DisplayName.Trim(),
                 CategoryId = body.CategoryId,
@@ -472,7 +499,12 @@ public class PartiesController : ApiControllerBase
             await Log("PARTY_CREATED", "Party", body.PartyCode,
                 $"{body.LegalName} ({body.Type})", 1);
 
-            return Ok(new { id = user.UserId, message = $"{body.LegalName} added." });
+            return Ok(new
+            {
+                id = user.UserId,
+                partyCode = body.PartyCode,
+                message = $"{body.LegalName} saved as {body.PartyCode}."
+            });
         }
         catch (Exception ex)
         {
@@ -502,7 +534,7 @@ public class PartiesController : ApiControllerBase
             user.PrimaryLocationId = body.DefaultLocationId;
             user.IsActive = body.IsActive;
 
-            party.PartyCode = body.PartyCode.Trim().ToUpperInvariant();
+            party.PartyCode = (body.PartyCode ?? party.PartyCode).Trim().ToUpperInvariant();
             party.LegalName = body.LegalName.Trim();
             party.DisplayName = string.IsNullOrWhiteSpace(body.DisplayName) ? null : body.DisplayName.Trim();
             party.CategoryId = body.CategoryId;
@@ -567,11 +599,10 @@ public class PartiesController : ApiControllerBase
     private async Task<string?> ValidateParty(PartyRequest b, int? existingId)
     {
         if (string.IsNullOrWhiteSpace(b.LegalName)) return "Legal name is required.";
-        if (string.IsNullOrWhiteSpace(b.PartyCode)) return "Party code is required.";
         if (b.CreditLimit < 0) return "Credit limit cannot be negative.";
         if (b.CreditDays < 0 || b.CreditDays > 365) return "Credit days must be between 0 and 365.";
 
-        var code = b.PartyCode.Trim().ToUpperInvariant();
+        var code = (b.PartyCode ?? "").Trim().ToUpperInvariant();
         var codeTaken = await _db.Parties
             .AnyAsync(p => p.PartyCode.ToUpper() == code && (existingId == null || p.UserId != existingId));
         if (codeTaken) return $"Party code {code} is already in use.";
@@ -597,7 +628,7 @@ public class PartiesController : ApiControllerBase
     // ══════════════════════════ request bodies ══════════════════════════
 
     public record PartyRequest(
-        string PartyCode, string LegalName, string? DisplayName, string Type,
+        string? PartyCode, string LegalName, string? DisplayName, string Type,
         string? Email, string? Phone, string? AltPhone, string? AddressLine,
         int CategoryId, int CityId, string? Industry,
         string? Ntn, string? Strn, string? Cnic,

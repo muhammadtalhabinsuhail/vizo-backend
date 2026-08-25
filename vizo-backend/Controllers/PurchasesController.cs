@@ -628,4 +628,474 @@ public class PurchasesController : ApiControllerBase
             return Fail(ex, "load purchase lookups");
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CREATE  --  PO, GRN, PI, PR
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Raises a purchase order. Line totals are recomputed here from qty, cost
+    /// and tax; a total that arrives from the browser is a total anybody can
+    /// edit.
+    /// </summary>
+    [HttpPost("orders")]
+    public async Task<IActionResult> CreatePurchaseOrder([FromBody] PoRequest body)
+    {
+        try
+        {
+            var err = await ValidateLines(body.Lines, body.SupplierId, body.LocationId);
+            if (err is not null) return BadRequest(new { message = err });
+
+            var me = await CurrentEmployeeId();
+            if (me is null) return BadRequest(new { message = "Only a staff account can raise a purchase order." });
+
+            var status = await _db.PurchaseOrderStatuses
+                .FirstOrDefaultAsync(s => s.StatusKey == (body.SubmitForApproval ? "PENDING_APPROVAL" : "DRAFT"));
+            if (status is null) return BadRequest(new { message = "Purchase-order statuses are not configured." });
+
+            decimal subtotal = 0, tax = 0;
+            foreach (var l in body.Lines)
+            {
+                var net = l.Qty * l.UnitCost;
+                subtotal += net;
+                tax += net * (l.TaxPercent / 100m);
+            }
+            var total = subtotal - body.Discount + tax;
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var po = new PurchaseOrder
+            {
+                PoNo = await NextNumber("PO"),
+                SupplierUserId = body.SupplierId,
+                LocationId = body.LocationId,
+                PoDate = body.PoDate ?? Today(),
+                ExpectedDate = body.ExpectedDate,
+                StatusId = status.StatusId,
+                Subtotal = subtotal,
+                DiscountAmount = body.Discount,
+                TaxAmount = tax,
+                TotalAmount = total,
+                Notes = body.Notes,
+                CreatedByUserId = me.Value,
+                ApprovedByUserId = null
+            };
+            _db.PurchaseOrders.Add(po);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                var net = l.Qty * l.UnitCost;
+                _db.PurchaseOrderItems.Add(new PurchaseOrderItem
+                {
+                    PoId = po.PoId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    Quantity = l.Qty,
+                    UnitCost = l.UnitCost,
+                    TaxPercent = l.TaxPercent,
+                    LineTotal = net + net * (l.TaxPercent / 100m)
+                });
+            }
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("PO_CREATED", "PurchaseOrder", po.PoNo, $"{body.Lines.Count} lines, {total:N0}", 1);
+            return Ok(new { id = po.PoId, poNo = po.PoNo, message = $"Purchase order {po.PoNo} saved." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save the purchase order");
+        }
+    }
+
+    /// <summary>
+    /// Approves a purchase order. Separate from creation on purpose: whoever
+    /// raises the order is not necessarily allowed to commit the money.
+    /// </summary>
+    [HttpPost("orders/{id:int}/approve")]
+    public async Task<IActionResult> ApprovePurchaseOrder(int id)
+    {
+        try
+        {
+            var po = await _db.PurchaseOrders.Include(p => p.Status)
+                .FirstOrDefaultAsync(p => p.PoId == id);
+            if (po is null) return NotFound(new { message = $"No purchase order with id {id}." });
+            if (po.Status.StatusKey is "APPROVED" or "RECEIVED" or "CLOSED")
+                return BadRequest(new { message = $"{po.PoNo} is already {po.Status.StatusName}." });
+
+            var me = await CurrentEmployeeId();
+            if (me is null) return BadRequest(new { message = "Only a staff account can approve a purchase order." });
+
+            var approved = await _db.PurchaseOrderStatuses.FirstOrDefaultAsync(s => s.StatusKey == "APPROVED");
+            if (approved is null) return BadRequest(new { message = "No APPROVED status is configured." });
+
+            po.StatusId = approved.StatusId;
+            po.ApprovedByUserId = me.Value;
+            await _db.SaveChangesAsync();
+            await Log("PO_APPROVED", "PurchaseOrder", po.PoNo, $"{po.TotalAmount:N0}", 2);
+
+            return Ok(new { id, message = $"{po.PoNo} approved." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"approve purchase order {id}");
+        }
+    }
+
+    /// <summary>
+    /// Records a goods receipt. THIS IS WHERE STOCK RISES -- not at the invoice.
+    /// Damaged units are received but not added to sellable stock.
+    /// </summary>
+    [HttpPost("grns")]
+    public async Task<IActionResult> CreateGrn([FromBody] GrnRequest body)
+    {
+        try
+        {
+            if (body.Lines is null || body.Lines.Count == 0)
+                return BadRequest(new { message = "A goods receipt needs at least one line." });
+            if (!await _db.Parties.AnyAsync(p => p.UserId == body.SupplierId))
+                return BadRequest(new { message = "Pick a valid supplier." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+                return BadRequest(new { message = "Pick a valid location." });
+            if (string.IsNullOrWhiteSpace(body.DeliveryNoteNo))
+                return BadRequest(new { message = "The supplier's delivery-note number is required." });
+
+            foreach (var l in body.Lines)
+            {
+                if (l.QtyReceived <= 0)
+                    return BadRequest(new { message = "Every line needs a received quantity above zero." });
+                if (l.QtyDamaged < 0 || l.QtyDamaged > l.QtyReceived)
+                    return BadRequest(new { message = "Damaged cannot be negative or more than received." });
+                if (!await _db.Products.AnyAsync(p => p.ProductId == l.ProductId))
+                    return BadRequest(new { message = $"Product {l.ProductId} does not exist." });
+            }
+
+            var me = await CurrentEmployeeId();
+            if (me is null) return BadRequest(new { message = "Only a staff account can receive stock." });
+
+            var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "POSTED");
+            if (posted is null) return BadRequest(new { message = "No POSTED status is configured." });
+
+            var receipt = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "PURCHASE")
+                          ?? await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "RECEIPT");
+            if (receipt is null) return BadRequest(new { message = "No inbound movement type is configured." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var grn = new GoodsReceipt
+            {
+                GrnNo = await NextNumber("GRN"),
+                PoId = body.PoId,
+                SupplierUserId = body.SupplierId,
+                LocationId = body.LocationId,
+                ReceiptDate = body.ReceiptDate ?? Today(),
+                DeliveryNoteNo = body.DeliveryNoteNo.Trim(),
+                VehicleNo = body.VehicleNo,
+                TotalValue = body.Lines.Sum(l => l.QtyReceived * l.UnitCost),
+                StatusId = posted.StatusId,
+                ReceivedByUserId = me.Value,
+                Notes = body.Notes
+            };
+            _db.GoodsReceipts.Add(grn);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                _db.GoodsReceiptItems.Add(new GoodsReceiptItem
+                {
+                    GrnId = grn.GrnId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    QtyReceived = l.QtyReceived,
+                    QtyDamaged = l.QtyDamaged,
+                    UnitCost = l.UnitCost,
+                    BatchNo = l.BatchNo,
+                    ExpiryDate = l.ExpiryDate
+                });
+
+                /* Only ACCEPTED units go on the shelf. Damaged ones are recorded
+                   on the line so the claim against the supplier has evidence,
+                   but they are not sellable and must not inflate stock. */
+                var accepted = l.QtyReceived - l.QtyDamaged;
+                if (accepted <= 0) continue;
+
+                var bal = await _db.StockBalances
+                    .FirstOrDefaultAsync(s => s.ProductId == l.ProductId && s.LocationId == body.LocationId);
+                if (bal is null)
+                {
+                    bal = new StockBalance { ProductId = l.ProductId, LocationId = body.LocationId, Quantity = 0 };
+                    _db.StockBalances.Add(bal);
+                }
+                bal.Quantity += accepted;
+
+                _db.StockMovements.Add(new StockMovement
+                {
+                    ProductId = l.ProductId,
+                    LocationId = body.LocationId,
+                    MovementTypeId = receipt.MovementTypeId,
+                    MovedAt = Now(),
+                    ReferenceNo = grn.GrnNo,
+                    Quantity = accepted,
+                    BalanceAfter = bal.Quantity,
+                    UserId = CurrentUserId()
+                });
+            }
+            await _db.SaveChangesAsync();
+
+            /* Move the PO along so the buyer can see what has landed. */
+            if (body.PoId is not null)
+            {
+                var po = await _db.PurchaseOrders
+                    .Include(p => p.PurchaseOrderItems)
+                    .Include(p => p.GoodsReceipts).ThenInclude(g => g.GoodsReceiptItems)
+                    .FirstOrDefaultAsync(p => p.PoId == body.PoId);
+                if (po is not null)
+                {
+                    var ordered = po.PurchaseOrderItems.Sum(i => i.Quantity);
+                    var got = po.GoodsReceipts.SelectMany(g => g.GoodsReceiptItems).Sum(i => i.QtyReceived);
+                    var key = got >= ordered ? "RECEIVED" : "PARTIALLY_RECEIVED";
+                    var st = await _db.PurchaseOrderStatuses.FirstOrDefaultAsync(s => s.StatusKey == key);
+                    if (st is not null) po.StatusId = st.StatusId;
+                    await _db.SaveChangesAsync();
+                }
+            }
+
+            await tx.CommitAsync();
+            await Log("GRN_CREATED", "GoodsReceipt", grn.GrnNo,
+                $"{body.Lines.Count} lines, {grn.TotalValue:N0}", 1);
+
+            return Ok(new { id = grn.GrnId, grnNo = grn.GrnNo, message = $"{grn.GrnNo} received and stock updated." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "record the goods receipt");
+        }
+    }
+
+    /// <summary>
+    /// Records the supplier's bill. The PAYABLE rises here; stock does not move
+    /// (that happened at the GRN). SupplierInvoiceNo is their number on their
+    /// paper -- ours is generated.
+    /// </summary>
+    [HttpPost("invoices")]
+    public async Task<IActionResult> CreatePurchaseInvoice([FromBody] PiRequest body)
+    {
+        try
+        {
+            var err = await ValidateLines(body.Lines, body.SupplierId, null);
+            if (err is not null) return BadRequest(new { message = err });
+            if (string.IsNullOrWhiteSpace(body.SupplierInvoiceNo))
+                return BadRequest(new { message = "The supplier's own invoice number is required." });
+            if (body.WhtAmount < 0)
+                return BadRequest(new { message = "Withholding tax cannot be negative." });
+
+            var me = await CurrentEmployeeId();
+            if (me is null) return BadRequest(new { message = "Only a staff account can record a purchase invoice." });
+
+            var status = await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "ISSUED")
+                         ?? await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
+            if (status is null) return BadRequest(new { message = "Invoice statuses are not configured." });
+
+            decimal subtotal = 0, tax = 0;
+            foreach (var l in body.Lines)
+            {
+                var net = l.Qty * l.UnitCost;
+                subtotal += net;
+                tax += net * (l.TaxPercent / 100m);
+            }
+            var total = subtotal - body.Discount + tax - body.WhtAmount;
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var pi = new PurchaseInvoice
+            {
+                InvoiceNo = await NextNumber("PI"),
+                SupplierInvoiceNo = body.SupplierInvoiceNo.Trim(),
+                SupplierUserId = body.SupplierId,
+                PoId = body.PoId,
+                InvoiceDate = body.InvoiceDate ?? Today(),
+                DueDate = body.DueDate ?? (body.InvoiceDate ?? Today()).AddDays(30),
+                Subtotal = subtotal,
+                DiscountAmount = body.Discount,
+                TaxAmount = tax,
+                WhtAmount = body.WhtAmount,
+                TotalAmount = total,
+                StatusId = status.StatusId,
+                MethodId = body.MethodId,
+                CreatedByUserId = me.Value
+            };
+            _db.PurchaseInvoices.Add(pi);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                var net = l.Qty * l.UnitCost;
+                _db.PurchaseInvoiceItems.Add(new PurchaseInvoiceItem
+                {
+                    PiId = pi.PiId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    Quantity = l.Qty,
+                    UnitCost = l.UnitCost,
+                    TaxPercent = l.TaxPercent,
+                    LineTotal = net + net * (l.TaxPercent / 100m)
+                });
+            }
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("PI_CREATED", "PurchaseInvoice", pi.InvoiceNo,
+                $"{body.SupplierInvoiceNo} / {total:N0}", 2);
+
+            return Ok(new { id = pi.PiId, invoiceNo = pi.InvoiceNo, message = $"Purchase invoice {pi.InvoiceNo} saved." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save the purchase invoice");
+        }
+    }
+
+    /// <summary>Sends goods back to a supplier and takes them off the shelf.</summary>
+    [HttpPost("returns")]
+    public async Task<IActionResult> CreatePurchaseReturn([FromBody] PrRequest body)
+    {
+        try
+        {
+            if (body.Lines is null || body.Lines.Count == 0)
+                return BadRequest(new { message = "A purchase return needs at least one line." });
+            if (string.IsNullOrWhiteSpace(body.Reason))
+                return BadRequest(new { message = "A reason is required." });
+
+            var pi = await _db.PurchaseInvoices.FirstOrDefaultAsync(p => p.PiId == body.PiId);
+            if (pi is null) return BadRequest(new { message = "Pick a valid purchase invoice." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+                return BadRequest(new { message = "Pick a valid location." });
+
+            var me = await CurrentEmployeeId();
+            if (me is null) return BadRequest(new { message = "Only a staff account can raise a purchase return." });
+
+            var status = await _db.ReturnStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
+            if (status is null) return BadRequest(new { message = "Return statuses are not configured." });
+
+            var issue = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "PURCHASE_RETURN")
+                        ?? await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "ISSUE");
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var pr = new PurchaseReturn
+            {
+                ReturnNo = await NextNumber("PR"),
+                PiId = body.PiId,
+                SupplierUserId = pi.SupplierUserId,
+                LocationId = body.LocationId,
+                ReturnDate = body.ReturnDate ?? Today(),
+                Reason = body.Reason.Trim(),
+                StatusId = status.StatusId,
+                CreatedByUserId = me.Value
+            };
+            _db.PurchaseReturns.Add(pr);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                if (l.Qty <= 0)
+                    return BadRequest(new { message = "Every line needs a quantity above zero." });
+
+                _db.PurchaseReturnItems.Add(new PurchaseReturnItem
+                {
+                    PrId = pr.PrId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    Quantity = l.Qty,
+                    UnitCost = l.UnitCost
+                });
+
+                var bal = await _db.StockBalances
+                    .FirstOrDefaultAsync(s => s.ProductId == l.ProductId && s.LocationId == body.LocationId);
+                if (bal is null || bal.Quantity < l.Qty)
+                    return BadRequest(new
+                    {
+                        message = $"Cannot return {l.Qty} of product {l.ProductId} -- only {bal?.Quantity ?? 0} on hand."
+                    });
+
+                bal.Quantity -= l.Qty;
+                if (issue is not null)
+                {
+                    _db.StockMovements.Add(new StockMovement
+                    {
+                        ProductId = l.ProductId,
+                        LocationId = body.LocationId,
+                        MovementTypeId = issue.MovementTypeId,
+                        MovedAt = Now(),
+                        ReferenceNo = pr.ReturnNo,
+                        Quantity = -l.Qty,
+                        BalanceAfter = bal.Quantity,
+                        UserId = CurrentUserId()
+                    });
+                }
+            }
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("PR_CREATED", "PurchaseReturn", pr.ReturnNo, body.Reason, 2);
+            return Ok(new { id = pr.PrId, returnNo = pr.ReturnNo, message = $"Purchase return {pr.ReturnNo} saved." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save the purchase return");
+        }
+    }
+
+    // ════════════════════════ validation helper ════════════════════════
+
+    private async Task<string?> ValidateLines(List<PurchaseLineRequest>? lines, int supplierId, int? locationId)
+    {
+        if (lines is null || lines.Count == 0) return "At least one line is required.";
+        if (!await _db.Parties.AnyAsync(p => p.UserId == supplierId)) return "Pick a valid supplier.";
+        if (locationId is not null && !await _db.Locations.AnyAsync(l => l.LocationId == locationId))
+            return "Pick a valid location.";
+
+        foreach (var l in lines)
+        {
+            if (l.Qty <= 0) return "Every line needs a quantity above zero.";
+            if (l.UnitCost < 0) return "A unit cost cannot be negative.";
+            if (l.TaxPercent is < 0 or > 100) return "Tax must be between 0 and 100.";
+            if (!await _db.Products.AnyAsync(p => p.ProductId == l.ProductId))
+                return $"Product {l.ProductId} does not exist.";
+        }
+        return null;
+    }
+
+    // ══════════════════════════ request bodies ══════════════════════════
+
+    public record PurchaseLineRequest(int ProductId, int Qty, decimal UnitCost, decimal TaxPercent);
+
+    public record PoRequest(
+        int SupplierId, int LocationId, DateOnly? PoDate, DateOnly? ExpectedDate,
+        decimal Discount, string? Notes, bool SubmitForApproval,
+        List<PurchaseLineRequest> Lines);
+
+    public record GrnLineRequest(
+        int ProductId, int QtyReceived, int QtyDamaged, decimal UnitCost,
+        string? BatchNo, DateOnly? ExpiryDate);
+
+    public record GrnRequest(
+        int? PoId, int SupplierId, int LocationId, DateOnly? ReceiptDate,
+        string DeliveryNoteNo, string? VehicleNo, string? Notes,
+        List<GrnLineRequest> Lines);
+
+    public record PiRequest(
+        int SupplierId, int? PoId, string SupplierInvoiceNo,
+        DateOnly? InvoiceDate, DateOnly? DueDate,
+        decimal Discount, decimal WhtAmount, int MethodId,
+        List<PurchaseLineRequest> Lines);
+
+    public record PrRequest(
+        int PiId, int LocationId, DateOnly? ReturnDate, string Reason,
+        List<PurchaseLineRequest> Lines);
 }

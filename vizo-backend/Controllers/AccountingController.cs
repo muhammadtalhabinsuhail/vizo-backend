@@ -1198,20 +1198,6 @@ public class AccountingController : ApiControllerBase
         }
     }
 
-    // ════════════════════════ numbering helper ════════════════════════
-
-    private async Task<string> NextNumber(string prefix)
-    {
-        var series = await _db.DocumentSeries.FirstOrDefaultAsync(s => s.Prefix == prefix);
-        if (series is null) return $"{prefix}-{DateTime.UtcNow:yyyyMMddHHmmss}";
-
-        var n = series.NextNumber;
-        series.NextNumber = n + 1;
-        await _db.SaveChangesAsync();
-
-        var year = series.IncludeYear ? $"{DateTime.UtcNow:yyyy}-" : "";
-        return $"{series.Prefix}-{year}{n.ToString().PadLeft(series.Padding, '0')}";
-    }
 
     // ══════════════════════════ request bodies ══════════════════════════
 
@@ -1226,4 +1212,142 @@ public class AccountingController : ApiControllerBase
         DateOnly? ExpenseDate, int LocationId, string? CategoryName,
         int ExpenseAccountId, int PaidFromAccountId, decimal Amount,
         string VendorName, int MethodId, string? Description);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CREATE  --  voucher
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Records money in or out. The voucher TYPE decides the direction
+    /// (VoucherType.IsReceipt), and allocations attach it to the invoices it
+    /// pays -- an unallocated voucher is money that arrived with no idea what
+    /// it settles, which is how a customer ledger stops agreeing with the
+    /// invoice list.
+    /// </summary>
+    [HttpPost("vouchers")]
+    public async Task<IActionResult> CreateVoucher([FromBody] VoucherRequest body)
+    {
+        try
+        {
+            if (body.Amount <= 0)
+                return BadRequest(new { message = "A voucher needs an amount above zero." });
+
+            var type = await _db.VoucherTypes.FirstOrDefaultAsync(t => t.VoucherTypeId == body.VoucherTypeId);
+            if (type is null) return BadRequest(new { message = "Pick a valid voucher type." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+                return BadRequest(new { message = "Pick a valid location." });
+            if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
+                return BadRequest(new { message = "Pick a valid payment method." });
+            if (body.PartyId is not null && !await _db.Parties.AnyAsync(p => p.UserId == body.PartyId))
+                return BadRequest(new { message = "Pick a valid party." });
+            if (body.CashBankAccountId is not null &&
+                !await _db.Accounts.AnyAsync(a => a.AccountId == body.CashBankAccountId && !a.IsGroup))
+                return BadRequest(new { message = "Pick a valid cash or bank account." });
+
+            var allocated = (body.Allocations ?? new List<VoucherAllocationRequest>()).Sum(a => a.Amount);
+            if (allocated > body.Amount)
+                return BadRequest(new
+                {
+                    message = $"Allocated {allocated:N2} is more than the voucher amount {body.Amount:N2}."
+                });
+
+            var draft = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
+            var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
+            if (draft is null || posted is null)
+                return BadRequest(new { message = "Posting statuses are not configured." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var v = new Voucher
+            {
+                VoucherNo = await NextNumber(type.IsReceipt ? "RV" : "PV"),
+                VoucherTypeId = type.VoucherTypeId,
+                VoucherDate = body.VoucherDate ?? Today(),
+                LocationId = body.LocationId,
+                PartyUserId = body.PartyId,
+                CashBankAccountId = body.CashBankAccountId,
+                Amount = body.Amount,
+                MethodId = body.MethodId,
+                PaymentProvider = body.PaymentProvider,
+                ReferenceNo = body.Reference,
+                WalletTxnId = body.WalletTxnId,
+                Narration = body.Narration ?? "",
+                StatusId = body.PostImmediately ? posted.StatusId : draft.StatusId,
+                CreatedByUserId = CurrentUserId()
+            };
+            _db.Vouchers.Add(v);
+            await _db.SaveChangesAsync();
+
+            foreach (var a in body.Allocations ?? new List<VoucherAllocationRequest>())
+            {
+                if (a.Amount <= 0)
+                    return BadRequest(new { message = "An allocation cannot be zero or negative." });
+                if (a.SalesInvoiceId is null && a.PurchaseInvoiceId is null)
+                    return BadRequest(new { message = "An allocation must point at a sale or purchase invoice." });
+
+                _db.VoucherAllocations.Add(new VoucherAllocation
+                {
+                    VoucherId = v.VoucherId,
+                    SalesInvoiceId = a.SalesInvoiceId,
+                    PurchaseInvoiceId = a.PurchaseInvoiceId,
+                    Amount = a.Amount
+                });
+            }
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log(type.IsReceipt ? "RECEIPT_RECORDED" : "PAYMENT_RECORDED",
+                "Voucher", v.VoucherNo, $"{body.Amount:N2}", 2);
+
+            return Ok(new
+            {
+                id = v.VoucherId,
+                voucherNo = v.VoucherNo,
+                unallocated = body.Amount - allocated,
+                message = $"{v.VoucherNo} saved" + (body.PostImmediately ? " and posted." : " as a draft.")
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save the voucher");
+        }
+    }
+
+    /// <summary>Posts a draft voucher.</summary>
+    [HttpPost("vouchers/{id:int}/post")]
+    public async Task<IActionResult> PostVoucher(int id)
+    {
+        try
+        {
+            var v = await _db.Vouchers.Include(x => x.Status)
+                .FirstOrDefaultAsync(x => x.VoucherId == id);
+            if (v is null) return NotFound(new { message = $"No voucher with id {id}." });
+            if (v.Status.StatusKey == Posted)
+                return BadRequest(new { message = $"{v.VoucherNo} is already posted." });
+
+            var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
+            if (posted is null) return BadRequest(new { message = "No POSTED status is configured." });
+
+            v.StatusId = posted.StatusId;
+            await _db.SaveChangesAsync();
+            await Log("VOUCHER_POSTED", "Voucher", v.VoucherNo, $"{v.Amount:N2}", 2);
+
+            return Ok(new { id, message = $"{v.VoucherNo} posted." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"post voucher {id}");
+        }
+    }
+
+    // ══════════════════════ request bodies (part 2) ═════════════════════
+
+    public record VoucherAllocationRequest(int? SalesInvoiceId, int? PurchaseInvoiceId, decimal Amount);
+
+    public record VoucherRequest(
+        int VoucherTypeId, DateOnly? VoucherDate, int LocationId, int? PartyId,
+        int? CashBankAccountId, decimal Amount, int MethodId,
+        string? PaymentProvider, string? Reference, string? WalletTxnId,
+        string? Narration, bool PostImmediately,
+        List<VoucherAllocationRequest>? Allocations);
 }

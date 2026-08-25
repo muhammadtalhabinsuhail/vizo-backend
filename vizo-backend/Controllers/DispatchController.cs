@@ -267,20 +267,6 @@ public class DispatchController : ApiControllerBase
         }
     }
 
-    // ════════════════════════ numbering helper ════════════════════════
-
-    private async Task<string> NextNumber(string prefix)
-    {
-        var series = await _db.DocumentSeries.FirstOrDefaultAsync(s => s.Prefix == prefix);
-        if (series is null) return $"{prefix}-{DateTime.UtcNow:yyyyMMddHHmmss}";
-
-        var n = series.NextNumber;
-        series.NextNumber = n + 1;
-        await _db.SaveChangesAsync();
-
-        var year = series.IncludeYear ? $"{DateTime.UtcNow:yyyy}-" : "";
-        return $"{series.Prefix}-{year}{n.ToString().PadLeft(series.Padding, '0')}";
-    }
 
     // ══════════════════════════ request bodies ══════════════════════════
 

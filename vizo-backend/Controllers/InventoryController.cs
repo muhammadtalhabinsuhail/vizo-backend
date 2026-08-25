@@ -442,6 +442,78 @@ public class InventoryController : ApiControllerBase
         }
     }
 
+
+    /// <summary>
+    /// Deletes a category. Refuses while products still point at it -- the FK
+    /// would reject it anyway, but a clear message beats a 23503 in the log.
+    /// </summary>
+    [HttpDelete("categories/{id:int}")]
+    public async Task<IActionResult> DeleteCategory(int id)
+    {
+        try
+        {
+            var c = await _db.Categories
+                .Include(x => x.Products)
+                .Include(x => x.InverseParentCategory)
+                .FirstOrDefaultAsync(x => x.CategoryId == id);
+            if (c is null) return NotFound(new { message = $"No category with id {id}." });
+
+            if (c.Products.Count > 0)
+                return BadRequest(new
+                {
+                    message = $"{c.CategoryName} still has {c.Products.Count} product(s). " +
+                              "Move them to another category first, or set this one inactive instead."
+                });
+            if (c.InverseParentCategory.Count > 0)
+                return BadRequest(new
+                {
+                    message = $"{c.CategoryName} has {c.InverseParentCategory.Count} sub-categor" +
+                              (c.InverseParentCategory.Count == 1 ? "y" : "ies") + ". Remove those first."
+                });
+
+            var name = c.CategoryName;
+            _db.Categories.Remove(c);
+            await _db.SaveChangesAsync();
+            await Log("CATEGORY_DELETED", "Category", id.ToString(), name, 3);
+
+            return Ok(new { id, message = $"{name} deleted." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"delete category {id}");
+        }
+    }
+
+    /// <summary>Deletes a brand. Refuses while products still point at it.</summary>
+    [HttpDelete("brands/{id:int}")]
+    public async Task<IActionResult> DeleteBrand(int id)
+    {
+        try
+        {
+            var b = await _db.Brands.Include(x => x.Products)
+                .FirstOrDefaultAsync(x => x.BrandId == id);
+            if (b is null) return NotFound(new { message = $"No brand with id {id}." });
+
+            if (b.Products.Count > 0)
+                return BadRequest(new
+                {
+                    message = $"{b.BrandName} still has {b.Products.Count} product(s). " +
+                              "Reassign them first, or set this brand inactive instead."
+                });
+
+            var name = b.BrandName;
+            _db.Brands.Remove(b);
+            await _db.SaveChangesAsync();
+            await Log("BRAND_DELETED", "Brand", id.ToString(), name, 3);
+
+            return Ok(new { id, message = $"{name} deleted." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"delete brand {id}");
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════
     //  STOCK LEVELS AND MOVEMENTS
     // ══════════════════════════════════════════════════════════════════
@@ -805,4 +877,311 @@ public class InventoryController : ApiControllerBase
     public record CategoryRequest(string Name, int? ParentId, bool IsActive);
 
     public record BrandRequest(string Code, string Name, string? Description, bool IsActive);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  CREATE  --  adjustments and transfers
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Corrects the shelf count. The line carries CurrentQty (what the system
+    /// thought) and NewQty (what was actually counted); the difference is what
+    /// moves. CurrentQty is re-read from StockBalance here rather than trusted
+    /// from the browser, because between opening the form and saving it somebody
+    /// else may have sold the same item -- writing the client's stale figure back
+    /// would silently undo their sale.
+    /// </summary>
+    [HttpPost("adjustments")]
+    public async Task<IActionResult> CreateAdjustment([FromBody] AdjustmentRequest body)
+    {
+        try
+        {
+            if (body.Lines is null || body.Lines.Count == 0)
+                return BadRequest(new { message = "An adjustment needs at least one line." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+                return BadRequest(new { message = "Pick a valid location." });
+            if (!await _db.AdjustmentReasons.AnyAsync(r => r.ReasonId == body.ReasonId))
+                return BadRequest(new { message = "Pick a valid reason." });
+            foreach (var l in body.Lines)
+            {
+                if (l.NewQty < 0) return BadRequest(new { message = "A counted quantity cannot be negative." });
+                if (!await _db.Products.AnyAsync(p => p.ProductId == l.ProductId))
+                    return BadRequest(new { message = $"Product {l.ProductId} does not exist." });
+            }
+
+            var me = await CurrentEmployeeId();
+            if (me is null) return BadRequest(new { message = "Only a staff account can correct stock." });
+
+            var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "POSTED");
+            var type = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "ADJUSTMENT");
+            if (posted is null || type is null)
+                return BadRequest(new { message = "POSTED status or ADJUSTMENT movement type is not configured." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var adj = new StockAdjustment
+            {
+                AdjustmentNo = await NextNumber("ADJ"),
+                LocationId = body.LocationId,
+                AdjustmentDate = body.AdjustmentDate ?? Today(),
+                ReasonId = body.ReasonId,
+                ReasonNotes = body.ReasonNotes ?? "",
+                StatusId = posted.StatusId,
+                CreatedByUserId = me.Value
+            };
+            _db.StockAdjustments.Add(adj);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            var moved = 0;
+            foreach (var l in body.Lines)
+            {
+                var bal = await _db.StockBalances
+                    .FirstOrDefaultAsync(s => s.ProductId == l.ProductId && s.LocationId == body.LocationId);
+                if (bal is null)
+                {
+                    bal = new StockBalance { ProductId = l.ProductId, LocationId = body.LocationId, Quantity = 0 };
+                    _db.StockBalances.Add(bal);
+                    await _db.SaveChangesAsync();
+                }
+
+                var current = bal.Quantity;          // the truth, right now
+                var delta = l.NewQty - current;
+
+                _db.StockAdjustmentItems.Add(new StockAdjustmentItem
+                {
+                    AdjustmentId = adj.AdjustmentId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    CurrentQty = current,
+                    NewQty = l.NewQty
+                });
+
+                if (delta == 0) continue;          // counted the same, nothing to move
+                bal.Quantity = l.NewQty;
+                moved++;
+
+                _db.StockMovements.Add(new StockMovement
+                {
+                    ProductId = l.ProductId,
+                    LocationId = body.LocationId,
+                    MovementTypeId = type.MovementTypeId,
+                    MovedAt = Now(),
+                    ReferenceNo = adj.AdjustmentNo,
+                    Quantity = delta,
+                    BalanceAfter = bal.Quantity,
+                    UserId = CurrentUserId()
+                });
+            }
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("STOCK_ADJUSTED", "StockAdjustment", adj.AdjustmentNo,
+                $"{moved} of {body.Lines.Count} lines moved", 3);
+
+            return Ok(new
+            {
+                id = adj.AdjustmentId,
+                adjustmentNo = adj.AdjustmentNo,
+                linesChanged = moved,
+                message = moved == 0
+                    ? $"{adj.AdjustmentNo} saved. Every line matched the system count, so no stock moved."
+                    : $"{adj.AdjustmentNo} posted. {moved} line(s) corrected."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "post the stock adjustment");
+        }
+    }
+
+    /// <summary>
+    /// Moves stock between two locations. Goods leave the FROM shelf
+    /// immediately and are only added to the TO shelf when the receiving end
+    /// confirms (POST transfers/{id}/receive) -- stock in a van belongs to
+    /// neither shelf, and counting it in both is how a transfer creates
+    /// inventory out of nothing.
+    /// </summary>
+    [HttpPost("transfers")]
+    public async Task<IActionResult> CreateTransfer([FromBody] TransferRequest body)
+    {
+        try
+        {
+            if (body.Lines is null || body.Lines.Count == 0)
+                return BadRequest(new { message = "A transfer needs at least one line." });
+            if (body.FromLocationId == body.ToLocationId)
+                return BadRequest(new { message = "From and To must be different locations." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.FromLocationId))
+                return BadRequest(new { message = "Pick a valid source location." });
+            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.ToLocationId))
+                return BadRequest(new { message = "Pick a valid destination location." });
+
+            var me = await CurrentEmployeeId();
+            if (me is null) return BadRequest(new { message = "Only a staff account can move stock." });
+
+            var status = await _db.TransferStatuses.FirstOrDefaultAsync(s => s.StatusKey == "IN_TRANSIT");
+            var outType = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "TRANSFER_OUT");
+            if (status is null || outType is null)
+                return BadRequest(new { message = "IN_TRANSIT status or TRANSFER_OUT movement type is not configured." });
+
+            /* Check every line before moving any of them, so a short line on
+               row 5 does not leave rows 1-4 already deducted. */
+            foreach (var l in body.Lines)
+            {
+                if (l.Qty <= 0) return BadRequest(new { message = "Every line needs a quantity above zero." });
+                var have = await _db.StockBalances
+                    .Where(s => s.ProductId == l.ProductId && s.LocationId == body.FromLocationId)
+                    .Select(s => (int?)s.Quantity).FirstOrDefaultAsync() ?? 0;
+                if (have < l.Qty)
+                {
+                    var p = await _db.Products.AsNoTracking().FirstOrDefaultAsync(x => x.ProductId == l.ProductId);
+                    return BadRequest(new
+                    {
+                        message = $"{p?.ProductName ?? $"Product {l.ProductId}"}: asked for {l.Qty}, only {have} on the source shelf."
+                    });
+                }
+            }
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var tr = new StockTransfer
+            {
+                TransferNo = await NextNumber("TRF"),
+                FromLocationId = body.FromLocationId,
+                ToLocationId = body.ToLocationId,
+                TransferDate = body.TransferDate ?? Today(),
+                StatusId = status.StatusId,
+                InitiatedByUserId = me.Value,
+                ApprovedByUserId = null,
+                ReceivedOn = null,
+                Notes = body.Notes
+            };
+            _db.StockTransfers.Add(tr);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                _db.StockTransferItems.Add(new StockTransferItem
+                {
+                    TransferId = tr.TransferId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    Quantity = l.Qty
+                });
+
+                var from = await _db.StockBalances
+                    .FirstAsync(s => s.ProductId == l.ProductId && s.LocationId == body.FromLocationId);
+                from.Quantity -= l.Qty;
+
+                _db.StockMovements.Add(new StockMovement
+                {
+                    ProductId = l.ProductId,
+                    LocationId = body.FromLocationId,
+                    MovementTypeId = outType.MovementTypeId,
+                    MovedAt = Now(),
+                    ReferenceNo = tr.TransferNo,
+                    Quantity = -l.Qty,
+                    BalanceAfter = from.Quantity,
+                    UserId = CurrentUserId()
+                });
+            }
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("TRANSFER_SENT", "StockTransfer", tr.TransferNo,
+                $"{body.Lines.Count} lines", 2);
+
+            return Ok(new
+            {
+                id = tr.TransferId,
+                transferNo = tr.TransferNo,
+                message = $"{tr.TransferNo} sent. Stock leaves the source now and lands when the destination receives it."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "send the stock transfer");
+        }
+    }
+
+    /// <summary>The receiving end confirms; this is when stock lands on the TO shelf.</summary>
+    [HttpPost("transfers/{id:int}/receive")]
+    public async Task<IActionResult> ReceiveTransfer(int id)
+    {
+        try
+        {
+            var tr = await _db.StockTransfers
+                .Include(t => t.Status)
+                .Include(t => t.StockTransferItems)
+                .FirstOrDefaultAsync(t => t.TransferId == id);
+
+            if (tr is null) return NotFound(new { message = $"No transfer with id {id}." });
+            if (tr.Status.StatusKey == "RECEIVED")
+                return BadRequest(new { message = $"{tr.TransferNo} was already received." });
+            if (tr.Status.StatusKey is "DRAFT" or "REJECTED")
+                return BadRequest(new { message = $"{tr.TransferNo} is {tr.Status.StatusName} and has not been sent." });
+
+            var me = await CurrentEmployeeId();
+            if (me is null) return BadRequest(new { message = "Only a staff account can receive a transfer." });
+
+            var received = await _db.TransferStatuses.FirstOrDefaultAsync(s => s.StatusKey == "RECEIVED");
+            var inType = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "TRANSFER_IN");
+            if (received is null || inType is null)
+                return BadRequest(new { message = "RECEIVED status or TRANSFER_IN movement type is not configured." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            foreach (var l in tr.StockTransferItems)
+            {
+                var to = await _db.StockBalances
+                    .FirstOrDefaultAsync(s => s.ProductId == l.ProductId && s.LocationId == tr.ToLocationId);
+                if (to is null)
+                {
+                    to = new StockBalance { ProductId = l.ProductId, LocationId = tr.ToLocationId, Quantity = 0 };
+                    _db.StockBalances.Add(to);
+                    await _db.SaveChangesAsync();
+                }
+                to.Quantity += l.Quantity;
+
+                _db.StockMovements.Add(new StockMovement
+                {
+                    ProductId = l.ProductId,
+                    LocationId = tr.ToLocationId,
+                    MovementTypeId = inType.MovementTypeId,
+                    MovedAt = Now(),
+                    ReferenceNo = tr.TransferNo,
+                    Quantity = l.Quantity,
+                    BalanceAfter = to.Quantity,
+                    UserId = CurrentUserId()
+                });
+            }
+
+            tr.StatusId = received.StatusId;
+            tr.ReceivedOn = Today();
+            tr.ApprovedByUserId = me.Value;
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("TRANSFER_RECEIVED", "StockTransfer", tr.TransferNo, null, 2);
+            return Ok(new { id, message = $"{tr.TransferNo} received. Stock is now on the destination shelf." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"receive transfer {id}");
+        }
+    }
+
+    // ══════════════════════ request bodies (part 2) ═════════════════════
+
+    public record AdjustmentLineRequest(int ProductId, int NewQty);
+
+    public record AdjustmentRequest(
+        int LocationId, DateOnly? AdjustmentDate, int ReasonId, string? ReasonNotes,
+        List<AdjustmentLineRequest> Lines);
+
+    public record TransferLineRequest(int ProductId, int Qty);
+
+    public record TransferRequest(
+        int FromLocationId, int ToLocationId, DateOnly? TransferDate, string? Notes,
+        List<TransferLineRequest> Lines);
 }

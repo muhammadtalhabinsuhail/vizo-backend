@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
 
 namespace vizo_backend.Controllers;
@@ -100,5 +101,43 @@ public abstract class ApiControllerBase : ControllerBase
             LoggedAt = Now()
         });
         await _db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Next document number for a series, read straight off "DocumentSeries" so
+    /// the prefix, padding and year setting a Super Admin picked at
+    /// /admin/numbering are the ones actually used. Increments NextNumber in the
+    /// same call.
+    ///
+    /// KNOWN LIMIT: the read and the increment are not atomic against another
+    /// connection, so two documents created in the same instant can take the
+    /// same number. The proper fix is one PostgreSQL sequence per series, which
+    /// is a schema change -- it is written up in
+    /// backend/Database/db_code_changes.txt section 3.1 rather than faked here.
+    /// </summary>
+    protected async Task<string> NextNumber(string prefix)
+    {
+        var series = await _db.DocumentSeries.FirstOrDefaultAsync(s => s.Prefix == prefix);
+        if (series is null) return $"{prefix}-{DateTime.UtcNow:yyyyMMddHHmmss}";
+
+        var n = series.NextNumber;
+        series.NextNumber = n + 1;
+        await _db.SaveChangesAsync();
+
+        var year = series.IncludeYear ? $"{DateTime.UtcNow:yy}-" : "";
+        return $"{series.Prefix}-{year}{n.ToString().PadLeft(series.Padding, '0')}";
+    }
+
+    /// <summary>
+    /// The signed-in user as an EMPLOYEE id. Purchase-side documents
+    /// (PurchaseOrder, GoodsReceipt, PurchaseInvoice, PurchaseReturn,
+    /// StockAdjustment, StockTransfer) and Claim/Collection/Delivery all have
+    /// FKs to "Employee", not "User" -- they share the same key, but only staff
+    /// have an Employee row, so this checks rather than assumes.
+    /// </summary>
+    protected async Task<int?> CurrentEmployeeId()
+    {
+        var id = CurrentUserId();
+        return await _db.Employees.AnyAsync(e => e.UserId == id) ? id : null;
     }
 }

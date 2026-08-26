@@ -830,6 +830,30 @@ public class InventoryController : ApiControllerBase
                     .ToListAsync(),
                 transferStatuses = await _db.TransferStatuses.AsNoTracking()
                     .Select(s => new { id = s.StatusId, key = s.StatusKey, name = s.StatusName })
+                    .ToListAsync(),
+
+                /* Every active product, for the item pickers on the adjustment
+                   and transfer forms. Those two screens used to import a
+                   hard-coded array from the frontend's src/data/products, so a
+                   product created minutes earlier could not be adjusted or
+                   transferred at all -- it simply was not in the list. Read
+                   live here so the picker is never behind the catalogue.
+                   totalStock is the sum across locations; the per-location
+                   figure the adjustment form actually needs comes from
+                   GET /inventory/stock-levels?locationId=. */
+                products = await _db.Products.AsNoTracking()
+                    .Where(p => p.IsActive)
+                    .OrderBy(p => p.ProductName)
+                    .Select(p => new
+                    {
+                        id = p.ProductId,
+                        sku = p.Sku,
+                        name = p.ProductName,
+                        packing = p.Packing,
+                        costPrice = p.CostPrice,
+                        salePrice = p.SalePrice,
+                        totalStock = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
+                    })
                     .ToListAsync()
             });
         }

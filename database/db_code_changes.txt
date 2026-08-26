@@ -452,5 +452,176 @@ WHERE "Email" IN ('nadia@vizo.com.pk', 'junaid@vizo.com.pk', 'ahmed@vizo.com.pk'
       "ActivityLog" entities as they are, and adds no table.
 
 ═══════════════════════════════════════════════════════════════════════════════
+ SECTION 9 — 2026-08-26 — STALE DROPDOWNS: ROOT CAUSE AND FIX
+═══════════════════════════════════════════════════════════════════════════════
+
+ NO SCHEMA CHANGE WAS NEEDED, AND NO NEW TABLE OR MODEL WAS CREATED.
+ This section is here because section 5 of the brief asks for the dropdown
+ investigation to be written down either way.
+
+ THE REPORTED BUG
+   A product created on the New Product screen did not appear in the product
+   pickers on other screens (stock adjustment, stock transfer, purchase order
+   line, and so on).
+
+ WHAT IT WAS NOT
+   Not a caching problem, not Next.js App Router route caching, and not a
+   stale query on the server. Each of those was checked.
+
+ WHAT IT ACTUALLY WAS
+   Those screens were never connected. They imported a hard-coded TypeScript
+   array from the frontend's own source:
+
+       import { products } from "@/data/products";
+       import { activeLocations } from "@/data/settings";
+       import { parties } from "@/data/parties";
+
+   That file is compiled into the bundle. It cannot change when the database
+   changes, so no amount of refetching would ever have shown a new product --
+   there was no fetch at all. GET /api/purchases/lookups was already returning
+   the full live catalogue the whole time; the pages simply ignored it.
+
+ PROOF
+   Product id 35, SKU VZ-123-ER ("muhammadtalhabinsuhail"), was created through
+   the app by Talha between sessions. It was absent from every picker before
+   this change and present in all of them afterwards, with no restart.
+
+ THE FIX (frontend, plus one small API addition)
+   Every affected picker now fetches on mount with axios and renders from that
+   response. Fixed in:
+
+     components/widgets/report-toolbar.tsx   location filter -- SHARED by all
+                                             seven report screens, so a
+                                             location added at /admin/locations
+                                             never appeared on any report
+     inventory/adjustments/new               products, locations, reasons
+     inventory/transfers/new                 products, both locations
+     purchases/orders/new                    products, suppliers, locations
+     purchases/grns/new                      open POs, PO lines, locations
+     purchases/invoices/new                  products, suppliers, methods, POs
+     purchases/returns/new                   posted invoices, invoice lines,
+                                             locations
+
+   The reason list on the adjustment form was six <option> tags written into
+   the page while the API validates against the AdjustmentReason table, so a
+   reason edited in the database would have been rejected on save. It reads
+   the table now.
+
+ API ADDITION FOR THIS
+   GET /api/inventory/lookups gained a `products` array (active only). The
+   adjustment and transfer pickers had no live product source before; the only
+   one that existed was on the purchases controller, which is the wrong module
+   to reach into from an inventory screen.
+
+ HOW TO RE-TEST IT
+   1. Create a product at /inventory/products/new.
+   2. WITHOUT restarting anything, open each of:
+        /inventory/adjustments/new    /inventory/transfers/new
+        /purchases/orders/new         /purchases/invoices/new
+   3. Open the item picker on each. The new product must be listed.
+   4. Set it inactive at /inventory/products/<id> and repeat -- it must now be
+      absent, which proves the filter and not just the fetch.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 10 — 2026-08-26 — API ENDPOINTS ADDED OR WIDENED
+═══════════════════════════════════════════════════════════════════════════════
+
+ All are additions to EXISTING domain controllers. No controller file was
+ created, no service, DTO, interface or repository was introduced, and every
+ action is async and wrapped in try/catch reporting through Fail().
+
+ NEW
+   POST /api/accounting/periods/{id}/reopen        (previous session)
+   GET  /api/accounting/reconciliation/{id}        (previous session)
+   POST /api/accounting/reconciliation/{id}/match  (previous session)
+   POST /api/accounting/reconciliation/{id}/finalize (previous session)
+   POST /api/claims                                (previous session)
+   POST /api/claims/{id}/remind                    (previous session)
+   /api/profile/*                                  (previous session)
+
+ WIDENED IN THIS PASS
+   GET /api/inventory/lookups
+       + products[]  -- active catalogue for the adjustment/transfer pickers.
+
+   GET /api/purchases/orders/{id}
+       + lines[].received      how much of each line has actually arrived,
+                               counted off POSTED receipts only
+       + receipts[].statusName, receipts[].receivedBy, receipts[].unitsReceived
+       The list endpoint already returned a received percentage; the detail
+       endpoint did not, so the same order read "0% received" when opened.
+
+   GET /api/sales/invoices
+       + customerId filter, matching the one GetOrders already had. The party
+         detail screen shows one customer's invoices and would otherwise have
+         had to pull every invoice and filter in the browser.
+
+   GET /api/parties/{id}/statement
+       + company{}  letterhead for the printed statement, read from the
+                    Company table. /api/admin/company is SuperAdmin-only while
+                    a statement is printed by sales and accounts too, so the
+                    same row is served read-only alongside the statement it
+                    belongs to. The frontend previously imported a hard-coded
+                    `company` object, so anything changed at /admin/settings
+                    never reached the paper a customer receives.
+
+ NO NEW MODEL CLASS AND NO NEW TABLE WERE CREATED IN THIS PASS.
+ Everything above reads the scaffolded entities as they already are.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 11 — 2026-08-26 — STILL MISSING A BACKEND (not faked)
+═══════════════════════════════════════════════════════════════════════════════
+
+ Controls that had no endpoint behind them. Rather than leave a button that
+ reports success while doing nothing, each is either removed or plainly
+ disabled, and listed here so the gap is on record.
+
+ 11.1  CANCEL A PURCHASE ORDER
+       /purchases/orders/{id} carried a "Danger Zone" that cancelled the PO
+       and said the supplier had been notified. There is no cancel endpoint
+       and no outbound mail. Removed.
+       To build: POST /api/purchases/orders/{id}/cancel setting the status to
+       CANCELLED, refusing once anything has been received against it.
+
+ 11.2  RECORDING A PAYMENT FROM THE SUPPLIER INVOICE SCREEN
+       There is no supplier pay-run. The invoice screen shows paid and
+       outstanding and points at Money -> Vouchers, which is where payments
+       actually get recorded.
+
+ 11.3  CSV / MT940 BANK STATEMENT IMPORT
+       The reconciliation screen had an "Upload Statement" button with no
+       parser and no endpoint. BankStatementLine rows are seeded or entered.
+       Removed; the screen says where its lines come from.
+
+ 11.4  TWO-FACTOR AUTH and "SIGN OUT EVERYWHERE"
+       See section 6. Both need schema; both are shown as unavailable.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ SECTION 12 — 2026-08-26 — ROWS WRITTEN TO NEON WHILE VERIFYING
+═══════════════════════════════════════════════════════════════════════════════
+
+ 12.1  "Product" id 36, SKU ZZ-DROPDOWN-TEST, "Dropdown freshness probe"
+       Created live to prove the pickers refresh, confirmed present in all
+       four item pickers with no restart, then set IsActive = FALSE and
+       confirmed it disappeared from them. It is inactive, so it cannot reach
+       an order, invoice or packing screen.
+
+       Remove it if you want it gone:
+         DELETE FROM "ProductBarcode" WHERE "ProductId" = 36;
+         DELETE FROM "Product"        WHERE "ProductId" = 36;
+
+ 12.2  "Product" id 34, SKU ZZ-WIRING-TEST-01 -- from the previous session,
+       also inactive. Same removal SQL with 34. See section 7.1.
+
+ 12.3  NOT OURS, DO NOT DELETE: "Product" id 35, SKU VZ-123-ER, named
+       "muhammadtalhabinsuhail". Talha created this through the app between
+       sessions. It is a real user-created row and is left alone.
+
+ Nothing else was written. The earlier verification writes listed in section 7
+ were all reversed and remain so.
+
+═══════════════════════════════════════════════════════════════════════════════
  END
 ═══════════════════════════════════════════════════════════════════════════════

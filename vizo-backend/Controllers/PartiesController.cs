@@ -316,13 +316,50 @@ public class PartiesController : ApiControllerBase
                 closingBalance = running,
                 totalDebit = rows.Sum(r => r.debit),
                 totalCredit = rows.Sum(r => r.credit),
-                lines = rows
+                lines = rows,
+
+                /* Letterhead for the printed statement. It lives in AppSetting
+                   under the "company" group and is edited at /admin/settings,
+                   but that endpoint is SuperAdmin-only while a statement is
+                   printed by sales and accounts too -- so the same rows are
+                   served here, read-only, with the statement they belong to.
+                   The frontend previously imported a hard-coded `company`
+                   object, so a change made at /admin/settings never reached
+                   the paper a customer actually receives. */
+                company = await CompanyHeader()
             });
         }
         catch (Exception ex)
         {
             return Fail(ex, $"load the statement for party {id}");
         }
+    }
+
+    /// <summary>
+    /// Letterhead for the printed statement, off the single "Company" row.
+    ///
+    /// It is NOT in AppSetting -- company details have their own table, which
+    /// /admin/company serves. That endpoint is SuperAdmin-only while a
+    /// statement gets printed by sales and accounts too, so the same row is
+    /// read here. Returns nulls rather than throwing if the table is empty.
+    /// </summary>
+    private async Task<object?> CompanyHeader()
+    {
+        return await _db.Companies.AsNoTracking()
+            .Select(c => new
+            {
+                name = c.CompanyName,
+                legalName = c.LegalName,
+                ntn = c.Ntn,
+                strn = c.Strn,
+                email = c.Email,
+                phone = c.Phone,
+                city = c.City.CityName,
+                country = c.Country,
+                addressLine = c.AddressLine,
+                currencySymbol = c.CurrencySymbol
+            })
+            .FirstOrDefaultAsync();
     }
 
     // ══════════════════════════════════════════════════════════════════

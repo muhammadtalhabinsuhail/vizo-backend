@@ -414,7 +414,7 @@ public class SalesController : ApiControllerBase
     [HttpGet("invoices")]
     [Authorize(Policy = "BackOffice")]
     public async Task<IActionResult> GetInvoices(
-        [FromQuery] string? q, [FromQuery] string? status,
+        [FromQuery] string? q, [FromQuery] string? status, [FromQuery] int? customerId,
         [FromQuery] int page = 1, [FromQuery] int pageSize = 50)
     {
         try
@@ -423,6 +423,12 @@ public class SalesController : ApiControllerBase
             if (pageSize is < 1 or > 200) pageSize = 50;
 
             var rows = _db.SalesInvoices.AsNoTracking().AsQueryable();
+
+            /* Matches the customerId filter GetOrders already had. The party
+               detail screen shows one customer's invoices, and without this it
+               had to pull every invoice in the system and filter in the
+               browser -- which is exactly what rule 3 of AGENTS.md forbids. */
+            if (customerId is not null) rows = rows.Where(i => i.CustomerUserId == customerId);
 
             if (!string.IsNullOrWhiteSpace(status))
                 rows = rows.Where(i => i.Status.StatusKey == status);

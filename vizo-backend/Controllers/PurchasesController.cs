@@ -139,14 +139,30 @@ public class PurchasesController : ApiControllerBase
                         qty = i.Quantity,
                         unitCost = i.UnitCost,
                         taxPercent = i.TaxPercent,
-                        lineTotal = i.LineTotal
+                        lineTotal = i.LineTotal,
+
+                        /* How much of THIS line has actually arrived, counted
+                           off the posted receipts for this order. The detail
+                           screen shows an "x% received" figure that the list
+                           endpoint already returned but this one did not, so
+                           the same order read 0% when opened. Only POSTED
+                           receipts count -- a draft GRN is somebody still
+                           typing, not stock on the shelf. */
+                        received = x.GoodsReceipts
+                            .Where(g => g.Status.StatusKey == "POSTED")
+                            .SelectMany(g => g.GoodsReceiptItems)
+                            .Where(gi => gi.ProductId == i.ProductId)
+                            .Sum(gi => (int?)(gi.QtyReceived - gi.QtyDamaged)) ?? 0
                     }).ToList(),
-                    receipts = x.GoodsReceipts.Select(g => new
+                    receipts = x.GoodsReceipts.OrderByDescending(g => g.ReceiptDate).Select(g => new
                     {
                         id = g.GrnId,
                         grnNo = g.GrnNo,
                         receiptDate = g.ReceiptDate,
-                        status = g.Status.StatusKey
+                        status = g.Status.StatusKey,
+                        statusName = g.Status.StatusName,
+                        receivedBy = g.ReceivedByUser != null ? g.ReceivedByUser.User.FullName : null,
+                        unitsReceived = g.GoodsReceiptItems.Sum(gi => (int?)(gi.QtyReceived - gi.QtyDamaged)) ?? 0
                     }).ToList()
                 })
                 .FirstOrDefaultAsync();

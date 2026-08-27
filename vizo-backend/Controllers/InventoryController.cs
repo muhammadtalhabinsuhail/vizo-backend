@@ -312,12 +312,17 @@ public class InventoryController : ApiControllerBase
             if (await _db.Categories.AnyAsync(c => c.CategoryName.ToLower() == name.ToLower()))
                 return BadRequest(new { message = $"A category called {name} already exists." });
 
+
             var c = new Category
             {
                 CategoryName = name,
-                ParentCategoryId = body.ParentId,
+                ParentCategoryId = body.ParentId == 0 ? null : body.ParentId,
                 IsActive = body.IsActive
-            };
+            }; 
+
+          
+
+
             _db.Categories.Add(c);
             await _db.SaveChangesAsync();
             await Log("CATEGORY_CREATED", "Category", c.CategoryId.ToString(), name, 1);

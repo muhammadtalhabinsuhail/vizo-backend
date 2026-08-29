@@ -48,6 +48,21 @@ public sealed class PdfCanvas
         _pages.Add(_c);
     }
 
+    /// <summary>
+    /// Draws onto a page that already exists.
+    ///
+    /// Needed for the footer. "Page 2 of 5" cannot be written while page 2 is
+    /// being laid out, because nobody knows yet whether there will be a page 5
+    /// -- a table that overflows makes its own pages as it goes. So the body is
+    /// drawn first, and the footers stamped afterwards once the count is known.
+    /// </summary>
+    public void SelectPage(int index)
+    {
+        if (index < 0 || index >= _pages.Count)
+            throw new ArgumentOutOfRangeException(nameof(index));
+        _c = _pages[index];
+    }
+
     /* ─────────────────────────── drawing ─────────────────────────── */
 
     public void Rect(double x, double y, double w, double h, string hex)

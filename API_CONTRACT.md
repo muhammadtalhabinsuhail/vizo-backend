@@ -456,3 +456,79 @@ ordinary invoice that shows in the ledger.
 `stockHere` is null unless `locationId` is passed. `isSellable` is false for
 claim and in-transit stock — held, never sold. `defaultTaxPercent` is the rate
 most of the catalogue carries, and is what the counter screen starts on.
+
+---
+
+## Documents — every PDF in the system
+
+**Nothing is written to the API host's filesystem.** Every document is rendered
+in memory from the database and pushed to the **`CloudinaryPdfs`** account in
+`appsettings.json` (`advpos/documents/…`). `DocumentFile` records where each one
+went; `10_document_files.sql` created it.
+
+Two verbs on the same URL, and the difference matters:
+
+| | |
+|---|---|
+| `GET`  | render from the database and stream the bytes — Print and Download |
+| `POST` | render, upload to Cloudinary, record the link — Save to store |
+
+### Business documents
+
+`GET  /documents/{kind}/{id}/pdf` → `application/pdf`
+`POST /documents/{kind}/{id}/pdf?force=false` →
+`{ "archived", "fileId", "kind", "docNo", "fileName", "pdfUrl", "bytes",
+   "isDeliverable", "generatedAt", "shareUrl", "rebuilt", "message" }`
+
+`GET /documents/{kind}/{id}/file` → the stored record, or `{ "archived": false }`.
+
+`kind` is one of:
+
+```
+purchase-order   purchase-invoice   goods-receipt   purchase-return
+stock-adjustment stock-transfer     voucher         journal-entry
+expense          party-statement
+```
+
+For `party-statement` the id is the **party's UserId**.
+
+### Reports
+
+`GET  /reports/{key}/pdf?from=&to=&locationId=&asOf=&days=&minCoverDays=&limit=`
+`POST /reports/{key}/pdf?…` — same query, archives it.
+
+`key`: `sales-summary` · `aging-customer` · `aging-supplier` · `dead-stock` ·
+`slow-moving` · `top-customers`
+
+### Financial statements
+
+`GET  /accounting/{key}/pdf?asOf=&from=&to=&accountId=`
+`POST /accounting/{key}/pdf?…`
+
+`key`: `trial-balance` · `balance-sheet` · `profit-loss` · `cash-flow` ·
+`ledger` (needs `accountId`)
+
+Reports and statements have no row to key a stored file off — a sales summary
+for August is a document about a date range. The archive key is a fingerprint
+of the parameters, so re-running the same report **replaces** its file instead
+of piling up copies.
+
+### The store
+
+`GET /documents?kind=&q=&page=1&pageSize=50` (BackOffice) →
+`{ "total", "page", "pageSize", "undeliverable", "items": [...] }`
+
+`undeliverable` counts files Cloudinary accepted but will not serve. Surfaced on
+`/admin/documents`.
+
+`GET /documents/open/{kind}/{key}?k=<hmac>` — **anonymous**, same signing scheme
+as `/sales/bill/{invoiceNo}`.
+
+### `isDeliverable`
+
+Every upload is followed by a HEAD on the URL it returned. Cloudinary blocks PDF
+delivery by default on accounts created since 2023 — the upload succeeds and
+every request to the link answers `401 deny or ACL failure`. When that is the
+case the app hands out its own signed link instead of a broken one, and switches
+back to Cloudinary automatically once the console setting is changed
+(Settings → Security → Restricted media types).

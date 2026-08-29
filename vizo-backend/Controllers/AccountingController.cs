@@ -1,6 +1,9 @@
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using vizo_backend.Documents;
 using vizo_backend.Models;
 
 namespace vizo_backend.Controllers;
@@ -1616,4 +1619,424 @@ public class AccountingController : ApiControllerBase
         string? PaymentProvider, string? Reference, string? WalletTxnId,
         string? Narration, bool PostImmediately,
         List<VoucherAllocationRequest>? Allocations);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  STATEMENT PDFs
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  The five statements -- trial balance, balance sheet, profit and loss,
+        cash flow and a ledger -- render to PDF and push to the "CloudinaryPdfs"
+        account, exactly like the bills and the reports.
+
+        Until now the only way to get any of them onto paper was the browser's
+        own print dialog, which prints the sidebar and the buttons along with
+        the numbers, and stores nothing anywhere.
+
+        Each renderer calls the SAME action the browser calls and reads its
+        result rather than re-running a copy of the query, so the statement on
+        paper and the statement on screen cannot disagree. A statement that
+        quietly differs from the screen it was printed from is the worst thing
+        an accounting system can produce.                                      */
+
+    private static readonly string[] StatementKeys =
+    {
+        "trial-balance", "balance-sheet", "profit-loss", "cash-flow", "ledger"
+    };
+
+    /// <summary>The statement as a PDF, built on request.</summary>
+    [HttpGet("{key}/pdf")]
+    public async Task<IActionResult> RenderStatementPdf(string key,
+        [FromQuery] DateOnly? asOf, [FromQuery] DateOnly? from, [FromQuery] DateOnly? to,
+        [FromQuery] int accountId = 0)
+    {
+        try
+        {
+            var built = await BuildStatement(key, asOf, from, to, accountId);
+            if (built.Error is not null) return built.Error;
+
+            Response.Headers.ContentDisposition = $"inline; filename=\"{built.FileName}\"";
+            return File(DocumentPdf.Render(built.Doc!), "application/pdf");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"render the {key.Replace('-', ' ')} statement");
+        }
+    }
+
+    /// <summary>Renders the statement and pushes it to the documents Cloudinary account.</summary>
+    [HttpPost("{key}/pdf")]
+    public async Task<IActionResult> ArchiveStatementPdf(string key,
+        [FromQuery] DateOnly? asOf, [FromQuery] DateOnly? from, [FromQuery] DateOnly? to,
+        [FromQuery] int accountId = 0)
+    {
+        try
+        {
+            var built = await BuildStatement(key, asOf, from, to, accountId);
+            if (built.Error is not null) return built.Error;
+
+            var kind = $"statement.{key}";
+            var stored = await DocumentArchive.StoreAsync(_db, _cfg, kind, built.Fingerprint!,
+                built.Doc!.Title, built.FileName!, DocumentPdf.Render(built.Doc!),
+                CurrentUserId(), "statements");
+
+            await Log("STATEMENT_ARCHIVED", kind, built.Doc!.Title, stored.PdfUrl, 1);
+
+            return Ok(new
+            {
+                archived = true,
+                fileId = stored.FileId,
+                kind,
+                fileName = stored.FileName,
+                pdfUrl = stored.PdfUrl,
+                bytes = stored.Bytes,
+                isDeliverable = stored.Deliverable,
+                generatedAt = stored.GeneratedAt,
+                message = stored.Deliverable
+                    ? $"{built.Doc!.Title} saved to the document store."
+                    : $"{built.Doc!.Title} saved. The store will not serve PDFs yet -- see the Cloudinary setting."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"archive the {key.Replace('-', ' ')} statement");
+        }
+    }
+
+    private sealed record BuiltStatement(
+        DocumentPdf.Data? Doc, string? FileName, string? Fingerprint, IActionResult? Error);
+
+    private async Task<BuiltStatement> BuildStatement(string key,
+        DateOnly? asOf, DateOnly? from, DateOnly? to, int accountId)
+    {
+        if (!StatementKeys.Contains(key, StringComparer.OrdinalIgnoreCase))
+            return new BuiltStatement(null, null, null,
+                NotFound(new { message = $"'{key}' is not a statement. Try: {string.Join(", ", StatementKeys)}." }));
+
+        if (key.Equals("ledger", StringComparison.OrdinalIgnoreCase) && accountId <= 0)
+            return new BuiltStatement(null, null, null,
+                BadRequest(new { message = "A ledger needs an accountId." }));
+
+        IActionResult action = key.ToLowerInvariant() switch
+        {
+            "trial-balance" => await GetTrialBalance(asOf),
+            "balance-sheet" => await GetBalanceSheet(asOf),
+            "profit-loss" => await GetProfitLoss(from, to),
+            "cash-flow" => await GetCashFlow(from, to),
+            _ => await GetLedger(accountId, from, to)
+        };
+
+        if (action is not OkObjectResult ok || ok.Value is null)
+            return new BuiltStatement(null, null, null, action);
+
+        var j = JsonSerializer.SerializeToElement(ok.Value, PdfJson);
+        var c = await PdfLetterHead();
+        var cur = c.CurrencySymbol;
+
+        return key.ToLowerInvariant() switch
+        {
+            "trial-balance" => new BuiltStatement(TrialBalancePdf(j, c, cur),
+                $"trial-balance-{PdfStr(j, "asOf")}.pdf", PdfStr(j, "asOf"), null),
+
+            "balance-sheet" => new BuiltStatement(BalanceSheetPdf(j, c, cur),
+                $"balance-sheet-{PdfStr(j, "asOf")}.pdf", PdfStr(j, "asOf"), null),
+
+            "profit-loss" => new BuiltStatement(ProfitLossPdf(j, c, cur),
+                $"profit-and-loss-{PdfStr(j, "from")}-to-{PdfStr(j, "to")}.pdf",
+                $"{PdfStr(j, "from")}:{PdfStr(j, "to")}", null),
+
+            "cash-flow" => new BuiltStatement(CashFlowPdf(j, c, cur),
+                $"cash-flow-{PdfStr(j, "from")}-to-{PdfStr(j, "to")}.pdf",
+                $"{PdfStr(j, "from")}:{PdfStr(j, "to")}", null),
+
+            _ => new BuiltStatement(LedgerPdf(j, c, cur),
+                $"ledger-{PdfStr(j.GetProperty("account"), "code")}.pdf",
+                $"{accountId}:{from}:{to}", null)
+        };
+    }
+
+    /* ─────────────────────── the five layouts ─────────────────────── */
+
+    private DocumentPdf.Data TrialBalancePdf(JsonElement j, DocumentPdf.LetterHead c, string cur)
+    {
+        var balanced = j.TryGetProperty("isBalanced", out var b) && b.ValueKind == JsonValueKind.True;
+        var note = PdfStr(j, "note");
+
+        return new DocumentPdf.Data(
+            Company: c,
+            Title: "Trial Balance",
+            DocNo: null,
+            StatusName: balanced ? "Balanced" : "Out of balance",
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("As At", PdfDay(j, "asOf")),
+                new DocumentPdf.Fact("Accounts", PdfArr(j, "lines").Count().ToString()),
+                new DocumentPdf.Fact("Posted Debit", DocumentPdf.Money(PdfDec(j, "movementDebit"))),
+                new DocumentPdf.Fact("Posted Credit", DocumentPdf.Money(PdfDec(j, "movementCredit"))),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Code", 1.5),
+                new DocumentPdf.Col("Account", 5),
+                new DocumentPdf.Col("Group", 2.2),
+                new DocumentPdf.Col("Debit", 2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Credit", 2, DocumentPdf.Align.Right),
+            },
+            Rows: PdfArr(j, "lines").Select(l => new DocumentPdf.Row(new[]
+            {
+                PdfStr(l, "code"), PdfStr(l, "name"), PdfStr(l, "group"),
+                PdfZero(PdfDec(l, "debitBalance")), PdfZero(PdfDec(l, "creditBalance"))
+            })).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Total debit", DocumentPdf.Money(PdfDec(j, "totalDebit"), cur)),
+                new DocumentPdf.Total("Total credit", DocumentPdf.Money(PdfDec(j, "totalCredit"), cur)),
+                new DocumentPdf.Total(balanced ? "Balanced" : "Difference",
+                    DocumentPdf.Money(Math.Abs(PdfDec(j, "totalDebit") - PdfDec(j, "totalCredit")), cur),
+                    Emphasis: true),
+            },
+            Notes: string.IsNullOrWhiteSpace(note) ? null : note,
+            Footnote: "Posted entries only. Opening balances are carried on the account's natural side.",
+            PreparedBy: null,
+            EmptyMessage: "No posted movement as at this date.");
+    }
+
+    private DocumentPdf.Data BalanceSheetPdf(JsonElement j, DocumentPdf.LetterHead c, string cur)
+    {
+        DocumentPdf.Col[] Cols() => new[]
+        {
+            new DocumentPdf.Col("Code", 1.6),
+            new DocumentPdf.Col("Account", 6.4),
+            new DocumentPdf.Col("Balance", 2.4, DocumentPdf.Align.Right),
+        };
+
+        List<DocumentPdf.Row> Group(string name) => PdfArr(j, name).Select(a => new DocumentPdf.Row(new[]
+        {
+            PdfStr(a, "code"), PdfStr(a, "name"), DocumentPdf.Money(PdfDec(a, "balance"))
+        }, Sub: PdfStr(a, "type"))).ToList();
+
+        var diff = PdfDec(j, "difference");
+
+        return new DocumentPdf.Data(
+            Company: c,
+            Title: "Balance Sheet",
+            DocNo: null,
+            StatusName: diff == 0 ? "Balanced" : "Difference reported",
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("As At", PdfDay(j, "asOf")),
+                new DocumentPdf.Fact("Assets", DocumentPdf.Money(PdfDec(j, "totalAssets"))),
+                new DocumentPdf.Fact("Liabilities", DocumentPdf.Money(PdfDec(j, "totalLiabilities"))),
+                new DocumentPdf.Fact("Equity", DocumentPdf.Money(PdfDec(j, "totalEquity"))),
+            },
+            Columns: Cols(),
+            Rows: Group("assets"),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Total assets", DocumentPdf.Money(PdfDec(j, "totalAssets"), cur)),
+                new DocumentPdf.Total("Total liabilities", DocumentPdf.Money(PdfDec(j, "totalLiabilities"), cur)),
+                new DocumentPdf.Total("Total equity", DocumentPdf.Money(PdfDec(j, "totalEquity"), cur)),
+                new DocumentPdf.Total(diff == 0 ? "Balanced" : "Unexplained Difference",
+                    DocumentPdf.Money(diff, cur), Emphasis: true),
+            },
+            Notes: diff == 0 ? null
+                : "Retained earnings are not a stored account in this chart, so the gap between the "
+                + "two sides is reported rather than hidden. A balance sheet that silently balances "
+                + "is worse than one that shows you the difference.",
+            Footnote: "Posted entries only, from the opening balances forward.",
+            PreparedBy: null,
+            EmptyMessage: "No asset balances as at this date.",
+            More: new[]
+            {
+                new DocumentPdf.Section("Liabilities", Cols(), Group("liabilities")),
+                new DocumentPdf.Section("Equity", Cols(), Group("equity")),
+            });
+    }
+
+    private DocumentPdf.Data ProfitLossPdf(JsonElement j, DocumentPdf.LetterHead c, string cur)
+    {
+        DocumentPdf.Col[] Cols() => new[]
+        {
+            new DocumentPdf.Col("Code", 1.6),
+            new DocumentPdf.Col("Account", 6.4),
+            new DocumentPdf.Col("Amount", 2.4, DocumentPdf.Align.Right),
+        };
+
+        List<DocumentPdf.Row> Group(string name) => PdfArr(j, name).Select(a => new DocumentPdf.Row(new[]
+        {
+            PdfStr(a, "code"), PdfStr(a, "name"), DocumentPdf.Money(PdfDec(a, "amount"))
+        }, Sub: PdfStr(a, "type"))).ToList();
+
+        var net = PdfDec(j, "netProfit");
+
+        return new DocumentPdf.Data(
+            Company: c,
+            Title: "Profit and Loss",
+            DocNo: null,
+            StatusName: net >= 0 ? "Profit" : "Loss",
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("From", PdfDay(j, "from")),
+                new DocumentPdf.Fact("To", PdfDay(j, "to")),
+                new DocumentPdf.Fact("Income", DocumentPdf.Money(PdfDec(j, "totalIncome"))),
+                new DocumentPdf.Fact("Expense", DocumentPdf.Money(PdfDec(j, "totalExpense"))),
+            },
+            Columns: Cols(),
+            Rows: Group("income"),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Total income", DocumentPdf.Money(PdfDec(j, "totalIncome"), cur)),
+                new DocumentPdf.Total("Total expense", DocumentPdf.Money(PdfDec(j, "totalExpense"), cur),
+                    Colour: DocumentPdf.Danger),
+                new DocumentPdf.Total(net >= 0 ? "Net Profit" : "Net Loss",
+                    DocumentPdf.Money(Math.Abs(net), cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Posted entries only, for the period shown. Income is credit-net, expense is debit-net.",
+            PreparedBy: null,
+            EmptyMessage: "No income posted in this period.",
+            More: new[] { new DocumentPdf.Section("Expenses", Cols(), Group("expense")) });
+    }
+
+    private DocumentPdf.Data CashFlowPdf(JsonElement j, DocumentPdf.LetterHead c, string cur)
+    {
+        var net = PdfDec(j, "netChange");
+
+        return new DocumentPdf.Data(
+            Company: c,
+            Title: "Cash Flow",
+            DocNo: null,
+            StatusName: net >= 0 ? "Net inflow" : "Net outflow",
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("From", PdfDay(j, "from")),
+                new DocumentPdf.Fact("To", PdfDay(j, "to")),
+                new DocumentPdf.Fact("In", DocumentPdf.Money(PdfDec(j, "totalInflow"))),
+                new DocumentPdf.Fact("Out", DocumentPdf.Money(PdfDec(j, "totalOutflow"))),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Code", 1.6),
+                new DocumentPdf.Col("Cash / Bank Account", 4.6),
+                new DocumentPdf.Col("In", 2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Out", 2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Net", 2, DocumentPdf.Align.Right),
+            },
+            Rows: PdfArr(j, "lines").Select(l => new DocumentPdf.Row(new[]
+            {
+                PdfStr(l, "code"), PdfStr(l, "name"),
+                PdfZero(PdfDec(l, "inflow")), PdfZero(PdfDec(l, "outflow")),
+                DocumentPdf.Money(PdfDec(l, "net"))
+            })).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Total in", DocumentPdf.Money(PdfDec(j, "totalInflow"), cur),
+                    Colour: DocumentPdf.Success),
+                new DocumentPdf.Total("Total out", DocumentPdf.Money(PdfDec(j, "totalOutflow"), cur),
+                    Colour: DocumentPdf.Danger),
+                new DocumentPdf.Total("Net Change", DocumentPdf.Money(net, cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Movement across cash and bank accounts from posted entries only.",
+            PreparedBy: null,
+            EmptyMessage: "No cash or bank movement in this period.");
+    }
+
+    private DocumentPdf.Data LedgerPdf(JsonElement j, DocumentPdf.LetterHead c, string cur)
+    {
+        var acc = j.GetProperty("account");
+
+        return new DocumentPdf.Data(
+            Company: c,
+            Title: "Account Ledger",
+            DocNo: PdfStr(acc, "code"),
+            StatusName: null,
+            Counterparty: new DocumentPdf.Party("Account", PdfStr(acc, "name"),
+                new[] { PdfStr(acc, "code"), PdfStr(acc, "type") }),
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("Opening", DocumentPdf.Money(PdfDec(j, "openingBalance"))),
+                new DocumentPdf.Fact("Closing", DocumentPdf.Money(PdfDec(j, "closingBalance"))),
+                new DocumentPdf.Fact("Entries", PdfArr(j, "lines").Count().ToString()),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Date", 1.6),
+                new DocumentPdf.Col("Entry", 1.6),
+                new DocumentPdf.Col("Narration", 3.4),
+                new DocumentPdf.Col("Debit", 1.6, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Credit", 1.6, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Balance", 1.8, DocumentPdf.Align.Right),
+            },
+            Rows: PdfArr(j, "lines").Select(l => new DocumentPdf.Row(new[]
+            {
+                PdfDay(l, "date"), PdfStr(l, "entryNo"),
+                PdfStr(l, "narration"),
+                PdfZero(PdfDec(l, "debit")), PdfZero(PdfDec(l, "credit")),
+                DocumentPdf.Money(PdfDec(l, "balance"))
+            }, Sub: PdfStr(l, "party"))).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Opening balance", DocumentPdf.Money(PdfDec(j, "openingBalance"), cur)),
+                new DocumentPdf.Total("Total debit", DocumentPdf.Money(PdfDec(j, "totalDebit"), cur)),
+                new DocumentPdf.Total("Total credit", DocumentPdf.Money(PdfDec(j, "totalCredit"), cur)),
+                new DocumentPdf.Total("Closing Balance", DocumentPdf.Money(PdfDec(j, "closingBalance"), cur),
+                    Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Posted entries only, in date order. The running balance is on a debit basis.",
+            PreparedBy: null,
+            EmptyMessage: "No posted movement on this account for the period.");
+    }
+
+    /* ───────────────────── json readers + letterhead ───────────────────── */
+
+    private static readonly JsonSerializerOptions PdfJson = new()
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles
+    };
+
+    private static IEnumerable<JsonElement> PdfArr(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var a) && a.ValueKind == JsonValueKind.Array
+            ? a.EnumerateArray()
+            : Enumerable.Empty<JsonElement>();
+
+    private static string PdfStr(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var v) && v.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined)
+            ? (v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : v.ToString())
+            : "";
+
+    private static decimal PdfDec(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDecimal() : 0m;
+
+    private static string PdfDay(JsonElement j, string name) =>
+        DateOnly.TryParse(PdfStr(j, name), CultureInfo.InvariantCulture, out var d)
+            ? DocumentPdf.Day(d)
+            : PdfStr(j, name);
+
+    /// <summary>A dash reads better than a column of 0.00 down a statement.</summary>
+    private static string PdfZero(decimal v) => v == 0 ? "-" : DocumentPdf.Money(v);
+
+    private async Task<DocumentPdf.LetterHead> PdfLetterHead()
+    {
+        var c = await _db.Companies.AsNoTracking()
+            .Select(x => new
+            {
+                x.CompanyName, x.LegalName, x.AddressLine,
+                city = x.City.CityName,
+                x.Country, x.Phone, x.Email, x.Ntn, x.Strn, x.CurrencySymbol
+            })
+            .FirstOrDefaultAsync();
+
+        return new DocumentPdf.LetterHead(
+            c?.CompanyName ?? "AdvPOS",
+            c?.LegalName ?? c?.CompanyName ?? "AdvPOS",
+            c?.AddressLine ?? "", c?.city ?? "", c?.Country ?? "",
+            c?.Phone ?? "", c?.Email ?? "", c?.Ntn ?? "", c?.Strn ?? "",
+            c?.CurrencySymbol ?? "PKR");
+    }
+
 }

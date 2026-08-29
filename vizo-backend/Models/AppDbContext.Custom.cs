@@ -26,6 +26,12 @@ public partial class AppDbContext
     /// </summary>
     public virtual DbSet<PasswordResetCode> PasswordResetCodes { get; set; } = null!;
 
+    /// <summary>
+    /// Every PDF the API has generated and where it was pushed to.
+    /// Created on Neon by backend/database/10_document_files.sql.
+    /// </summary>
+    public virtual DbSet<DocumentFile> DocumentFiles { get; set; } = null!;
+
     partial void OnModelCreatingPartial(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<PasswordResetCode>(entity =>
@@ -61,6 +67,32 @@ public partial class AppDbContext
             entity.Property(e => e.IsWalkIn).HasDefaultValue(false);
             entity.Property(e => e.WalkInName).HasMaxLength(150);
             entity.Property(e => e.WalkInPhone).HasMaxLength(30);
+        });
+
+        modelBuilder.Entity<DocumentFile>(entity =>
+        {
+            entity.HasKey(e => e.FileId).HasName("DocumentFile_pkey");
+
+            entity.ToTable("DocumentFile");
+
+            /* One current file per document. Re-generating replaces the row
+               rather than adding another, so the table stays the size of the
+               document set instead of growing with every click. */
+            entity.HasIndex(e => new { e.DocKind, e.DocKey }, "UX_DocumentFile_Doc").IsUnique();
+
+            entity.Property(e => e.DocKind).HasMaxLength(40);
+            entity.Property(e => e.DocKey).HasMaxLength(120);
+            entity.Property(e => e.DocNo).HasMaxLength(60);
+            entity.Property(e => e.FileName).HasMaxLength(160);
+            entity.Property(e => e.PdfUrl).HasMaxLength(500);
+            entity.Property(e => e.PdfPublicId).HasMaxLength(255);
+            entity.Property(e => e.IsDeliverable).HasDefaultValue(false);
+            entity.Property(e => e.GeneratedAt).HasColumnType("timestamp without time zone");
+
+            entity.HasOne<User>().WithMany()
+                .HasForeignKey(d => d.GeneratedByUserId)
+                .OnDelete(DeleteBehavior.ClientSetNull)
+                .HasConstraintName("FK_DocumentFile_User");
         });
 
         modelBuilder.Entity<SalesReturn>(entity =>

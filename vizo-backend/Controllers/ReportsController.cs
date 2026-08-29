@@ -1,6 +1,9 @@
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using vizo_backend.Documents;
 using vizo_backend.Models;
 
 namespace vizo_backend.Controllers;
@@ -13,6 +16,11 @@ namespace vizo_backend.Controllers;
 /// cache and no stored aggregate, because a stale number that looks official is
 /// worse than a slow query. Every money figure comes from POSTED ledger rows or
 /// from invoices; nothing counts a draft.
+///
+/// Every report can also be rendered to PDF and pushed to the documents
+/// Cloudinary account -- see the PDF section at the foot of this file. The
+/// renderer calls the SAME action the browser calls rather than re-running a
+/// copy of the query, so paper and screen cannot disagree.
 ///
 /// Controller-only by design: no DTOs, no services, no interfaces, no
 /// repositories. Every action is wrapped in try/catch and reports via Fail().
@@ -522,4 +530,461 @@ public class ReportsController : ApiControllerBase
             return Fail(ex, "load the reports overview");
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  PDF
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  Every report can be rendered to PDF and pushed to the "CloudinaryPdfs"
+        account, exactly like the bills.
+
+        Before this, the Export PDF / Excel / CSV buttons in the report toolbar
+        -- shared by all seven report screens -- called toast.success("Exporting
+        PDF…") and did nothing else. Nothing was generated and nothing was ever
+        stored anywhere.
+
+        HOW THE PDF CANNOT DRIFT FROM THE SCREEN. Each renderer calls the SAME
+        action the browser calls and reads its result, rather than re-running a
+        copy of the query. If the ageing buckets change, both change together;
+        there is no second implementation to forget about.
+
+        A report has no row anywhere to key a stored file off -- a sales summary
+        for August is a document about a date range. So the archive key is a
+        fingerprint of the parameters it was run with, which also means re-running
+        the same report replaces its file instead of piling up copies.          */
+
+    private static readonly string[] ReportKeys =
+    {
+        "sales-summary", "aging-customer", "aging-supplier",
+        "dead-stock", "slow-moving", "top-customers"
+    };
+
+    /// <summary>The report as a PDF, built on request. Print and Preview use this.</summary>
+    [HttpGet("{key}/pdf")]
+    public async Task<IActionResult> RenderPdf(string key,
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to, [FromQuery] int? locationId,
+        [FromQuery] DateOnly? asOf, [FromQuery] int days = 90,
+        [FromQuery] int minCoverDays = 120, [FromQuery] int limit = 20)
+    {
+        try
+        {
+            var built = await BuildReport(key, from, to, locationId, asOf, days, minCoverDays, limit);
+            if (built.Error is not null) return built.Error;
+
+            Response.Headers.ContentDisposition = $"inline; filename=\"{built.FileName}\"";
+            return File(DocumentPdf.Render(built.Doc!), "application/pdf");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"render the {key.Replace('-', ' ')} report");
+        }
+    }
+
+    /// <summary>
+    /// Renders the report and pushes it to the documents Cloudinary account.
+    /// Re-running the same report with the same parameters replaces its file.
+    /// </summary>
+    [HttpPost("{key}/pdf")]
+    public async Task<IActionResult> ArchivePdf(string key,
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to, [FromQuery] int? locationId,
+        [FromQuery] DateOnly? asOf, [FromQuery] int days = 90,
+        [FromQuery] int minCoverDays = 120, [FromQuery] int limit = 20)
+    {
+        try
+        {
+            var built = await BuildReport(key, from, to, locationId, asOf, days, minCoverDays, limit);
+            if (built.Error is not null) return built.Error;
+
+            var kind = $"report.{key}";
+            var stored = await DocumentArchive.StoreAsync(_db, _cfg, kind, built.Fingerprint!,
+                built.Doc!.Title, built.FileName!, DocumentPdf.Render(built.Doc!),
+                CurrentUserId(), "reports");
+
+            await Log("REPORT_ARCHIVED", kind, built.Doc!.Title, stored.PdfUrl, 1);
+
+            return Ok(new
+            {
+                archived = true,
+                fileId = stored.FileId,
+                kind,
+                fileName = stored.FileName,
+                pdfUrl = stored.PdfUrl,
+                bytes = stored.Bytes,
+                isDeliverable = stored.Deliverable,
+                generatedAt = stored.GeneratedAt,
+                message = stored.Deliverable
+                    ? $"{built.Doc!.Title} saved to the document store."
+                    : $"{built.Doc!.Title} saved. The store will not serve PDFs yet -- see the Cloudinary setting."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"archive the {key.Replace('-', ' ')} report");
+        }
+    }
+
+    private sealed record BuiltReport(
+        DocumentPdf.Data? Doc, string? FileName, string? Fingerprint, IActionResult? Error);
+
+    /// <summary>
+    /// Runs the report's own action, then shapes its result for the renderer.
+    /// The JsonElement hop is deliberate: it is the exact payload the browser
+    /// receives, so the paper and the screen cannot disagree.
+    /// </summary>
+    private async Task<BuiltReport> BuildReport(string key,
+        DateOnly? from, DateOnly? to, int? locationId, DateOnly? asOf,
+        int days, int minCoverDays, int limit)
+    {
+        if (!ReportKeys.Contains(key, StringComparer.OrdinalIgnoreCase))
+            return new BuiltReport(null, null, null,
+                NotFound(new { message = $"'{key}' is not a report. Try: {string.Join(", ", ReportKeys)}." }));
+
+        IActionResult action = key.ToLowerInvariant() switch
+        {
+            "sales-summary" => await SalesSummary(from, to, locationId),
+            "aging-customer" => await CustomerAging(asOf),
+            "aging-supplier" => await SupplierAging(asOf),
+            "dead-stock" => await DeadStock(days),
+            "slow-moving" => await SlowMoving(days, minCoverDays),
+            _ => await TopCustomers(from, to, limit)
+        };
+
+        if (action is not OkObjectResult ok || ok.Value is null)
+            return new BuiltReport(null, null, null, action);
+
+        var j = JsonSerializer.SerializeToElement(ok.Value, JsonShape);
+        var company = await LetterHead();
+        var cur = company.CurrencySymbol;
+
+        var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmm", CultureInfo.InvariantCulture);
+
+        return key.ToLowerInvariant() switch
+        {
+            "sales-summary" => Wrap(SalesSummaryPdf(j, company, cur),
+                $"sales-summary-{Str(j, "from")}-to-{Str(j, "to")}.pdf",
+                $"{Str(j, "from")}:{Str(j, "to")}:{locationId?.ToString() ?? "all"}"),
+
+            "aging-customer" => Wrap(AgingPdf(j, company, cur, customers: true),
+                $"customer-ageing-{Str(j, "asOf")}.pdf", $"{Str(j, "asOf")}"),
+
+            "aging-supplier" => Wrap(AgingPdf(j, company, cur, customers: false),
+                $"supplier-ageing-{Str(j, "asOf")}.pdf", $"{Str(j, "asOf")}"),
+
+            "dead-stock" => Wrap(DeadStockPdf(j, company, cur),
+                $"dead-stock-{days}d-{stamp}.pdf", $"{days}"),
+
+            "slow-moving" => Wrap(SlowMovingPdf(j, company, cur),
+                $"slow-moving-{days}d-{minCoverDays}c-{stamp}.pdf", $"{days}:{minCoverDays}"),
+
+            _ => Wrap(TopCustomersPdf(j, company, cur),
+                $"top-customers-{Str(j, "from")}-to-{Str(j, "to")}.pdf",
+                $"{Str(j, "from")}:{Str(j, "to")}:{limit}")
+        };
+
+        static BuiltReport Wrap(DocumentPdf.Data doc, string file, string fingerprint) =>
+            new(doc, file, fingerprint, null);
+    }
+
+    /* ─────────────────────── the six report layouts ─────────────────────── */
+
+    private DocumentPdf.Data SalesSummaryPdf(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
+        new(
+            Company: c,
+            Title: "Sales Summary",
+            DocNo: null,
+            StatusName: null,
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("From", Day(j, "from")),
+                new DocumentPdf.Fact("To", Day(j, "to")),
+                new DocumentPdf.Fact("Invoices", Num(j, "invoiceCount")),
+                new DocumentPdf.Fact("Units Sold", Num(j, "unitsSold")),
+                new DocumentPdf.Fact("Margin", $"{Dec(j, "marginPercent"):0.#}%"),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Date", 2.4),
+                new DocumentPdf.Col("Invoices", 1.3, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Units", 1.3, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Revenue", 2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Cost", 2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Margin", 2, DocumentPdf.Align.Right),
+            },
+            Rows: Arr(j, "byDay").Select(d => new DocumentPdf.Row(new[]
+            {
+                Day(d, "date"), Num(d, "invoices"), Num(d, "units"),
+                DocumentPdf.Money(Dec(d, "revenue")),
+                DocumentPdf.Money(Dec(d, "cost")),
+                DocumentPdf.Money(Dec(d, "margin"))
+            })).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Subtotal", DocumentPdf.Money(Dec(j, "subtotal"), cur)),
+                new DocumentPdf.Total("Discount", DocumentPdf.Money(-Dec(j, "discount"), cur), Colour: DocumentPdf.Danger),
+                new DocumentPdf.Total("Tax", DocumentPdf.Money(Dec(j, "tax"), cur)),
+                new DocumentPdf.Total("Cost of sales", DocumentPdf.Money(Dec(j, "cost"), cur)),
+                new DocumentPdf.Total("Gross margin", DocumentPdf.Money(Dec(j, "margin"), cur), Colour: DocumentPdf.Success),
+                new DocumentPdf.Total("Average invoice", DocumentPdf.Money(Dec(j, "averageInvoice"), cur)),
+                new DocumentPdf.Total("Revenue", DocumentPdf.Money(Dec(j, "revenue"), cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Revenue is invoiced value. Cost is the unit cost captured on each line at invoice time.",
+            PreparedBy: null,
+            EmptyMessage: "No invoices in this period.",
+            More: new[]
+            {
+                new DocumentPdf.Section("By location",
+                    new[]
+                    {
+                        new DocumentPdf.Col("Location", 3.6),
+                        new DocumentPdf.Col("Invoices", 1.4, DocumentPdf.Align.Right),
+                        new DocumentPdf.Col("Revenue", 2.2, DocumentPdf.Align.Right),
+                        new DocumentPdf.Col("Cost", 2.2, DocumentPdf.Align.Right),
+                        new DocumentPdf.Col("Margin", 2.2, DocumentPdf.Align.Right),
+                    },
+                    Arr(j, "byLocation").Select(l => new DocumentPdf.Row(new[]
+                    {
+                        Str(l, "location"), Num(l, "invoices"),
+                        DocumentPdf.Money(Dec(l, "revenue")),
+                        DocumentPdf.Money(Dec(l, "cost")),
+                        DocumentPdf.Money(Dec(l, "margin"))
+                    })).ToList())
+            });
+
+    private DocumentPdf.Data AgingPdf(JsonElement j, DocumentPdf.LetterHead c, string cur, bool customers)
+    {
+        var nameField = customers ? "customerName" : "supplierName";
+        var countField = customers ? "customerCount" : "supplierCount";
+
+        return new DocumentPdf.Data(
+            Company: c,
+            Title: customers ? "Customer Ageing" : "Supplier Ageing",
+            DocNo: null,
+            StatusName: null,
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("As At", Day(j, "asOf")),
+                new DocumentPdf.Fact(customers ? "Customers" : "Suppliers", Num(j, countField)),
+                new DocumentPdf.Fact("Outstanding", DocumentPdf.Money(Dec(j, "totalOutstanding"))),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col(customers ? "Customer" : "Supplier", 3.4),
+                new DocumentPdf.Col("Inv", 0.8, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Current", 1.6, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("1-30", 1.5, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("31-60", 1.5, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("61-90", 1.5, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("90+", 1.5, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Outstanding", 1.9, DocumentPdf.Align.Right),
+            },
+            Rows: Arr(j, "items").Select(r => new DocumentPdf.Row(new[]
+            {
+                Str(r, nameField), Num(r, "invoiceCount"),
+                Zero(Dec(r, "current")), Zero(Dec(r, "d0_30")), Zero(Dec(r, "d31_60")),
+                Zero(Dec(r, "d61_90")), Zero(Dec(r, "d90plus")),
+                DocumentPdf.Money(Dec(r, "outstanding"))
+            }, Sub: customers && Bool(r, "overLimit") ? "over credit limit" : null)).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Current", DocumentPdf.Money(Dec(j, "current"), cur)),
+                new DocumentPdf.Total("1-30 days", DocumentPdf.Money(Dec(j, "d0_30"), cur)),
+                new DocumentPdf.Total("31-60 days", DocumentPdf.Money(Dec(j, "d31_60"), cur)),
+                new DocumentPdf.Total("61-90 days", DocumentPdf.Money(Dec(j, "d61_90"), cur)),
+                new DocumentPdf.Total("Over 90 days", DocumentPdf.Money(Dec(j, "d90plus"), cur), Colour: DocumentPdf.Danger),
+                new DocumentPdf.Total("Total Outstanding", DocumentPdf.Money(Dec(j, "totalOutstanding"), cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Aged from the DUE date, not the invoice date -- an invoice on 60-day terms is not overdue on day 31.",
+            PreparedBy: null,
+            EmptyMessage: "Nothing outstanding as at this date.");
+    }
+
+    private DocumentPdf.Data DeadStockPdf(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
+        new(
+            Company: c,
+            Title: "Dead Stock",
+            DocNo: null,
+            StatusName: null,
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("Window", $"{Num(j, "windowDays")} days"),
+                new DocumentPdf.Fact("Items", Num(j, "count")),
+                new DocumentPdf.Fact("Tied Up", DocumentPdf.Money(Dec(j, "tiedUpValue"))),
+                new DocumentPdf.Fact("As At", DocumentPdf.Day(Today())),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Item", 4.4),
+                new DocumentPdf.Col("Brand", 1.8),
+                new DocumentPdf.Col("On Hand", 1.3, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Cost", 1.5, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Last Sold", 1.7, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Tied Up", 1.8, DocumentPdf.Align.Right),
+            },
+            Rows: Arr(j, "items").Select(r => new DocumentPdf.Row(new[]
+            {
+                Str(r, "name"), Str(r, "brand"), Num(r, "onHand"),
+                DocumentPdf.Money(Dec(r, "costPrice")),
+                NullableInt(r, "daysSinceLastOut") is int d ? $"{d} days ago" : "never",
+                DocumentPdf.Money(Dec(r, "tiedUpValue"))
+            }, Sub: $"{Str(r, "sku")}  ·  {Str(r, "category")}")).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Items not moving", Num(j, "count")),
+                new DocumentPdf.Total("Capital Tied Up", DocumentPdf.Money(Dec(j, "tiedUpValue"), cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Items with stock on hand and no outward movement in the window. Zero-stock items are excluded.",
+            PreparedBy: null,
+            EmptyMessage: "Nothing has been sitting still this long.");
+
+    private DocumentPdf.Data SlowMovingPdf(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
+        new(
+            Company: c,
+            Title: "Slow Moving Stock",
+            DocNo: null,
+            StatusName: null,
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("Window", $"{Num(j, "windowDays")} days"),
+                new DocumentPdf.Fact("Cover Over", $"{Num(j, "minCoverDays")} days"),
+                new DocumentPdf.Fact("Items", Num(j, "count")),
+                new DocumentPdf.Fact("Tied Up", DocumentPdf.Money(Dec(j, "tiedUpValue"))),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Item", 4.2),
+                new DocumentPdf.Col("On Hand", 1.3, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Sold", 1.2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Per Day", 1.3, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Cover", 1.5, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Tied Up", 1.8, DocumentPdf.Align.Right),
+            },
+            Rows: Arr(j, "items").Select(r => new DocumentPdf.Row(new[]
+            {
+                Str(r, "name"), Num(r, "onHand"), Num(r, "soldInWindow"),
+                $"{Dec(r, "perDay"):0.##}",
+                $"{Num(r, "coverDays")} days",
+                DocumentPdf.Money(Dec(r, "tiedUpValue"))
+            }, Sub: $"{Str(r, "sku")}  ·  {Str(r, "brand")}")).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Slow movers", Num(j, "count")),
+                new DocumentPdf.Total("Capital Tied Up", DocumentPdf.Money(Dec(j, "tiedUpValue"), cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Days of cover, not units sold, is the number that matters: 5 a month is fine on a 10-unit shelf and terrible on a 500-unit one.",
+            PreparedBy: null,
+            EmptyMessage: "Everything is turning over inside the cover threshold.");
+
+    private DocumentPdf.Data TopCustomersPdf(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
+        new(
+            Company: c,
+            Title: "Top Customers",
+            DocNo: null,
+            StatusName: null,
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("From", Day(j, "from")),
+                new DocumentPdf.Fact("To", Day(j, "to")),
+                new DocumentPdf.Fact("Customers", Num(j, "count")),
+                new DocumentPdf.Fact("Revenue", DocumentPdf.Money(Dec(j, "totalRevenue"))),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Customer", 3.6),
+                new DocumentPdf.Col("Inv", 0.9, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Revenue", 2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Margin", 2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Margin %", 1.3, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Avg Invoice", 1.8, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Last Buy", 1.6, DocumentPdf.Align.Right),
+            },
+            Rows: Arr(j, "items").Select(r => new DocumentPdf.Row(new[]
+            {
+                Str(r, "customerName"), Num(r, "invoiceCount"),
+                DocumentPdf.Money(Dec(r, "revenue")),
+                DocumentPdf.Money(Dec(r, "margin")),
+                $"{Dec(r, "marginPercent"):0.#}%",
+                DocumentPdf.Money(Dec(r, "averageInvoice")),
+                $"{Num(r, "daysSinceLastInvoice")}d ago"
+            }, Sub: Str(r, "city"))).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Total margin", DocumentPdf.Money(Dec(j, "totalMargin"), cur), Colour: DocumentPdf.Success),
+                new DocumentPdf.Total("Total Revenue", DocumentPdf.Money(Dec(j, "totalRevenue"), cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Ranked by invoiced revenue over the period. Margin uses the unit cost captured at invoice time.",
+            PreparedBy: null,
+            EmptyMessage: "No invoices in this period.");
+
+    /* ───────────────────────── json + letterhead ───────────────────────── */
+
+    /* The API serialises anonymous objects with their own property names, which
+       are already camelCase. Matching that here means the readers below use the
+       same keys the browser sees. */
+    private static readonly JsonSerializerOptions JsonShape = new()
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles
+    };
+
+    private static IEnumerable<JsonElement> Arr(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var a) && a.ValueKind == JsonValueKind.Array
+            ? a.EnumerateArray()
+            : Enumerable.Empty<JsonElement>();
+
+    private static string Str(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var v) && v.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined)
+            ? (v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : v.ToString())
+            : "";
+
+    private static decimal Dec(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDecimal() : 0m;
+
+    private static string Num(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number
+            ? v.GetInt64().ToString("N0", CultureInfo.GetCultureInfo("en-US"))
+            : "0";
+
+    private static bool Bool(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
+
+    private static int? NullableInt(JsonElement j, string name) =>
+        j.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : null;
+
+    /// <summary>A date the API sent as "2026-08-29", shown as "29 Aug 2026".</summary>
+    private static string Day(JsonElement j, string name) =>
+        DateOnly.TryParse(Str(j, name), CultureInfo.InvariantCulture, out var d)
+            ? DocumentPdf.Day(d)
+            : Str(j, name);
+
+    /// <summary>An ageing bucket: a dash reads better than a column of 0.00.</summary>
+    private static string Zero(decimal v) => v == 0 ? "-" : DocumentPdf.Money(v);
+
+    private async Task<DocumentPdf.LetterHead> LetterHead()
+    {
+        var c = await _db.Companies.AsNoTracking()
+            .Select(x => new
+            {
+                x.CompanyName, x.LegalName, x.AddressLine,
+                city = x.City.CityName,
+                x.Country, x.Phone, x.Email, x.Ntn, x.Strn, x.CurrencySymbol
+            })
+            .FirstOrDefaultAsync();
+
+        return new DocumentPdf.LetterHead(
+            c?.CompanyName ?? "AdvPOS",
+            c?.LegalName ?? c?.CompanyName ?? "AdvPOS",
+            c?.AddressLine ?? "", c?.city ?? "", c?.Country ?? "",
+            c?.Phone ?? "", c?.Email ?? "", c?.Ntn ?? "", c?.Strn ?? "",
+            c?.CurrencySymbol ?? "PKR");
+    }
+
 }

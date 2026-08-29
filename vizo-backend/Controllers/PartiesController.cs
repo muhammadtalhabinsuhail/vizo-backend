@@ -1,6 +1,8 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using vizo_backend.Documents;
 using vizo_backend.Models;
 
 namespace vizo_backend.Controllers;
@@ -674,4 +676,73 @@ public class PartiesController : ApiControllerBase
         bool IsActive);
 
     public record ActiveRequest(bool Value);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EXPORT
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  The Export button used to be a toast, or nothing at all. It now returns
+        a real .xlsx.
+
+        The export runs the SAME list action the screen runs and writes its
+        result, rather than re-querying -- so what lands in Excel is what was on
+        the page, filters and all, and the two cannot drift.
+
+        Money, dates and counts are written as typed cells rather than strings,
+        so the columns sort and total in Excel instead of being text that merely
+        looks like numbers.                                                     */
+
+    /// <summary>Customers and suppliers on the current filter, as a spreadsheet.</summary>
+    [HttpGet("export")]
+    public async Task<IActionResult> ExportParties(
+        [FromQuery] string? type, [FromQuery] string? q, [FromQuery] bool includeInactive = true)
+    {
+        try
+        {
+            var action = await GetParties(type, q, includeInactive, 1, 5000);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Code", "partyCode", XlsxWriter.CellKind.Text, 14),
+                new XlsxWriter.Column("Legal Name", "legalName", XlsxWriter.CellKind.Text, 32),
+                new XlsxWriter.Column("Trading As", "displayName", XlsxWriter.CellKind.Text, 26),
+                new XlsxWriter.Column("Type", "type"),
+                new XlsxWriter.Column("Category", "categoryName"),
+                new XlsxWriter.Column("City", "city"),
+                new XlsxWriter.Column("Province", "province"),
+                new XlsxWriter.Column("Phone", "phone", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Email", "email", XlsxWriter.CellKind.Text, 28),
+                new XlsxWriter.Column("NTN", "ntn", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("STRN", "strn", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Credit Limit", "creditLimit", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Credit Days", "creditDays", XlsxWriter.CellKind.Integer, 12),
+                new XlsxWriter.Column("Hold Policy", "creditHoldPolicy"),
+                new XlsxWriter.Column("Receivable", "currentBalance", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Payable", "payableBalance", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Sales Rep", "salesPerson", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Rating", "rating", XlsxWriter.CellKind.Text, 8),
+                new XlsxWriter.Column("Active", "isActive", XlsxWriter.CellKind.Text, 8),
+                new XlsxWriter.Column("Last Purchase", "lastPurchaseAt", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Last Payment", "lastPaymentAt", XlsxWriter.CellKind.Date),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Parties",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"parties-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the parties");
+        }
+    }
+
+    /* The API writes anonymous objects with their own already-camelCase names;
+       matching that here means the column Field values below are the same keys
+       the browser sees. */
+    private static readonly JsonSerializerOptions ExportJson = new()
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles
+    };
+
 }

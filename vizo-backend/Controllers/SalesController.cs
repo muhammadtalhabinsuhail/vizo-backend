@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Authorization;
@@ -1066,6 +1067,52 @@ public class SalesController : ApiControllerBase
         catch (Exception ex)
         {
             return Fail(ex, $"build the bill for invoice {id}");
+        }
+    }
+
+    /// <summary>
+    /// Sends the caller to the bill's own file in the Cloudinary store,
+    /// building and uploading it first if it has never been stored.
+    ///
+    /// THIS IS WHAT PRINT AND DOWNLOAD USE. Rendering fresh on every click
+    /// worked, but it meant the bill people looked at was never the bill that
+    /// had been stored, and the stored copy was only exercised when somebody
+    /// pressed Share. Two paths to the same document is two things that can
+    /// disagree. Now the bytes on screen ARE the bytes in the store -- and the
+    /// same ones the customer got over WhatsApp.
+    ///
+    /// Falls back to rendering only when the store cannot serve it, so a
+    /// Cloudinary outage degrades to "the bill still opens".
+    /// </summary>
+    [HttpGet("invoices/{id:int}/download")]
+    [Authorize(Policy = "BackOffice")]
+    public async Task<IActionResult> DownloadBill(int id, [FromQuery] bool attachment = false)
+    {
+        try
+        {
+            var row = await _db.SalesInvoices
+                .FirstOrDefaultAsync(i => i.InvoiceId == id);
+            if (row is null) return NotFound(new { message = $"No invoice with id {id}." });
+
+            if (string.IsNullOrWhiteSpace(row.PdfUrl))
+                await TryBuildBill(id);
+
+            var url = await _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.InvoiceId == id).Select(i => i.PdfUrl).FirstAsync();
+
+            if (!string.IsNullOrWhiteSpace(url))
+                return Redirect(CloudinaryUrl.AsAttachment(url!, attachment));
+
+            var data = await BillData(id);
+            if (data is null) return NotFound(new { message = $"No invoice with id {id}." });
+
+            Response.Headers.ContentDisposition =
+                $"{(attachment ? "attachment" : "inline")}; filename=\"{data.InvoiceNo}.pdf\"";
+            return File(InvoicePdf.Render(data), "application/pdf");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"open the bill for invoice {id}");
         }
     }
 
@@ -2386,4 +2433,191 @@ public class SalesController : ApiControllerBase
         int CustomerId, bool IsWalkIn, string? WalkInName, string? WalkInPhone,
         int LocationId, int MethodId, string? Notes,
         List<InvoiceLineRequest> Lines);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EXPORT
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  The Export button used to be a toast, or nothing at all. It now returns
+        a real .xlsx.
+
+        The export runs the SAME list action the screen runs and writes its
+        result, rather than re-querying -- so what lands in Excel is what was on
+        the page, filters and all, and the two cannot drift.
+
+        Money, dates and counts are written as typed cells rather than strings,
+        so the columns sort and total in Excel instead of being text that merely
+        looks like numbers.                                                     */
+
+    /// <summary>Every order on the current filter, as a spreadsheet.</summary>
+    [HttpGet("orders/export")]
+    public async Task<IActionResult> ExportOrders(
+        [FromQuery] string? q, [FromQuery] string? status, [FromQuery] int? customerId)
+    {
+        try
+        {
+            /* pageSize 5000: an export is the one place a full list is wanted,
+               and the screen itself stays paginated. */
+            var action = await GetOrders(q, status, customerId, 1, 5000);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Order No", "orderNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Customer", "customerName", XlsxWriter.CellKind.Text, 30),
+                new XlsxWriter.Column("Type", "customerType"),
+                new XlsxWriter.Column("City", "city"),
+                new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Sales Rep", "salesPerson", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Order Date", "orderDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Delivery Date", "deliveryDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Status", "statusName"),
+                new XlsxWriter.Column("Items", "itemCount", XlsxWriter.CellKind.Integer, 10),
+                new XlsxWriter.Column("Subtotal", "subtotal", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Discount", "discount", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Tax", "tax", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Total", "total", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Payment", "paymentMethod"),
+                new XlsxWriter.Column("Received", "paidAmount", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Payment Status", "paymentStatus"),
+                new XlsxWriter.Column("Invoice No", "invoiceNo", XlsxWriter.CellKind.Text, 16),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Sales Orders",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"sales-orders-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the orders");
+        }
+    }
+
+    /// <summary>Every invoice on the current filter, as a spreadsheet.</summary>
+    [HttpGet("invoices/export")]
+    [Authorize(Policy = "BackOffice")]
+    public async Task<IActionResult> ExportInvoices(
+        [FromQuery] string? q, [FromQuery] string? status, [FromQuery] int? customerId,
+        [FromQuery] string? walkIn)
+    {
+        try
+        {
+            var action = await GetInvoices(q, status, customerId, walkIn, 1, 5000);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Invoice No", "invoiceNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Order No", "orderNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Customer", "customerName", XlsxWriter.CellKind.Text, 30),
+                new XlsxWriter.Column("Phone", "customerPhone", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Walk-in", "isWalkIn", XlsxWriter.CellKind.Text, 10),
+                new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Invoice Date", "invoiceDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Due Date", "dueDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Items", "itemCount", XlsxWriter.CellKind.Integer, 10),
+                new XlsxWriter.Column("Subtotal", "subtotal", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Discount", "discount", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Tax", "tax", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Total", "total", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Paid", "paid", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Balance", "balance", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Status", "statusName"),
+                new XlsxWriter.Column("Payment", "paymentMethod"),
+                new XlsxWriter.Column("Stored PDF", "pdfUrl", XlsxWriter.CellKind.Text, 46),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Sale Invoices",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"sale-invoices-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the invoices");
+        }
+    }
+
+    /// <summary>Walk-in counter bills, as a spreadsheet.</summary>
+    [HttpGet("direct/walkin/export")]
+    [Authorize(Policy = "OrderDept")]
+    public async Task<IActionResult> ExportWalkIn(
+        [FromQuery] string? q, [FromQuery] string? from, [FromQuery] string? to)
+    {
+        try
+        {
+            var action = await GetWalkInSales(q, from, to, 1, 5000);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Bill No", "invoiceNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Customer", "customerName", XlsxWriter.CellKind.Text, 28),
+                new XlsxWriter.Column("Phone", "customerPhone", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Date", "invoiceDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Payment", "paymentMethodName"),
+                new XlsxWriter.Column("Items", "itemCount", XlsxWriter.CellKind.Integer, 10),
+                new XlsxWriter.Column("Units", "units", XlsxWriter.CellKind.Integer, 10),
+                new XlsxWriter.Column("Subtotal", "subtotal", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Discount", "discount", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Tax", "tax", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Total", "total", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Sold By", "soldBy", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Stored PDF", "pdfUrl", XlsxWriter.CellKind.Text, 46),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Walk-in Sales",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"walk-in-sales-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the walk-in sales");
+        }
+    }
+
+    /// <summary>Sales returns, as a spreadsheet.</summary>
+    [HttpGet("returns/export")]
+    [Authorize(Policy = "BackOffice")]
+    public async Task<IActionResult> ExportReturns([FromQuery] string? q, [FromQuery] string? status)
+    {
+        try
+        {
+            var action = await GetReturns(q, status);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Return No", "returnNo", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Against Invoice", "invoiceNo", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Customer", "customerName", XlsxWriter.CellKind.Text, 30),
+                new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Return Date", "returnDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Reason", "reason", XlsxWriter.CellKind.Text, 40),
+                new XlsxWriter.Column("Refund Method", "refundMethod"),
+                new XlsxWriter.Column("Status", "statusName"),
+                new XlsxWriter.Column("Lines", "itemCount", XlsxWriter.CellKind.Integer, 10),
+                new XlsxWriter.Column("Resalable", "resalableQty", XlsxWriter.CellKind.Integer, 12),
+                new XlsxWriter.Column("Damaged", "damagedQty", XlsxWriter.CellKind.Integer, 12),
+                new XlsxWriter.Column("Refund", "totalAmount", XlsxWriter.CellKind.Money),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Sales Returns",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"sales-returns-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the returns");
+        }
+    }
+
+    /* The API writes anonymous objects with their own already-camelCase names;
+       matching that here means the column Field values below are the same keys
+       the browser sees. */
+    private static readonly JsonSerializerOptions ExportJson = new()
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles
+    };
+
 }

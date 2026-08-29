@@ -70,6 +70,68 @@ public static class DocumentArchive
             stored.Url, stored.PublicId, stored.Bytes, stored.Deliverable, now);
     }
 
+    /// <summary>
+    /// Builds, uploads and records a document by kind and id, swallowing any
+    /// failure.
+    ///
+    /// This is what every CREATE action calls. A document is archived the moment
+    /// it exists, not the first time somebody presses a button, so Download and
+    /// Print always have a stored Cloudinary file to hand out.
+    ///
+    /// The failure is swallowed ON PURPOSE. By the time this runs the order has
+    /// been taken, the stock has moved and the money is in the drawer; failing
+    /// the request because a document store was briefly unreachable would tell
+    /// the operator the sale did not happen, and they would ring it up twice.
+    /// The PDF can be rebuilt from the row at any time -- the sale cannot.
+    /// </summary>
+    public static async Task<Result?> TryStoreForAsync(
+        AppDbContext db, IConfiguration cfg, ILogger logger,
+        string kind, int id, int userId)
+    {
+        try
+        {
+            if (!DocumentBuilder.Kinds.TryGetValue(kind, out var folder))
+            {
+                logger.LogWarning("No document kind '{Kind}' to archive", kind);
+                return null;
+            }
+
+            var doc = await DocumentBuilder.BuildAsync(db, kind, id);
+            if (doc is null)
+            {
+                logger.LogWarning("Nothing to archive for {Kind} {Id}", kind, id);
+                return null;
+            }
+
+            return await StoreAsync(db, cfg, kind, id.ToString(), doc.DocNo,
+                DocumentBuilder.FileName(kind, doc.DocNo, id),
+                DocumentPdf.Render(doc), userId, folder);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex,
+                "{Kind} {Id} was saved but its PDF could not be archived. It can be rebuilt from the row.",
+                kind, id);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The stored file for a document, archiving it first if it has never been
+    /// archived. What the Download and Print routes call, so the link they hand
+    /// out is always the Cloudinary one.
+    /// </summary>
+    public static async Task<DocumentFile?> EnsureAsync(
+        AppDbContext db, IConfiguration cfg, ILogger logger,
+        string kind, int id, int userId)
+    {
+        var existing = await FindAsync(db, kind, id.ToString());
+        if (existing is not null) return existing;
+
+        var stored = await TryStoreForAsync(db, cfg, logger, kind, id, userId);
+        return stored is null ? null : await FindAsync(db, kind, id.ToString());
+    }
+
     /// <summary>What is already archived for this document, or null.</summary>
     public static Task<DocumentFile?> FindAsync(AppDbContext db, string docKind, string docKey) =>
         db.DocumentFiles.AsNoTracking()

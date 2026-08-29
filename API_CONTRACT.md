@@ -473,6 +473,21 @@ Two verbs on the same URL, and the difference matters:
 | `GET`  | render from the database and stream the bytes — Print and Download |
 | `POST` | render, upload to Cloudinary, record the link — Save to store |
 
+### Getting a document to a person
+
+`GET /documents/{kind}/{id}/download?attachment=false`
+
+**302 to the document's own file in Cloudinary**, archiving it first if it has
+never been archived. `attachment=true` adds Cloudinary's `fl_attachment` so the
+browser saves rather than previews.
+
+This route needs the bearer header like every other `/api` route, so it is for
+API callers. A browser `window.open` sends cookies and NOT the header, so the
+front end opens the Cloudinary URL directly instead — see
+`vizo-erp/src/lib/documents.ts`.
+
+Same for a sale invoice: `GET /sales/invoices/{id}/download?attachment=false`.
+
 ### Business documents
 
 `GET  /documents/{kind}/{id}/pdf` → `application/pdf`
@@ -524,6 +539,20 @@ of piling up copies.
 `GET /documents/open/{kind}/{key}?k=<hmac>` — **anonymous**, same signing scheme
 as `/sales/bill/{invoiceNo}`.
 
+### Documents are archived when they are CREATED
+
+Every create action pushes its PDF to Cloudinary before it returns —
+`POST /purchases/orders`, `/purchases/grns`, `/purchases/invoices`,
+`/purchases/returns`, `/inventory/adjustments`, `/inventory/transfers`,
+`/accounting/journal-entries`, `/accounting/expenses`, `/accounting/vouchers`,
+and every path in Sales that raises an invoice.
+
+A failure there is logged and swallowed. By the time it runs the order is taken,
+the stock has moved and the money is in the drawer; failing the request because
+a document store was briefly unreachable would tell the operator the sale did not
+happen and they would ring it up twice. The PDF can be rebuilt from the row at
+any time — the sale cannot.
+
 ### `isDeliverable`
 
 Every upload is followed by a HEAD on the URL it returned. Cloudinary blocks PDF
@@ -532,3 +561,33 @@ every request to the link answers `401 deny or ACL failure`. When that is the
 case the app hands out its own signed link instead of a broken one, and switches
 back to Cloudinary automatically once the console setting is changed
 (Settings → Security → Restricted media types).
+
+
+---
+
+## Spreadsheet export
+
+Every list screen with an Export button returns a real `.xlsx` — one sheet,
+frozen header, auto-filter, and money, dates and counts as **typed cells**
+rather than text that merely looks like numbers.
+
+| | |
+|---|---|
+| `GET /sales/orders/export` | `q`, `status`, `customerId` |
+| `GET /sales/invoices/export` | `q`, `status`, `customerId`, `walkIn` |
+| `GET /sales/returns/export` | `q`, `status` |
+| `GET /sales/direct/walkin/export` | `q`, `from`, `to` |
+| `GET /purchases/orders/export` | `q`, `status`, `supplierId` |
+| `GET /parties/export` | `type`, `q`, `includeInactive` |
+| `GET /inventory/products/export` | `q`, `categoryId`, `brandId`, `status`, `includeInactive` |
+
+Each one runs the **same list action the screen runs** and writes its result, so
+the file is what was on the page — filters and all — and the two cannot drift.
+
+Behind `[Authorize]` like everything else, so the front end fetches the blob with
+the header attached rather than navigating (`vizo-erp/src/lib/export.ts`).
+
+The writer is `Documents/XlsxWriter.cs`: no NuGet package, an `.xlsx` being a zip
+of six small XML parts and `System.IO.Compression` being in the framework. Same
+reasoning as the PDF writer. One sheet only — if formulas or charts are ever
+wanted, that is the moment to reach for a library rather than to grow that file.

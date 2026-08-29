@@ -1,6 +1,8 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using vizo_backend.Documents;
 using vizo_backend.Models;
 
 namespace vizo_backend.Controllers;
@@ -312,17 +314,12 @@ public class InventoryController : ApiControllerBase
             if (await _db.Categories.AnyAsync(c => c.CategoryName.ToLower() == name.ToLower()))
                 return BadRequest(new { message = $"A category called {name} already exists." });
 
-
             var c = new Category
             {
                 CategoryName = name,
                 ParentCategoryId = body.ParentId == 0 ? null : body.ParentId,
                 IsActive = body.IsActive
-            }; 
-
-          
-
-
+            };
             _db.Categories.Add(c);
             await _db.SaveChangesAsync();
             await Log("CATEGORY_CREATED", "Category", c.CategoryId.ToString(), name, 1);
@@ -1007,6 +1004,13 @@ public class InventoryController : ApiControllerBase
             await Log("STOCK_ADJUSTED", "StockAdjustment", adj.AdjustmentNo,
                 $"{moved} of {body.Lines.Count} lines moved", 3);
 
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "stock-adjustment", adj.AdjustmentId, CurrentUserId());
+
             return Ok(new
             {
                 id = adj.AdjustmentId,
@@ -1120,6 +1124,13 @@ public class InventoryController : ApiControllerBase
             await Log("TRANSFER_SENT", "StockTransfer", tr.TransferNo,
                 $"{body.Lines.Count} lines", 2);
 
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "stock-transfer", tr.TransferId, CurrentUserId());
+
             return Ok(new
             {
                 id = tr.TransferId,
@@ -1213,4 +1224,66 @@ public class InventoryController : ApiControllerBase
     public record TransferRequest(
         int FromLocationId, int ToLocationId, DateOnly? TransferDate, string? Notes,
         List<TransferLineRequest> Lines);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EXPORT
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  The Export button used to be a toast, or nothing at all. It now returns
+        a real .xlsx.
+
+        The export runs the SAME list action the screen runs and writes its
+        result, rather than re-querying -- so what lands in Excel is what was on
+        the page, filters and all, and the two cannot drift.
+
+        Money, dates and counts are written as typed cells rather than strings,
+        so the columns sort and total in Excel instead of being text that merely
+        looks like numbers.                                                     */
+
+    /// <summary>The product catalogue on the current filter, as a spreadsheet.</summary>
+    [HttpGet("products/export")]
+    public async Task<IActionResult> ExportProducts(
+        [FromQuery] string? q, [FromQuery] int? categoryId, [FromQuery] int? brandId,
+        [FromQuery] string? status, [FromQuery] bool includeInactive = true)
+    {
+        try
+        {
+            var action = await GetProducts(q, categoryId, brandId, status, includeInactive, 1, 5000);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Code", "sku", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Product", "name", XlsxWriter.CellKind.Text, 38),
+                new XlsxWriter.Column("Category", "categoryName", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Brand", "brandName", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Pack", "packing", XlsxWriter.CellKind.Integer, 8),
+                new XlsxWriter.Column("Cost", "costPrice", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Sale Price", "salePrice", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Tax %", "taxRatePercent", XlsxWriter.CellKind.Number, 10),
+                new XlsxWriter.Column("On Hand", "totalStock", XlsxWriter.CellKind.Integer, 12),
+                new XlsxWriter.Column("Min Qty", "minQty", XlsxWriter.CellKind.Integer, 10),
+                new XlsxWriter.Column("Max Qty", "maxQty", XlsxWriter.CellKind.Integer, 10),
+                new XlsxWriter.Column("Stock Status", "status"),
+                new XlsxWriter.Column("Active", "isActive", XlsxWriter.CellKind.Text, 8),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Products",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"products-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the products");
+        }
+    }
+
+    /* The API writes anonymous objects with their own already-camelCase names;
+       matching that here means the column Field values below are the same keys
+       the browser sees. */
+    private static readonly JsonSerializerOptions ExportJson = new()
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles
+    };
+
 }

@@ -1,6 +1,8 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using vizo_backend.Documents;
 using vizo_backend.Models;
 
 namespace vizo_backend.Controllers;
@@ -718,6 +720,13 @@ public class PurchasesController : ApiControllerBase
             await tx.CommitAsync();
 
             await Log("PO_CREATED", "PurchaseOrder", po.PoNo, $"{body.Lines.Count} lines, {total:N0}", 1);
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-order", po.PoId, CurrentUserId());
+
             return Ok(new { id = po.PoId, poNo = po.PoNo, message = $"Purchase order {po.PoNo} saved." });
         }
         catch (Exception ex)
@@ -883,6 +892,13 @@ public class PurchasesController : ApiControllerBase
             await Log("GRN_CREATED", "GoodsReceipt", grn.GrnNo,
                 $"{body.Lines.Count} lines, {grn.TotalValue:N0}", 1);
 
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "goods-receipt", grn.GrnId, CurrentUserId());
+
             return Ok(new { id = grn.GrnId, grnNo = grn.GrnNo, message = $"{grn.GrnNo} received and stock updated." });
         }
         catch (Exception ex)
@@ -966,6 +982,13 @@ public class PurchasesController : ApiControllerBase
 
             await Log("PI_CREATED", "PurchaseInvoice", pi.InvoiceNo,
                 $"{body.SupplierInvoiceNo} / {total:N0}", 2);
+
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-invoice", pi.PiId, CurrentUserId());
 
             return Ok(new { id = pi.PiId, invoiceNo = pi.InvoiceNo, message = $"Purchase invoice {pi.InvoiceNo} saved." });
         }
@@ -1059,6 +1082,13 @@ public class PurchasesController : ApiControllerBase
             await tx.CommitAsync();
 
             await Log("PR_CREATED", "PurchaseReturn", pr.ReturnNo, body.Reason, 2);
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-return", pr.PrId, CurrentUserId());
+
             return Ok(new { id = pr.PrId, returnNo = pr.ReturnNo, message = $"Purchase return {pr.ReturnNo} saved." });
         }
         catch (Exception ex)
@@ -1114,4 +1144,65 @@ public class PurchasesController : ApiControllerBase
     public record PrRequest(
         int PiId, int LocationId, DateOnly? ReturnDate, string Reason,
         List<PurchaseLineRequest> Lines);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EXPORT
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  The Export button used to be a toast, or nothing at all. It now returns
+        a real .xlsx.
+
+        The export runs the SAME list action the screen runs and writes its
+        result, rather than re-querying -- so what lands in Excel is what was on
+        the page, filters and all, and the two cannot drift.
+
+        Money, dates and counts are written as typed cells rather than strings,
+        so the columns sort and total in Excel instead of being text that merely
+        looks like numbers.                                                     */
+
+    /// <summary>Every purchase order on the current filter, as a spreadsheet.</summary>
+    [HttpGet("orders/export")]
+    public async Task<IActionResult> ExportPurchaseOrders(
+        [FromQuery] string? q, [FromQuery] string? status, [FromQuery] int? supplierId)
+    {
+        try
+        {
+            var action = await GetPurchaseOrders(q, status, supplierId);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("PO No", "poNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Supplier", "supplierName", XlsxWriter.CellKind.Text, 32),
+                new XlsxWriter.Column("Deliver To", "location", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("PO Date", "poDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Expected", "expectedDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Status", "statusName"),
+                new XlsxWriter.Column("Lines", "itemCount", XlsxWriter.CellKind.Integer, 10),
+                new XlsxWriter.Column("Ordered Units", "orderedUnits", XlsxWriter.CellKind.Integer, 14),
+                new XlsxWriter.Column("Received Units", "receivedUnits", XlsxWriter.CellKind.Integer, 14),
+                new XlsxWriter.Column("Received %", "receivedPercent", XlsxWriter.CellKind.Number, 12),
+                new XlsxWriter.Column("Total", "total", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Raised By", "createdBy", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Approved By", "approvedBy", XlsxWriter.CellKind.Text, 20),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Purchase Orders",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"purchase-orders-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the purchase orders");
+        }
+    }
+
+    /* The API writes anonymous objects with their own already-camelCase names;
+       matching that here means the column Field values below are the same keys
+       the browser sees. */
+    private static readonly JsonSerializerOptions ExportJson = new()
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles
+    };
+
 }

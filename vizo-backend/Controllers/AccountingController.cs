@@ -400,6 +400,13 @@ public class AccountingController : ApiControllerBase
             await Log(body.PostImmediately ? "JOURNAL_POSTED" : "JOURNAL_DRAFTED",
                 "JournalEntry", entry.EntryNo, $"{totalDebit:N2} over {body.Lines.Count} lines", 2);
 
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "journal-entry", entry.EntryId, CurrentUserId());
+
             return Ok(new
             {
                 id = entry.EntryId,
@@ -778,6 +785,13 @@ public class AccountingController : ApiControllerBase
             _db.Expenses.Add(e);
             await _db.SaveChangesAsync();
             await Log("EXPENSE_CREATED", "Expense", e.ExpenseNo, $"{e.Amount:N2} to {e.VendorName}", 1);
+
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
 
             return Ok(new { id = e.ExpenseId, expenseNo = e.ExpenseNo, message = $"Expense {e.ExpenseNo} saved." });
         }
@@ -1565,6 +1579,13 @@ public class AccountingController : ApiControllerBase
 
             await Log(type.IsReceipt ? "RECEIPT_RECORDED" : "PAYMENT_RECORDED",
                 "Voucher", v.VoucherNo, $"{body.Amount:N2}", 2);
+
+            /* The PDF exists the moment the document does. Print and Download
+               then hand out the stored Cloudinary file rather than rendering a
+               fresh one, so what is on screen is what is in the store. A
+               failure here is logged and swallowed -- the document is saved
+               either way and the PDF can be rebuilt from the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "voucher", v.VoucherId, CurrentUserId());
 
             return Ok(new
             {

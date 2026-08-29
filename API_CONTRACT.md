@@ -299,3 +299,160 @@ Images and PDFs go to two **different** Cloudinary accounts, configured in
   "initials": "UM", "primaryLocationId", "employeeCode", "isActive",
   "permissions": ["orders.view", "..."] }
 ```
+
+---
+
+## Sales
+
+Everything under `/sales/*` needs a signed-in member of staff. Some actions are
+narrower — the policy is named against each one.
+
+### Orders
+
+`GET /sales/orders?q=&status=&customerId=&page=1&pageSize=50` →
+`{ "total", "page", "pageSize", "items": [...] }`
+
+`GET /sales/orders/{id}` → the header, the real lines, what has been paid,
+where the delivery got to, the invoice if one exists, and the activity trail:
+```jsonc
+{ "id", "orderNo", "customerId", "customerName", "customerInitials",
+  "customerCode", "customerPhone", "customerAltPhone", "customerAddress",
+  "customerType", "city", "creditLimit", "creditDays", "holdPolicy",
+  "locationId", "location", "salesPerson", "orderDate", "deliveryDate",
+  "status", "statusName", "subtotal", "discount", "tax", "total",
+  "methodId", "paymentMethod", "paymentMethodName",
+  "creditHoldReason", "notes", "createdBy", "createdAt",
+  "invoiceId", "invoiceNo", "invoicePdfUrl", "invoiceShareUrl",
+  "paidAmount", "balance", "paymentStatus", "outstanding",
+  "channel", "carrier", "trackingNo", "deliveryState", "dispatchedOn", "deliveredOn",
+  "lines":    [{ "id", "lineNo", "productId", "name", "sku", "packing",
+                 "qty", "rate", "discountPercent", "taxPercent", "lineTotal" }],
+  "activity": [{ "id", "action", "entityType", "detail", "at", "severity", "user" }] }
+```
+
+`POST /sales/orders` body:
+```jsonc
+{ "customerId", "locationId", "salesPersonUserId": null,
+  "orderDate": "2026-08-29", "deliveryDate": "2026-09-05", "dueDate": null,
+  "methodId", "notes": null,
+  "saveAsDraft": false,     // DRAFT: no credit check, no invoice
+  "raiseInvoice": true,     // cut the invoice in the same transaction
+  "lines": [{ "productId", "qty", "rate", "discountPercent", "taxPercent" }] }
+```
+→ `{ "id", "orderNo", "status", "onCreditHold", "invoiceId", "invoiceNo",
+     "invoicePdfUrl", "invoiceShareUrl", "message" }`
+
+An order over the customer's limit is saved `CREDIT_HOLD` and is **never**
+invoiced, whatever `raiseInvoice` says. Line totals are recomputed server-side.
+The document series is **`ORD`**, not `SO`.
+
+`POST /sales/orders/{id}/invoice` (BackOffice) body `{ "methodId": null, "dueDate": null }`
+→ `{ "invoiceId", "invoiceNo", "invoicePdfUrl", "invoiceShareUrl", "message" }`
+
+`PATCH /sales/orders/{id}/status` body `{ "statusKey", "reason": null }`
+→ `{ "id", "status", "statusName", "message" }`.
+Refuses to cancel an order that has been invoiced. The reason goes on the
+activity trail.
+
+### Credit holds
+
+`GET /sales/credit-holds` (Accountant) → the queue, each row carrying
+`customerPhone`, `outstanding`, `paidAmount` and `overBy` so the screen can
+remind, review or release without a second call.
+
+`GET /sales/credit-holds/count` (any staff) → `{ "count" }` — the sidebar badge.
+
+`POST /sales/credit-holds/{id}/override` (Accountant)
+body `{ "reason", "raiseInvoice": true }` → `{ "id", "status", "statusName",
+"invoiceId", "invoiceNo", "message" }`. The reason is required and is logged at
+severity 3.
+
+### Invoices
+
+`GET /sales/invoices?q=&status=&customerId=&walkIn=false&page=1&pageSize=50`
+
+`walkIn` is `false` (default, account invoices only), `true` (walk-in only) or
+`all`. Walk-in counter bills are kept out of the ledger by default — they never
+age and nobody chases them.
+
+`GET /sales/invoices/{id}` → as the list row, plus `strn`, `isWalkIn`,
+`shareUrl`, `notes`, `lines[].returnedQty`, and `company` — the letterhead
+straight off the `Company` row:
+```jsonc
+"company": { "name", "legalName", "address", "city", "country",
+             "phone", "email", "ntn", "strn", "currencyCode", "currencySymbol" }
+```
+
+`POST /sales/invoices` (BackOffice) — standalone or against an order.
+→ `{ "id", "invoiceNo", "pdfUrl", "shareUrl", "total", "message" }`
+
+`GET  /sales/invoices/{id}/pdf` → the bill as `application/pdf`, rendered from
+the row on every request. This is what Print and Download open.
+
+`POST /sales/invoices/{id}/pdf?force=false` → renders, uploads to the documents
+Cloudinary account and stores the link. → `{ "pdfUrl", "shareUrl", "rebuilt", "message" }`
+
+`GET /sales/bill/{invoiceNo}?k=<hmac>` — **anonymous**. The link the WhatsApp
+share sends: a customer has no account here. `k` is an HMAC of the invoice
+number under the JWT signing secret, compared in constant time; rotating that
+secret revokes every link at once.
+
+### Returns
+
+`GET  /sales/returns?q=&status=`
+`GET  /sales/returns/{id}` → header, lines with `soldQty`, the decision
+(`decisionReason`, `decidedBy`, `decidedAt`) and the activity trail.
+
+`POST /sales/returns` (BackOffice) body:
+```jsonc
+{ "invoiceId", "locationId", "returnDate", "reason", "refundMethodId",
+  "lines": [{ "productId", "qty", "rate", "conditionId", "restockLocationId": null }] }
+```
+Refuses anything not on the invoice, and anything already returned. Resalable
+lines go straight back on the shelf; the rest are written off.
+
+`PATCH /sales/returns/{id}/status` (BackOffice)
+body `{ "statusKey": "APPROVED" | "POSTED" | "REJECTED", "reason": null }`
+→ `{ "id", "status", "statusName", "unitsReversed", "message" }`
+
+**Rejecting takes the restocked units back off the shelf.** A reason is
+required on reject.
+
+### Counter sale
+
+`POST /sales/direct` (OrderDept) body:
+```jsonc
+{ "customerId", "isWalkIn": true, "walkInName", "walkInPhone",
+  "locationId", "methodId", "notes",
+  "lines": [{ "productId", "qty", "rate", "discountPercent", "taxPercent" }] }
+```
+One call raises the order, the invoice, the stock movement and the bill.
+→ `{ "orderId", "orderNo", "invoiceId", "invoiceNo", "isWalkIn",
+     "customerName", "customerPhone", "subtotal", "discount", "tax", "total",
+     "pdfUrl", "shareUrl", "message" }`
+
+A walk-in is booked against the shared `VZ-C-WALKIN` party with the buyer's own
+name and number on the invoice row; credit is refused. An existing shop gets an
+ordinary invoice that shows in the ledger.
+
+`GET /sales/direct/walkin?q=&from=&to=&page=1&pageSize=50` (OrderDept) →
+`{ "total", "page", "pageSize", "totalValue", "items": [...] }`
+
+### Lookups
+
+`GET /sales/lookups?locationId=` — one call fills every picker on every sales form:
+```jsonc
+{ "orderStatuses", "invoiceStatuses", "returnStatuses", "paymentMethods",
+  "conditions",
+  "locations": [{ "id", "code", "name", "kind", "isSellable" }],
+  "customers": [{ "id", "code", "name", "displayName", "city", "phone",
+                  "creditLimit", "creditDays", "holdPolicy", "outstanding" }],
+  "salesPeople",
+  "products":  [{ "id", "sku", "name", "packing", "salePrice", "costPrice",
+                  "taxRatePercent", "totalStock", "stockHere" }],
+  "walkInCustomerId", "defaultTaxPercent", "company" }
+```
+
+`stockHere` is null unless `locationId` is passed. `isSellable` is false for
+claim and in-transit stock — held, never sold. `defaultTaxPercent` is the rate
+most of the catalogue carries, and is what the counter screen starts on.

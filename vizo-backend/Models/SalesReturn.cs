@@ -27,6 +27,15 @@ public partial class SalesReturn
 
     public int CreatedByUserId { get; set; }
 
+    /* Added by backend/database/08_sales_documents.sql. */
+
+    /// <summary>Why the return was approved, posted or rejected. Required on reject.</summary>
+    public string? DecisionReason { get; set; }
+
+    public int? DecidedByUserId { get; set; }
+
+    public DateTime? DecidedAt { get; set; }
+
     public virtual User CreatedByUser { get; set; } = null!;
 
     public virtual Party CustomerUser { get; set; } = null!;

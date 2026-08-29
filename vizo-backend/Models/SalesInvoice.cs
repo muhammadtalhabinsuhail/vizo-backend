@@ -35,6 +35,23 @@ public partial class SalesInvoice
 
     public int CreatedByUserId { get; set; }
 
+    /* Added by backend/database/08_sales_documents.sql. */
+
+    /// <summary>Cloudinary secure_url of the rendered bill, or null until it is built.</summary>
+    public string? PdfUrl { get; set; }
+
+    /// <summary>Cloudinary public_id, kept so the asset can be replaced or removed.</summary>
+    public string? PdfPublicId { get; set; }
+
+    /// <summary>True for a counter sale to somebody with no shop account.</summary>
+    public bool IsWalkIn { get; set; }
+
+    /// <summary>The walk-in buyer's own name. Null on account sales.</summary>
+    public string? WalkInName { get; set; }
+
+    /// <summary>The walk-in buyer's own number -- this is what the WhatsApp share dials.</summary>
+    public string? WalkInPhone { get; set; }
+
     public virtual User CreatedByUser { get; set; } = null!;
 
     public virtual Party CustomerUser { get; set; } = null!;

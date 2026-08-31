@@ -112,5 +112,19 @@ public partial class AppDbContext
                 .OnDelete(DeleteBehavior.ClientSetNull)
                 .HasConstraintName("FK_SalesReturn_DecidedBy");
         });
+
+        modelBuilder.Entity<JournalEntry>(entity =>
+        {
+            /* A reversed entry stays POSTED and points at the entry that undid
+               it. See Models/JournalEntry.Custom.cs for why it is not simply
+               un-posted, and database/12_journal_reversal_link.sql for the
+               column. Self-referencing, so no cascade -- deleting a mirror must
+               not take the original with it. */
+            entity.HasOne(e => e.ReversedByEntry)
+                .WithMany(e => e.Reverses)
+                .HasForeignKey(e => e.ReversedByEntryId)
+                .OnDelete(DeleteBehavior.Restrict)
+                .HasConstraintName("JournalEntry_ReversedByEntryId_fkey");
+        });
     }
 }

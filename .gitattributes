@@ -61,3 +61,11 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+###############################################################################
+# database/db_ans.pdf lives in this repo. 'text=auto' guesses binary correctly
+# for it today, but a guess is not a guarantee -- a PDF that gets CRLF-converted
+# on checkout will not open. Say so outright.
+###############################################################################
+*.pdf   binary
+*.xlsx  binary

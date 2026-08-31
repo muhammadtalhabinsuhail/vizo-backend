@@ -226,6 +226,17 @@ public class AccountingController : ApiControllerBase
 
             var total = await rows.CountAsync();
 
+            /* Counted over the WHOLE filter, not the page. A card that only
+               counted the visible rows would change every time somebody turned
+               a page, which is not what "12 drafts" is supposed to mean.
+
+               Reversed is counted by the LINK, not by the status: a reversed
+               entry deliberately stays POSTED so the pair cancels in the
+               statements, so status alone can no longer find them. */
+            var postedCount = await rows.CountAsync(e => e.Status.StatusKey == Posted);
+            var draftCount = await rows.CountAsync(e => e.Status.StatusKey == "DRAFT");
+            var reversedCount = await rows.CountAsync(e => e.ReversedByEntryId != null);
+
             var items = await rows
                 .OrderByDescending(e => e.EntryDate).ThenByDescending(e => e.EntryId)
                 .Skip((page - 1) * pageSize).Take(pageSize)
@@ -243,12 +254,27 @@ public class AccountingController : ApiControllerBase
                     statusName = e.Status.StatusName,
                     createdBy = e.CreatedByUser.FullName,
                     postedBy = e.PostedByUser != null ? e.PostedByUser.FullName : null,
+                    /* A reversed entry stays POSTED so the pair cancels in the
+                       statements, so the status alone cannot tell the screen it
+                       was undone. This is what does. */
+                    reversedById = e.ReversedByEntryId,
+                    reversedBy = e.ReversedByEntry != null ? e.ReversedByEntry.EntryNo : null,
                     totalDebit = e.JournalEntryLines.Sum(l => (decimal?)l.DebitAmount) ?? 0m,
                     totalCredit = e.JournalEntryLines.Sum(l => (decimal?)l.CreditAmount) ?? 0m
                 })
                 .ToListAsync();
 
-            return Ok(new { total, page, pageSize, items });
+            return Ok(new
+            {
+                total,
+                page,
+                pageSize,
+                pageCount = (int)Math.Ceiling(total / (double)pageSize),
+                postedCount,
+                draftCount,
+                reversedCount,
+                items
+            });
         }
         catch (Exception ex)
         {
@@ -280,6 +306,12 @@ public class AccountingController : ApiControllerBase
                     createdBy = x.CreatedByUser.FullName,
                     createdAt = x.CreatedAt,
                     postedBy = x.PostedByUser != null ? x.PostedByUser.FullName : null,
+                    reversedById = x.ReversedByEntryId,
+                    reversedBy = x.ReversedByEntry != null ? x.ReversedByEntry.EntryNo : null,
+                    /* The other direction: this entry is itself the mirror that
+                       undid something. The screen shows "reverses JV-26-0180". */
+                    reversesId = x.Reverses.Select(r => (int?)r.EntryId).FirstOrDefault(),
+                    reverses = x.Reverses.Select(r => r.EntryNo).FirstOrDefault(),
                     lines = x.JournalEntryLines.OrderBy(l => l.LineNo).Select(l => new
                     {
                         id = l.LineId,
@@ -303,6 +335,7 @@ public class AccountingController : ApiControllerBase
                 e.id, e.entryNo, e.entryDate, e.entryType, e.entryTypeName,
                 e.reference, e.locationId, e.location, e.period, e.narration,
                 e.status, e.statusName, e.createdBy, e.createdAt, e.postedBy,
+                e.reversedById, e.reversedBy, e.reversesId, e.reverses,
                 totalDebit = e.lines.Sum(l => l.debit),
                 totalCredit = e.lines.Sum(l => l.credit),
                 e.lines
@@ -356,7 +389,12 @@ public class AccountingController : ApiControllerBase
 
             var draft = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
             var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
-            var type = await _db.JournalEntryTypes.FirstOrDefaultAsync(t => t.TypeKey == "MANUAL")
+            /* JOURNAL, not MANUAL. There is no MANUAL row in JournalEntryType,
+               and FirstOrDefaultAsync does not complain about that -- the
+               fallback then handed every hand-written entry the FIRST type in
+               the table, which is SALE. Entries typed as sales that were never
+               sales. */
+            var type = await _db.JournalEntryTypes.FirstOrDefaultAsync(t => t.TypeKey == "JOURNAL")
                        ?? await _db.JournalEntryTypes.FirstAsync();
 
             await using var tx = await _db.Database.BeginTransactionAsync();
@@ -461,14 +499,21 @@ public class AccountingController : ApiControllerBase
 
     [HttpGet("vouchers")]
     public async Task<IActionResult> GetVouchers(
-        [FromQuery] string? q, [FromQuery] string? status, [FromQuery] string? type)
+        [FromQuery] string? q, [FromQuery] string? status, [FromQuery] string? type,
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to,
+        [FromQuery] int page = 1, [FromQuery] int pageSize = 50)
     {
         try
         {
+            if (page < 1) page = 1;
+            if (pageSize is < 1 or > 500) pageSize = 50;
+
             var rows = _db.Vouchers.AsNoTracking().AsQueryable();
 
             if (!string.IsNullOrWhiteSpace(status)) rows = rows.Where(v => v.Status.StatusKey == status);
             if (!string.IsNullOrWhiteSpace(type)) rows = rows.Where(v => v.VoucherType.TypeCode == type);
+            if (from is not null) rows = rows.Where(v => v.VoucherDate >= from);
+            if (to is not null) rows = rows.Where(v => v.VoucherDate <= to);
             if (!string.IsNullOrWhiteSpace(q))
             {
                 var term = q.Trim().ToLower();
@@ -477,8 +522,24 @@ public class AccountingController : ApiControllerBase
                                        (v.PartyUser != null && v.PartyUser.LegalName.ToLower().Contains(term)));
             }
 
-            return Ok(await rows
+            var count = await rows.CountAsync();
+            var money = await rows.SumAsync(v => (decimal?)v.Amount) ?? 0m;
+
+            /* Split by direction over the WHOLE filter. The screen shows money
+               in and money out as two figures, and working them out from the
+               page on screen would give a different answer on every page. Only
+               POSTED counts -- a draft voucher has not moved anything. */
+            var receiptTotal = await rows
+                .Where(v => v.VoucherType.IsReceipt && v.Status.StatusKey == Posted)
+                .SumAsync(v => (decimal?)v.Amount) ?? 0m;
+            var paymentTotal = await rows
+                .Where(v => !v.VoucherType.IsReceipt && v.Status.StatusKey == Posted)
+                .SumAsync(v => (decimal?)v.Amount) ?? 0m;
+            var draftCount = await rows.CountAsync(v => v.Status.StatusKey == "DRAFT");
+
+            var items = await rows
                 .OrderByDescending(v => v.VoucherDate).ThenByDescending(v => v.VoucherId)
+                .Skip((page - 1) * pageSize).Take(pageSize)
                 .Select(v => new
                 {
                     id = v.VoucherId,
@@ -500,7 +561,24 @@ public class AccountingController : ApiControllerBase
                     statusName = v.Status.StatusName,
                     createdBy = v.CreatedByUser.FullName
                 })
-                .ToListAsync());
+                .ToListAsync();
+
+            /* `count` and `total` are over the WHOLE filter, not the page --
+               the summary cards on the screen show the filtered set, and a card
+               that only counted the visible page would be wrong the moment
+               somebody turned to page two. */
+            return Ok(new
+            {
+                count,
+                total = money,
+                receiptTotal,
+                paymentTotal,
+                draftCount,
+                page,
+                pageSize,
+                pageCount = (int)Math.Ceiling(count / (double)pageSize),
+                items
+            });
         }
         catch (Exception ex)
         {
@@ -539,6 +617,8 @@ public class AccountingController : ApiControllerBase
                     statusName = x.Status.StatusName,
                     entryId = x.EntryId,
                     entryNo = x.Entry != null ? x.Entry.EntryNo : null,
+                    reversalEntryNo = x.Entry != null && x.Entry.ReversedByEntry != null
+                        ? x.Entry.ReversedByEntry.EntryNo : null,
                     createdBy = x.CreatedByUser.FullName,
                     allocations = x.VoucherAllocations.Select(a => new
                     {
@@ -667,10 +747,14 @@ public class AccountingController : ApiControllerBase
     [HttpGet("expenses")]
     public async Task<IActionResult> GetExpenses(
         [FromQuery] string? q, [FromQuery] string? status,
-        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to)
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to,
+        [FromQuery] int page = 1, [FromQuery] int pageSize = 50)
     {
         try
         {
+            if (page < 1) page = 1;
+            if (pageSize is < 1 or > 500) pageSize = 50;
+
             var rows = _db.Expenses.AsNoTracking().AsQueryable();
 
             if (!string.IsNullOrWhiteSpace(status)) rows = rows.Where(e => e.Status.StatusKey == status);
@@ -705,7 +789,19 @@ public class AccountingController : ApiControllerBase
                 })
                 .ToListAsync();
 
-            return Ok(new { total = items.Sum(e => e.amount), count = items.Count, items });
+            /* `total` is the money and `count` is the row count -- both are what
+               the summary cards on the screen show, and both are over the WHOLE
+               filter, not just the page. `items` is the page. */
+            var paged = items.Skip((page - 1) * pageSize).Take(pageSize).ToList();
+            return Ok(new
+            {
+                total = items.Sum(e => e.amount),
+                count = items.Count,
+                page,
+                pageSize,
+                pageCount = (int)Math.Ceiling(items.Count / (double)pageSize),
+                items = paged
+            });
         }
         catch (Exception ex)
         {
@@ -738,7 +834,12 @@ public class AccountingController : ApiControllerBase
                     description = x.Description,
                     status = x.Status.StatusKey,
                     statusName = x.Status.StatusName,
+                    entryId = x.EntryId,
                     entryNo = x.Entry != null ? x.Entry.EntryNo : null,
+                    /* Set once the expense has been reversed, so the screen can
+                       say which entry undid it rather than only that it was. */
+                    reversalEntryNo = x.Entry != null && x.Entry.ReversedByEntry != null
+                        ? x.Entry.ReversedByEntry.EntryNo : null,
                     createdBy = x.CreatedByUser.FullName
                 })
                 .FirstOrDefaultAsync();
@@ -757,13 +858,10 @@ public class AccountingController : ApiControllerBase
     {
         try
         {
-            if (body.Amount <= 0) return BadRequest(new { message = "An expense needs an amount above zero." });
-            if (string.IsNullOrWhiteSpace(body.VendorName))
-                return BadRequest(new { message = "Vendor name is required." });
-            if (!await _db.Accounts.AnyAsync(a => a.AccountId == body.ExpenseAccountId && !a.IsGroup))
-                return BadRequest(new { message = "Pick a valid expense account." });
-            if (!await _db.Accounts.AnyAsync(a => a.AccountId == body.PaidFromAccountId && !a.IsGroup))
-                return BadRequest(new { message = "Pick a valid cash or bank account to pay from." });
+            /* One validator for create and update. Two copies of the same
+               rules is two sets of rules the day somebody edits one of them. */
+            var invalid = await ValidateExpense(body);
+            if (invalid is not null) return BadRequest(new { message = invalid });
 
             var draft = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
 
@@ -1467,9 +1565,20 @@ public class AccountingController : ApiControllerBase
                     .OrderByDescending(p => p.StartDate)
                     .Select(p => new { id = p.PeriodId, name = p.PeriodName, isClosed = p.IsClosed })
                     .ToListAsync(),
+                /* type comes from the USER's role, the same way PartiesController
+                   reads it -- 5 customer, 6 supplier, 7 both. A receipt voucher
+                   should not offer suppliers and a payment should not offer
+                   customers, and without this the screen cannot tell them apart. */
                 parties = await _db.Parties.AsNoTracking()
                     .Where(p => p.User.IsActive).OrderBy(p => p.LegalName)
-                    .Select(p => new { id = p.UserId, code = p.PartyCode, name = p.LegalName })
+                    .Select(p => new
+                    {
+                        id = p.UserId,
+                        code = p.PartyCode,
+                        name = p.LegalName,
+                        type = p.User.RoleId == 6 ? "SUPPLIER"
+                             : p.User.RoleId == 7 ? "BOTH" : "CUSTOMER"
+                    })
                     .ToListAsync()
             });
         }
@@ -1505,6 +1614,113 @@ public class AccountingController : ApiControllerBase
     /// it settles, which is how a customer ledger stops agreeing with the
     /// invoice list.
     /// </summary>
+    /// <summary>
+    /// The unpaid invoices a voucher can be allocated against.
+    ///
+    /// Neither SalesInvoice nor PurchaseInvoice carries a "paid" column, so
+    /// what has been settled is the sum of the allocations pointed at it. Only
+    /// POSTED vouchers count -- a draft is somebody's intention, not a payment,
+    /// and treating it as one would hide money that is still owed.
+    ///
+    /// kind: "sales" (money coming in) or "purchase" (money going out).
+    /// </summary>
+    [HttpGet("open-invoices")]
+    public async Task<IActionResult> GetOpenInvoices(
+        [FromQuery] string kind = "sales", [FromQuery] int? partyId = null,
+        [FromQuery] string? q = null, [FromQuery] int take = 50)
+    {
+        try
+        {
+            if (take is < 1 or > 200) take = 50;
+            var wanted = (kind ?? "sales").Trim().ToLowerInvariant();
+            if (wanted is not ("sales" or "purchase"))
+                return BadRequest(new { message = $"'{kind}' is not an invoice kind. Use sales or purchase." });
+
+            if (wanted == "sales")
+            {
+                var rows = _db.SalesInvoices.AsNoTracking()
+                    .Where(i => i.Status.StatusKey != "CANCELLED");
+                if (partyId is not null) rows = rows.Where(i => i.CustomerUserId == partyId);
+                if (!string.IsNullOrWhiteSpace(q))
+                {
+                    var term = q.Trim().ToLower();
+                    rows = rows.Where(i => i.InvoiceNo.ToLower().Contains(term));
+                }
+
+                var list = await rows
+                    .Select(i => new
+                    {
+                        id = i.InvoiceId,
+                        invoiceNo = i.InvoiceNo,
+                        invoiceDate = i.InvoiceDate,
+                        dueDate = i.DueDate,
+                        partyId = i.CustomerUserId,
+                        partyName = i.CustomerUser.LegalName,
+                        total = i.TotalAmount,
+                        paid = i.VoucherAllocations
+                            .Where(a => a.Voucher.Status.StatusKey == Posted)
+                            .Sum(a => (decimal?)a.Amount) ?? 0m
+                    })
+                    .ToListAsync();
+
+                var open = list.Select(i => new
+                    {
+                        i.id, i.invoiceNo, i.invoiceDate, i.dueDate, i.partyId, i.partyName,
+                        i.total, i.paid, balance = i.total - i.paid
+                    })
+                    .Where(i => i.balance > 0.004m)
+                    .OrderBy(i => i.dueDate).ThenBy(i => i.invoiceNo)
+                    .Take(take).ToList();
+
+                return Ok(new { kind = wanted, count = open.Count, outstanding = open.Sum(i => i.balance), items = open });
+            }
+            else
+            {
+                var rows = _db.PurchaseInvoices.AsNoTracking()
+                    .Where(i => i.Status.StatusKey != "CANCELLED");
+                if (partyId is not null) rows = rows.Where(i => i.SupplierUserId == partyId);
+                if (!string.IsNullOrWhiteSpace(q))
+                {
+                    var term = q.Trim().ToLower();
+                    rows = rows.Where(i => i.InvoiceNo.ToLower().Contains(term) ||
+                                           i.SupplierInvoiceNo.ToLower().Contains(term));
+                }
+
+                var list = await rows
+                    .Select(i => new
+                    {
+                        id = i.PiId,
+                        invoiceNo = i.InvoiceNo,
+                        supplierInvoiceNo = i.SupplierInvoiceNo,
+                        invoiceDate = i.InvoiceDate,
+                        dueDate = i.DueDate,
+                        partyId = i.SupplierUserId,
+                        partyName = i.SupplierUser.LegalName,
+                        total = i.TotalAmount,
+                        paid = i.VoucherAllocations
+                            .Where(a => a.Voucher.Status.StatusKey == Posted)
+                            .Sum(a => (decimal?)a.Amount) ?? 0m
+                    })
+                    .ToListAsync();
+
+                var open = list.Select(i => new
+                    {
+                        i.id, i.invoiceNo, i.supplierInvoiceNo, i.invoiceDate, i.dueDate,
+                        i.partyId, i.partyName, i.total, i.paid, balance = i.total - i.paid
+                    })
+                    .Where(i => i.balance > 0.004m)
+                    .OrderBy(i => i.dueDate).ThenBy(i => i.invoiceNo)
+                    .Take(take).ToList();
+
+                return Ok(new { kind = wanted, count = open.Count, outstanding = open.Sum(i => i.balance), items = open });
+            }
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the open invoices");
+        }
+    }
+
     [HttpPost("vouchers")]
     public async Task<IActionResult> CreateVoucher([FromBody] VoucherRequest body)
     {
@@ -1575,6 +1791,17 @@ public class AccountingController : ApiControllerBase
                 });
             }
             await _db.SaveChangesAsync();
+
+            /* Saved AND posted in one go still has to reach the ledger. This is
+               the same call PostVoucher makes -- one path, so a voucher posted
+               on creation and a voucher posted later produce the same entry. */
+            if (body.PostImmediately)
+            {
+                var why = await PostVoucherToLedger(v);
+                if (why is not null) return BadRequest(new { message = why });
+                await _db.SaveChangesAsync();
+            }
+
             await tx.CommitAsync();
 
             await Log(type.IsReceipt ? "RECEIPT_RECORDED" : "PAYMENT_RECORDED",
@@ -1616,17 +1843,162 @@ public class AccountingController : ApiControllerBase
             var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
             if (posted is null) return BadRequest(new { message = "No POSTED status is configured." });
 
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            /* Posting is the moment the money is recognised, so it is also the
+               moment the ledger has to hear about it. Before this the status
+               flipped on its own and EntryId stayed null -- a posted voucher
+               that no statement in the app could see, and a customer invoice
+               that never cleared. */
+            if (v.EntryId is null)
+            {
+                var why = await PostVoucherToLedger(v);
+                if (why is not null) return BadRequest(new { message = why });
+            }
+
             v.StatusId = posted.StatusId;
             await _db.SaveChangesAsync();
+            await tx.CommitAsync();
             await Log("VOUCHER_POSTED", "Voucher", v.VoucherNo, $"{v.Amount:N2}", 2);
 
-            return Ok(new { id, message = $"{v.VoucherNo} posted." });
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "voucher", v.VoucherId, CurrentUserId());
+
+            var entryNo = await _db.JournalEntries.AsNoTracking()
+                .Where(e => e.EntryId == v.EntryId).Select(e => e.EntryNo).FirstOrDefaultAsync();
+
+            return Ok(new { id, entryNo, message = $"{v.VoucherNo} posted." });
         }
         catch (Exception ex)
         {
             return Fail(ex, $"post voucher {id}");
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EXPORTS
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  Each export runs the SAME list action the screen runs and writes its
+        result, so the workbook is what was on the page -- filters, search and
+        all. Re-running a copy of the query here is how an export quietly starts
+        disagreeing with the screen it was taken from.
+
+        pageSize 5000: an export is the one place a full list is wanted, and the
+        screen itself stays paginated.                                        */
+
+    [HttpGet("expenses/export")]
+    public async Task<IActionResult> ExportExpenses(
+        [FromQuery] string? q, [FromQuery] string? status,
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to)
+    {
+        try
+        {
+            var action = await GetExpenses(q, status, from, to, 1, 5000);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Expense No", "expenseNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Date", "expenseDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Category", "categoryName", XlsxWriter.CellKind.Text, 20),
+                new XlsxWriter.Column("Vendor", "vendorName", XlsxWriter.CellKind.Text, 28),
+                new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Expense Account", "expenseAccount", XlsxWriter.CellKind.Text, 26),
+                new XlsxWriter.Column("Paid From", "paidFromAccount", XlsxWriter.CellKind.Text, 22),
+                new XlsxWriter.Column("Paid Via", "paymentMethod"),
+                new XlsxWriter.Column("Amount", "amount", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Status", "statusName"),
+                new XlsxWriter.Column("Entry No", "entryNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Recorded By", "createdBy", XlsxWriter.CellKind.Text, 22),
+                new XlsxWriter.Column("Description", "description", XlsxWriter.CellKind.Text, 40),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Expenses",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"expenses-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the expenses");
+        }
+    }
+
+    [HttpGet("journal-entries/export")]
+    public async Task<IActionResult> ExportJournalEntries(
+        [FromQuery] string? q, [FromQuery] string? status,
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to)
+    {
+        try
+        {
+            var action = await GetJournalEntries(q, status, from, to, 1, 5000);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Entry No", "entryNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Date", "entryDate", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Type", "entryTypeName", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Reference", "reference", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Narration", "narration", XlsxWriter.CellKind.Text, 42),
+                new XlsxWriter.Column("Debit", "totalDebit", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Credit", "totalCredit", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Status", "statusName"),
+                new XlsxWriter.Column("Reversed By", "reversedBy", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Created By", "createdBy", XlsxWriter.CellKind.Text, 22),
+                new XlsxWriter.Column("Posted By", "postedBy", XlsxWriter.CellKind.Text, 22),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Journal Entries",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"journal-entries-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the journal entries");
+        }
+    }
+
+    [HttpGet("vouchers/export")]
+    public async Task<IActionResult> ExportVouchers(
+        [FromQuery] string? q, [FromQuery] string? status, [FromQuery] string? type,
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to)
+    {
+        try
+        {
+            var action = await GetVouchers(q, status, type, from, to, 1, 5000);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var columns = new[]
+            {
+                new XlsxWriter.Column("Voucher No", "voucherNo", XlsxWriter.CellKind.Text, 16),
+                new XlsxWriter.Column("Date", "date", XlsxWriter.CellKind.Date),
+                new XlsxWriter.Column("Type", "typeName", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Party", "partyName", XlsxWriter.CellKind.Text, 28),
+                new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Cash/Bank", "cashBankAccount", XlsxWriter.CellKind.Text, 24),
+                new XlsxWriter.Column("Method", "paymentMethod"),
+                new XlsxWriter.Column("Reference", "reference", XlsxWriter.CellKind.Text, 18),
+                new XlsxWriter.Column("Amount", "amount", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Status", "statusName"),
+                new XlsxWriter.Column("Narration", "narration", XlsxWriter.CellKind.Text, 40),
+                new XlsxWriter.Column("Created By", "createdBy", XlsxWriter.CellKind.Text, 22),
+            };
+
+            var bytes = XlsxWriter.FromPayload("Vouchers",
+                JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
+            return File(bytes, XlsxWriter.ContentType, $"vouchers-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "export the vouchers");
+        }
+    }
+
+    private static readonly JsonSerializerOptions ExportJson = new()
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles
+    };
 
     // ══════════════════════ request bodies (part 2) ═════════════════════
 
@@ -2059,5 +2431,970 @@ public class AccountingController : ApiControllerBase
             c?.Phone ?? "", c?.Email ?? "", c?.Ntn ?? "", c?.Strn ?? "",
             c?.CurrencySymbol ?? "PKR");
     }
+
+
+    // ══════════════════════════════════════════════════════════════════
+    //  EDIT, DELETE AND THE STATUS MOVES
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  Until now the three accounting documents could only be CREATED and, for
+        two of them, posted. There was no way to correct a typo, throw away a
+        draft, reverse an entry that had gone in wrong, or reject an expense --
+        which meant the only remedy for any mistake was another entry on top of
+        it, made by hand, in the database.
+
+        THE RULE THAT GOVERNS ALL OF IT: a DRAFT is scratch, a POSTED document is
+        history. Drafts can be edited and deleted freely. Nothing posted is ever
+        edited or deleted -- it is reversed or cancelled, and the reversal is
+        itself a record. That is not politeness, it is what makes a ledger worth
+        reading a year later.                                                   */
+
+    /// <summary>The draft check every edit and delete below shares.</summary>
+    private static string? WhyLocked(string statusKey, string docNo) => statusKey switch
+    {
+        "DRAFT" => null,
+        "POSTED" => $"{docNo} is posted. Reverse it instead -- a posted document is history and is never edited.",
+        "REVERSED" => $"{docNo} has already been reversed.",
+        "CANCELLED" => $"{docNo} is cancelled.",
+        "REJECTED" => $"{docNo} was rejected. Raise a fresh one rather than reopening this.",
+        "RECONCILED" => $"{docNo} is reconciled against a bank statement and cannot be changed.",
+        _ => $"{docNo} is {statusKey.ToLowerInvariant()} and cannot be changed."
+    };
+
+    /* ─────────────────────────── expenses ─────────────────────────── */
+
+    /// <summary>Corrects a draft expense. Everything on the form can change.</summary>
+    [HttpPut("expenses/{id:int}")]
+    public async Task<IActionResult> UpdateExpense(int id, [FromBody] ExpenseRequest body)
+    {
+        try
+        {
+            var e = await _db.Expenses.Include(x => x.Status).FirstOrDefaultAsync(x => x.ExpenseId == id);
+            if (e is null) return NotFound(new { message = $"No expense with id {id}." });
+
+            var locked = WhyLocked(e.Status.StatusKey, e.ExpenseNo);
+            if (locked is not null) return BadRequest(new { message = locked });
+
+            var invalid = await ValidateExpense(body);
+            if (invalid is not null) return BadRequest(new { message = invalid });
+
+            e.ExpenseDate = body.ExpenseDate ?? e.ExpenseDate;
+            e.LocationId = body.LocationId;
+            e.CategoryName = string.IsNullOrWhiteSpace(body.CategoryName) ? e.CategoryName : body.CategoryName.Trim();
+            e.ExpenseAccountId = body.ExpenseAccountId;
+            e.PaidFromAccountId = body.PaidFromAccountId;
+            e.Amount = body.Amount;
+            e.VendorName = body.VendorName.Trim();
+            e.MethodId = body.MethodId;
+            e.Description = body.Description?.Trim();
+
+            await _db.SaveChangesAsync();
+            await Log("EXPENSE_UPDATED", "Expense", e.ExpenseNo, $"{e.Amount:N2} to {e.VendorName}", 2);
+
+            /* The stored PDF is now out of date, so rebuild it rather than leave
+               a document in the store that disagrees with the row. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
+
+            return Ok(new { id, expenseNo = e.ExpenseNo, message = $"{e.ExpenseNo} updated." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"update expense {id}");
+        }
+    }
+
+    /// <summary>Throws away a draft expense.</summary>
+    [HttpDelete("expenses/{id:int}")]
+    public async Task<IActionResult> DeleteExpense(int id)
+    {
+        try
+        {
+            var e = await _db.Expenses.Include(x => x.Status).FirstOrDefaultAsync(x => x.ExpenseId == id);
+            if (e is null) return NotFound(new { message = $"No expense with id {id}." });
+
+            var locked = WhyLocked(e.Status.StatusKey, e.ExpenseNo);
+            if (locked is not null) return BadRequest(new { message = locked });
+
+            var no = e.ExpenseNo;
+            _db.Expenses.Remove(e);
+            await _db.SaveChangesAsync();
+            await Log("EXPENSE_DELETED", "Expense", no, $"{e.Amount:N2} to {e.VendorName}", 3);
+
+            return Ok(new { id, message = $"{no} deleted." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"delete expense {id}");
+        }
+    }
+
+    /// <summary>
+    /// Approves or rejects a draft expense. Approving posts it; rejecting needs
+    /// a reason, because "why was my expense refused" is a question somebody
+    /// always asks.
+    /// </summary>
+    [HttpPatch("expenses/{id:int}/status")]
+    [Authorize(Policy = "Accountant")]
+    public async Task<IActionResult> SetExpenseStatus(int id, [FromBody] DecisionRequest body)
+    {
+        try
+        {
+            var key = (body.StatusKey ?? "").Trim().ToUpperInvariant();
+            if (key is not ("POSTED" or "REJECTED"))
+                return BadRequest(new { message = $"'{body.StatusKey}' is not an expense decision. Use POSTED or REJECTED." });
+            if (key == "REJECTED" && string.IsNullOrWhiteSpace(body.Reason))
+                return BadRequest(new { message = "Rejecting an expense needs a reason." });
+
+            var e = await _db.Expenses.Include(x => x.Status).FirstOrDefaultAsync(x => x.ExpenseId == id);
+            if (e is null) return NotFound(new { message = $"No expense with id {id}." });
+            if (e.Status.StatusKey != "DRAFT")
+                return BadRequest(new { message = $"{e.ExpenseNo} is already {e.Status.StatusName.ToLowerInvariant()}." });
+
+            var target = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == key);
+            if (target is null) return BadRequest(new { message = $"No {key} status is configured." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            /* Approving is the moment the money is recognised, so it is also
+               the moment the ledger has to hear about it. Before this the
+               status flipped on its own and EntryId stayed null: an approved
+               expense that no trial balance, P&L or cash flow could see. */
+            if (key == "POSTED" && e.EntryId is null)
+            {
+                var why = await PostExpenseToLedger(e);
+                if (why is not null) return BadRequest(new { message = why });
+            }
+
+            e.StatusId = target.StatusId;
+            if (!string.IsNullOrWhiteSpace(body.Reason))
+                e.Description = string.IsNullOrWhiteSpace(e.Description)
+                    ? body.Reason.Trim()
+                    : $"{e.Description}\n[{key}] {body.Reason.Trim()}";
+
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+            await Log($"EXPENSE_{key}", "Expense", e.ExpenseNo,
+                body.Reason?.Trim() ?? $"{e.Amount:N2}", key == "REJECTED" ? 3 : 2);
+
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
+
+            return Ok(new
+            {
+                id,
+                status = target.StatusKey,
+                statusName = target.StatusName,
+                message = key == "POSTED" ? $"{e.ExpenseNo} approved." : $"{e.ExpenseNo} rejected."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"change the status of expense {id}");
+        }
+    }
+
+    /// <summary>
+    /// The double entry an approved expense makes: the expense account is
+    /// debited and the cash or bank account it came out of is credited.
+    /// Sets Expense.EntryId. Returns the refusal message, or null on success.
+    /// </summary>
+    private async Task<string?> PostExpenseToLedger(Expense e)
+    {
+        var period = await _db.FiscalPeriods
+            .FirstOrDefaultAsync(p => p.StartDate <= e.ExpenseDate && p.EndDate >= e.ExpenseDate);
+        if (period is null) return $"No fiscal period covers {e.ExpenseDate:yyyy-MM-dd}, so {e.ExpenseNo} cannot be posted.";
+        if (period.IsClosed) return $"{period.PeriodName} is closed. {e.ExpenseNo} cannot be posted into it.";
+
+        var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
+        if (posted is null) return "No POSTED status is configured.";
+
+        var type = await _db.JournalEntryTypes.FirstOrDefaultAsync(t => t.TypeKey == "EXPENSE")
+                   ?? await _db.JournalEntryTypes.FirstAsync();
+
+        var entry = new JournalEntry
+        {
+            EntryNo = await NextNumber("JV"),
+            EntryDate = e.ExpenseDate,
+            EntryTypeId = type.EntryTypeId,
+            PeriodId = period.PeriodId,
+            LocationId = e.LocationId,
+            ReferenceNo = e.ExpenseNo,
+            Narration = $"{e.CategoryName} -- {e.VendorName}",
+            StatusId = posted.StatusId,
+            CreatedByUserId = CurrentUserId(),
+            PostedByUserId = CurrentUserId(),
+            CreatedAt = Today()
+        };
+        _db.JournalEntries.Add(entry);
+        await _db.SaveChangesAsync();
+
+        _db.JournalEntryLines.AddRange(
+            new JournalEntryLine
+            {
+                EntryId = entry.EntryId, LineNo = 1, AccountId = e.ExpenseAccountId,
+                Description = string.IsNullOrWhiteSpace(e.Description) ? e.VendorName : e.Description,
+                DebitAmount = e.Amount, CreditAmount = 0m
+            },
+            new JournalEntryLine
+            {
+                EntryId = entry.EntryId, LineNo = 2, AccountId = e.PaidFromAccountId,
+                Description = $"Paid to {e.VendorName}",
+                DebitAmount = 0m, CreditAmount = e.Amount
+            });
+        await _db.SaveChangesAsync();
+
+        e.EntryId = entry.EntryId;
+        return null;
+    }
+
+    /// <summary>
+    /// Undo a posted expense. The original row is never edited -- its journal
+    /// entry is reversed by a mirror entry and both are marked REVERSED, so the
+    /// history reads "this happened, and then it was undone" rather than "this
+    /// never happened".
+    /// </summary>
+    [HttpPost("expenses/{id:int}/reverse")]
+    [Authorize(Policy = "Accountant")]
+    public async Task<IActionResult> ReverseExpense(int id, [FromBody] ReverseRequest body)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(body?.Reason))
+                return BadRequest(new { message = "Reversing an expense needs a reason." });
+
+            var e = await _db.Expenses.Include(x => x.Status).FirstOrDefaultAsync(x => x.ExpenseId == id);
+            if (e is null) return NotFound(new { message = $"No expense with id {id}." });
+            if (e.Status.StatusKey != Posted)
+                return BadRequest(new { message = $"Only a posted expense can be reversed. {e.ExpenseNo} is {e.Status.StatusName.ToLowerInvariant()}." });
+
+            var reversed = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "REVERSED");
+            if (reversed is null) return BadRequest(new { message = "No REVERSED status is configured." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            string? mirrorNo = null;
+            if (e.EntryId is not null)
+            {
+                var original = await _db.JournalEntries
+                    .Include(x => x.JournalEntryLines)
+                    .FirstAsync(x => x.EntryId == e.EntryId);
+
+                var date = body.ReverseDate ?? Today();
+                var period = await _db.FiscalPeriods
+                    .FirstOrDefaultAsync(p => p.StartDate <= date && p.EndDate >= date);
+                if (period is null) return BadRequest(new { message = $"No fiscal period covers {date:yyyy-MM-dd}." });
+                if (period.IsClosed) return BadRequest(new { message = $"{period.PeriodName} is closed. Pick another reversal date." });
+
+                var mirror = new JournalEntry
+                {
+                    EntryNo = await NextNumber("JV"),
+                    EntryDate = date,
+                    EntryTypeId = original.EntryTypeId,
+                    PeriodId = period.PeriodId,
+                    LocationId = original.LocationId,
+                    ReferenceNo = original.EntryNo,
+                    Narration = $"Reversal of {original.EntryNo} ({e.ExpenseNo}) -- {body.Reason!.Trim()}",
+                    StatusId = original.StatusId,
+                    CreatedByUserId = CurrentUserId(),
+                    PostedByUserId = CurrentUserId(),
+                    CreatedAt = Today()
+                };
+                _db.JournalEntries.Add(mirror);
+                await _db.SaveChangesAsync();
+
+                short n = 1;
+                foreach (var l in original.JournalEntryLines.OrderBy(l => l.LineNo))
+                    _db.JournalEntryLines.Add(new JournalEntryLine
+                    {
+                        EntryId = mirror.EntryId, LineNo = n++, AccountId = l.AccountId,
+                        PartyUserId = l.PartyUserId, Description = l.Description,
+                        DebitAmount = l.CreditAmount,      // the swap IS the reversal
+                        CreditAmount = l.DebitAmount
+                    });
+
+                /* Same rule as ReverseJournalEntry: the original entry keeps
+                   POSTED so the two cancel in every statement. The EXPENSE is
+                   what becomes REVERSED -- that is a document status, and no
+                   statement reads it. */
+                original.ReversedByEntryId = mirror.EntryId;
+                mirrorNo = mirror.EntryNo;
+            }
+
+            e.StatusId = reversed.StatusId;
+            e.Description = string.IsNullOrWhiteSpace(e.Description)
+                ? $"[REVERSED] {body.Reason!.Trim()}"
+                : $"{e.Description}\n[REVERSED] {body.Reason!.Trim()}";
+
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+            await Log("EXPENSE_REVERSED", "Expense", e.ExpenseNo, body.Reason!.Trim(), 3);
+
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
+
+            return Ok(new
+            {
+                id,
+                status = "REVERSED",
+                reversalEntryNo = mirrorNo,
+                message = mirrorNo is null
+                    ? $"{e.ExpenseNo} reversed."
+                    : $"{e.ExpenseNo} reversed by {mirrorNo}."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"reverse expense {id}");
+        }
+    }
+
+    /// <summary>The checks CreateExpense and UpdateExpense both need.</summary>
+    private async Task<string?> ValidateExpense(ExpenseRequest body)
+    {
+        if (body.Amount <= 0) return "An expense needs an amount above zero.";
+        if (string.IsNullOrWhiteSpace(body.VendorName)) return "Who was paid?";
+        if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+            return "Pick a valid location.";
+        if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
+            return "Pick a valid payment method.";
+        /* Not merely "a real account" -- the RIGHT KIND of account. Nothing
+           stopped an expense being booked against Owner Capital before this,
+           and the resulting entry balanced perfectly while saying something
+           untrue. The screen only offers the correct accounts; this is what
+           makes that a rule rather than a suggestion. */
+        var expenseAccount = await _db.Accounts.AsNoTracking()
+            .Where(a => a.AccountId == body.ExpenseAccountId && !a.IsGroup)
+            .Select(a => new { a.AccountName, group = a.AccountType.Group.GroupName })
+            .FirstOrDefaultAsync();
+        if (expenseAccount is null)
+            return "Pick a valid expense account. A group heading cannot take a posting.";
+        if (expenseAccount.group != "Expenses")
+            return $"{expenseAccount.AccountName} is a {expenseAccount.group.ToLowerInvariant()} account, not an expense account.";
+
+        var paidFrom = await _db.Accounts.AsNoTracking()
+            .Where(a => a.AccountId == body.PaidFromAccountId && !a.IsGroup)
+            .Select(a => new { a.AccountName, type = a.AccountType.TypeName })
+            .FirstOrDefaultAsync();
+        if (paidFrom is null)
+            return "Pick a valid cash or bank account to pay from.";
+        if (paidFrom.type != "Cash & Bank")
+            return $"{paidFrom.AccountName} is not a cash or bank account, so an expense cannot be paid from it.";
+
+        if (body.ExpenseAccountId == body.PaidFromAccountId)
+            return "The expense account and the account it is paid from cannot be the same.";
+        return null;
+    }
+
+    /* ────────────────────── journal entries ────────────────────── */
+
+    /// <summary>
+    /// Replaces a draft entry's header and lines. Double entry is re-checked --
+    /// an edit can unbalance an entry exactly as easily as creating one can.
+    /// </summary>
+    [HttpPut("journal-entries/{id:int}")]
+    public async Task<IActionResult> UpdateJournalEntry(int id, [FromBody] JournalEntryRequest body)
+    {
+        try
+        {
+            var entry = await _db.JournalEntries
+                .Include(e => e.JournalEntryLines)
+                .Include(e => e.Status)
+                .FirstOrDefaultAsync(e => e.EntryId == id);
+            if (entry is null) return NotFound(new { message = $"No journal entry with id {id}." });
+
+            var locked = WhyLocked(entry.Status.StatusKey, entry.EntryNo);
+            if (locked is not null) return BadRequest(new { message = locked });
+
+            var invalid = await ValidateJournalLines(body.Lines);
+            if (invalid is not null) return BadRequest(new { message = invalid });
+
+            var date = body.EntryDate ?? entry.EntryDate;
+            var period = await _db.FiscalPeriods.FirstOrDefaultAsync(p => p.StartDate <= date && p.EndDate >= date);
+            if (period is null) return BadRequest(new { message = $"No fiscal period covers {date:yyyy-MM-dd}." });
+            if (period.IsClosed) return BadRequest(new { message = $"{period.PeriodName} is closed. Reopen it or use another date." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            entry.EntryDate = date;
+            entry.PeriodId = period.PeriodId;
+            entry.LocationId = body.LocationId;
+            entry.ReferenceNo = body.Reference;
+            entry.Narration = body.Narration ?? "";
+
+            /* Lines are replaced wholesale rather than diffed. A journal entry is
+               a single statement -- keeping line ids stable across an edit buys
+               nothing and costs a matching algorithm nobody would trust. */
+            _db.JournalEntryLines.RemoveRange(entry.JournalEntryLines);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                _db.JournalEntryLines.Add(new JournalEntryLine
+                {
+                    EntryId = entry.EntryId,
+                    LineNo = n++,
+                    AccountId = l.AccountId,
+                    PartyUserId = l.PartyId,
+                    Description = l.Description,
+                    DebitAmount = l.Debit,
+                    CreditAmount = l.Credit
+                });
+            }
+
+            if (body.PostImmediately)
+            {
+                var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
+                if (posted is not null)
+                {
+                    entry.StatusId = posted.StatusId;
+                    entry.PostedByUserId = CurrentUserId();
+                }
+            }
+
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            var total = body.Lines.Sum(l => l.Debit);
+            await Log(body.PostImmediately ? "JOURNAL_POSTED" : "JOURNAL_UPDATED",
+                "JournalEntry", entry.EntryNo, $"{total:N2} over {body.Lines.Count} lines", 2);
+
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "journal-entry", entry.EntryId, CurrentUserId());
+
+            return Ok(new
+            {
+                id,
+                entryNo = entry.EntryNo,
+                message = $"{entry.EntryNo} {(body.PostImmediately ? "updated and posted" : "updated")}."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"update journal entry {id}");
+        }
+    }
+
+    /// <summary>Throws away a draft entry and its lines.</summary>
+    [HttpDelete("journal-entries/{id:int}")]
+    public async Task<IActionResult> DeleteJournalEntry(int id)
+    {
+        try
+        {
+            var entry = await _db.JournalEntries
+                .Include(e => e.JournalEntryLines)
+                .Include(e => e.Status)
+                .FirstOrDefaultAsync(e => e.EntryId == id);
+            if (entry is null) return NotFound(new { message = $"No journal entry with id {id}." });
+
+            var locked = WhyLocked(entry.Status.StatusKey, entry.EntryNo);
+            if (locked is not null) return BadRequest(new { message = locked });
+
+            /* An entry raised BY a sale, a voucher or an expense is that
+               document's audit trail. Deleting it would leave the document
+               pointing at nothing. */
+            if (await _db.SalesInvoices.AnyAsync(i => i.EntryId == id)
+                || await _db.Vouchers.AnyAsync(v => v.EntryId == id)
+                || await _db.Expenses.AnyAsync(e => e.EntryId == id)
+                || await _db.SalesReturns.AnyAsync(r => r.EntryId == id))
+                return BadRequest(new
+                {
+                    message = $"{entry.EntryNo} belongs to another document and cannot be deleted on its own."
+                });
+
+            var no = entry.EntryNo;
+            _db.JournalEntryLines.RemoveRange(entry.JournalEntryLines);
+            _db.JournalEntries.Remove(entry);
+            await _db.SaveChangesAsync();
+            await Log("JOURNAL_DELETED", "JournalEntry", no, "draft discarded", 3);
+
+            return Ok(new { id, message = $"{no} deleted." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"delete journal entry {id}");
+        }
+    }
+
+    /// <summary>
+    /// Reverses a posted entry by writing its mirror image and marking the
+    /// original REVERSED.
+    ///
+    /// The correction is a NEW entry, not an edit of the old one. Both stay in
+    /// the ledger, so the trail reads "this was posted, then this undid it"
+    /// rather than "this was never quite what you remember".
+    /// </summary>
+    [HttpPost("journal-entries/{id:int}/reverse")]
+    [Authorize(Policy = "Accountant")]
+    public async Task<IActionResult> ReverseJournalEntry(int id, [FromBody] ReverseRequest? body)
+    {
+        try
+        {
+            var entry = await _db.JournalEntries
+                .Include(e => e.JournalEntryLines)
+                .Include(e => e.Status)
+                .FirstOrDefaultAsync(e => e.EntryId == id);
+            if (entry is null) return NotFound(new { message = $"No journal entry with id {id}." });
+
+            if (entry.Status.StatusKey != Posted)
+                return BadRequest(new
+                {
+                    message = $"Only a posted entry can be reversed. {entry.EntryNo} is {entry.Status.StatusName.ToLowerInvariant()} -- edit or delete it instead."
+                });
+            if (entry.ReversedByEntryId is not null)
+            {
+                var already = await _db.JournalEntries.AsNoTracking()
+                    .Where(e => e.EntryId == entry.ReversedByEntryId)
+                    .Select(e => e.EntryNo).FirstOrDefaultAsync();
+                return BadRequest(new { message = $"{entry.EntryNo} was already reversed by {already}." });
+            }
+
+            var date = body?.ReverseDate ?? Today();
+            var period = await _db.FiscalPeriods.FirstOrDefaultAsync(p => p.StartDate <= date && p.EndDate >= date);
+            if (period is null) return BadRequest(new { message = $"No fiscal period covers {date:yyyy-MM-dd}." });
+            if (period.IsClosed) return BadRequest(new { message = $"{period.PeriodName} is closed. Reopen it or reverse into another date." });
+
+            var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
+            if (posted is null)
+                return BadRequest(new { message = "No POSTED status is configured." });
+
+            var why = string.IsNullOrWhiteSpace(body?.Reason) ? "" : $" {body!.Reason!.Trim()}";
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            var mirror = new JournalEntry
+            {
+                EntryNo = await NextNumber("JV"),
+                EntryDate = date,
+                EntryTypeId = entry.EntryTypeId,
+                PeriodId = period.PeriodId,
+                LocationId = entry.LocationId,
+                ReferenceNo = entry.EntryNo,
+                Narration = $"Reversal of {entry.EntryNo}.{why}",
+                StatusId = posted.StatusId,
+                CreatedByUserId = CurrentUserId(),
+                PostedByUserId = CurrentUserId(),
+                CreatedAt = Today()
+            };
+            _db.JournalEntries.Add(mirror);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in entry.JournalEntryLines.OrderBy(l => l.LineNo))
+            {
+                _db.JournalEntryLines.Add(new JournalEntryLine
+                {
+                    EntryId = mirror.EntryId,
+                    LineNo = n++,
+                    AccountId = l.AccountId,
+                    PartyUserId = l.PartyUserId,
+                    Description = $"Reversal: {l.Description}",
+                    /* The mirror: every debit becomes a credit and back. */
+                    DebitAmount = l.CreditAmount,
+                    CreditAmount = l.DebitAmount
+                });
+            }
+
+            /* The original KEEPS its POSTED status. Every statement in this
+               controller filters on POSTED, so un-posting it would drop the
+               original out of the trial balance while the mirror stayed in --
+               leaving the ledger holding the negative of the entry instead of
+               nothing at all. Both sides count and cancel; this link is what
+               tells the screen the entry was undone. */
+            entry.ReversedByEntryId = mirror.EntryId;
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("JOURNAL_REVERSED", "JournalEntry", entry.EntryNo,
+                $"reversed by {mirror.EntryNo}.{why}", 3);
+
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "journal-entry", mirror.EntryId, CurrentUserId());
+
+            return Ok(new
+            {
+                id,
+                reversalId = mirror.EntryId,
+                reversalNo = mirror.EntryNo,
+                message = $"{entry.EntryNo} reversed by {mirror.EntryNo}."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"reverse journal entry {id}");
+        }
+    }
+
+    /// <summary>The double-entry checks Create and Update both need.</summary>
+    private async Task<string?> ValidateJournalLines(List<JournalLineRequest>? lines)
+    {
+        if (lines is null || lines.Count < 2) return "A journal entry needs at least two lines.";
+
+        var totalDebit = lines.Sum(l => l.Debit);
+        var totalCredit = lines.Sum(l => l.Credit);
+        if (totalDebit != totalCredit)
+            return $"Entry is out of balance: debits {totalDebit:N2} against credits {totalCredit:N2}.";
+        if (totalDebit == 0) return "An entry of zero has nothing to post.";
+
+        foreach (var l in lines)
+        {
+            if (l.Debit < 0 || l.Credit < 0) return "Debit and credit cannot be negative.";
+            if (l.Debit > 0 && l.Credit > 0) return "A line is either a debit or a credit, never both.";
+            if (l.Debit == 0 && l.Credit == 0) return "Every line needs a debit or a credit.";
+            if (!await _db.Accounts.AnyAsync(a => a.AccountId == l.AccountId && !a.IsGroup))
+                return $"Account {l.AccountId} is missing, or is a group heading that cannot take a posting.";
+        }
+        return null;
+    }
+
+    /* ─────────────────────────── vouchers ─────────────────────────── */
+
+    /// <summary>Corrects a draft voucher, allocations included.</summary>
+    [HttpPut("vouchers/{id:int}")]
+    public async Task<IActionResult> UpdateVoucher(int id, [FromBody] VoucherRequest body)
+    {
+        try
+        {
+            var v = await _db.Vouchers
+                .Include(x => x.Status)
+                .Include(x => x.VoucherAllocations)
+                .FirstOrDefaultAsync(x => x.VoucherId == id);
+            if (v is null) return NotFound(new { message = $"No voucher with id {id}." });
+
+            var locked = WhyLocked(v.Status.StatusKey, v.VoucherNo);
+            if (locked is not null) return BadRequest(new { message = locked });
+
+            var invalid = await ValidateVoucher(body);
+            if (invalid is not null) return BadRequest(new { message = invalid });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            v.VoucherTypeId = body.VoucherTypeId;
+            v.VoucherDate = body.VoucherDate ?? v.VoucherDate;
+            v.LocationId = body.LocationId;
+            v.PartyUserId = body.PartyId;
+            v.CashBankAccountId = body.CashBankAccountId;
+            v.Amount = body.Amount;
+            v.MethodId = body.MethodId;
+            v.PaymentProvider = body.PaymentProvider;
+            v.ReferenceNo = body.Reference;
+            v.WalletTxnId = body.WalletTxnId;
+            v.Narration = body.Narration ?? "";
+
+            _db.VoucherAllocations.RemoveRange(v.VoucherAllocations);
+            await _db.SaveChangesAsync();
+
+            decimal allocated = 0;
+            foreach (var a in body.Allocations ?? new List<VoucherAllocationRequest>())
+            {
+                if (a.Amount <= 0) continue;
+                allocated += a.Amount;
+                _db.VoucherAllocations.Add(new VoucherAllocation
+                {
+                    VoucherId = v.VoucherId,
+                    SalesInvoiceId = a.SalesInvoiceId,
+                    PurchaseInvoiceId = a.PurchaseInvoiceId,
+                    Amount = a.Amount
+                });
+            }
+
+            if (allocated > body.Amount)
+                return BadRequest(new
+                {
+                    message = $"Allocations come to {allocated:N2}, more than the voucher's {body.Amount:N2}."
+                });
+
+            if (body.PostImmediately)
+            {
+                var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
+                if (posted is not null) v.StatusId = posted.StatusId;
+            }
+
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log(body.PostImmediately ? "VOUCHER_POSTED" : "VOUCHER_UPDATED",
+                "Voucher", v.VoucherNo, $"{v.Amount:N2}", 2);
+
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "voucher", v.VoucherId, CurrentUserId());
+
+            return Ok(new
+            {
+                id,
+                voucherNo = v.VoucherNo,
+                unallocated = body.Amount - allocated,
+                message = $"{v.VoucherNo} {(body.PostImmediately ? "updated and posted" : "updated")}."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"update voucher {id}");
+        }
+    }
+
+    /// <summary>Throws away a draft voucher and its allocations.</summary>
+    [HttpDelete("vouchers/{id:int}")]
+    public async Task<IActionResult> DeleteVoucher(int id)
+    {
+        try
+        {
+            var v = await _db.Vouchers
+                .Include(x => x.Status)
+                .Include(x => x.VoucherAllocations)
+                .FirstOrDefaultAsync(x => x.VoucherId == id);
+            if (v is null) return NotFound(new { message = $"No voucher with id {id}." });
+
+            var locked = WhyLocked(v.Status.StatusKey, v.VoucherNo);
+            if (locked is not null) return BadRequest(new { message = locked });
+
+            var no = v.VoucherNo;
+            _db.VoucherAllocations.RemoveRange(v.VoucherAllocations);
+            _db.Vouchers.Remove(v);
+            await _db.SaveChangesAsync();
+            await Log("VOUCHER_DELETED", "Voucher", no, $"{v.Amount:N2} draft discarded", 3);
+
+            return Ok(new { id, message = $"{no} deleted." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"delete voucher {id}");
+        }
+    }
+
+    /// <summary>
+    /// Cancels a voucher. A posted one keeps its number and its history and is
+    /// simply marked cancelled -- money that was recorded as received cannot be
+    /// made to have never been recorded.
+    /// </summary>
+    [HttpPost("vouchers/{id:int}/cancel")]
+    [Authorize(Policy = "Accountant")]
+    public async Task<IActionResult> CancelVoucher(int id, [FromBody] ReverseRequest body)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(body?.Reason))
+                return BadRequest(new { message = "Cancelling a voucher needs a reason." });
+
+            var v = await _db.Vouchers.Include(x => x.Status).FirstOrDefaultAsync(x => x.VoucherId == id);
+            if (v is null) return NotFound(new { message = $"No voucher with id {id}." });
+
+            if (v.Status.StatusKey is "CANCELLED" or "REVERSED")
+                return BadRequest(new { message = $"{v.VoucherNo} is already {v.Status.StatusName.ToLowerInvariant()}." });
+            if (v.Status.StatusKey == "RECONCILED")
+                return BadRequest(new { message = $"{v.VoucherNo} is reconciled against a bank statement and cannot be cancelled." });
+
+            var cancelled = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "CANCELLED");
+            if (cancelled is null) return BadRequest(new { message = "No CANCELLED status is configured." });
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            /* Cancelling a voucher that was never posted is just a status
+               change. Cancelling a POSTED one is not -- its entry is already in
+               the ledger and its allocation is already clearing an invoice, so
+               both have to be undone or the customer stays credited for money
+               that came back. The entry is reversed rather than deleted, for
+               the same reason as everywhere else: it happened. */
+            string? mirrorNo = null;
+            if (v.EntryId is not null)
+            {
+                var original = await _db.JournalEntries
+                    .Include(x => x.JournalEntryLines)
+                    .FirstAsync(x => x.EntryId == v.EntryId);
+
+                if (original.ReversedByEntryId is null)
+                {
+                    var date = body.ReverseDate ?? Today();
+                    var period = await _db.FiscalPeriods
+                        .FirstOrDefaultAsync(fp => fp.StartDate <= date && fp.EndDate >= date);
+                    if (period is null) return BadRequest(new { message = $"No fiscal period covers {date:yyyy-MM-dd}." });
+                    if (period.IsClosed) return BadRequest(new { message = $"{period.PeriodName} is closed. Pick another cancellation date." });
+
+                    var mirror = new JournalEntry
+                    {
+                        EntryNo = await NextNumber("JV"),
+                        EntryDate = date,
+                        EntryTypeId = original.EntryTypeId,
+                        PeriodId = period.PeriodId,
+                        LocationId = original.LocationId,
+                        ReferenceNo = original.EntryNo,
+                        Narration = $"Reversal of {original.EntryNo} ({v.VoucherNo}) -- {body.Reason.Trim()}",
+                        StatusId = original.StatusId,
+                        CreatedByUserId = CurrentUserId(),
+                        PostedByUserId = CurrentUserId(),
+                        CreatedAt = Today()
+                    };
+                    _db.JournalEntries.Add(mirror);
+                    await _db.SaveChangesAsync();
+
+                    short n = 1;
+                    foreach (var l in original.JournalEntryLines.OrderBy(l => l.LineNo))
+                        _db.JournalEntryLines.Add(new JournalEntryLine
+                        {
+                            EntryId = mirror.EntryId, LineNo = n++, AccountId = l.AccountId,
+                            PartyUserId = l.PartyUserId, Description = l.Description,
+                            DebitAmount = l.CreditAmount,      // the swap IS the reversal
+                            CreditAmount = l.DebitAmount
+                        });
+
+                    original.ReversedByEntryId = mirror.EntryId;
+                    mirrorNo = mirror.EntryNo;
+                }
+            }
+
+            /* The allocations go with it. A cancelled voucher must not keep
+               clearing invoices -- open-invoices only counts POSTED vouchers,
+               but leaving the rows behind means a later re-post would silently
+               re-apply money that was taken back. */
+            var allocations = await _db.VoucherAllocations.Where(a => a.VoucherId == v.VoucherId).ToListAsync();
+            if (allocations.Count > 0) _db.VoucherAllocations.RemoveRange(allocations);
+
+            v.StatusId = cancelled.StatusId;
+            v.Narration = string.IsNullOrWhiteSpace(v.Narration)
+                ? $"Cancelled: {body.Reason.Trim()}"
+                : $"{v.Narration}\nCancelled: {body.Reason.Trim()}";
+
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+            await Log("VOUCHER_CANCELLED", "Voucher", v.VoucherNo, body.Reason.Trim(), 3);
+
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "voucher", v.VoucherId, CurrentUserId());
+
+            return Ok(new
+            {
+                id,
+                status = "CANCELLED",
+                reversalEntryNo = mirrorNo,
+                releasedAllocations = allocations.Count,
+                message = mirrorNo is null
+                    ? $"{v.VoucherNo} cancelled."
+                    : $"{v.VoucherNo} cancelled and reversed by {mirrorNo}."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"cancel voucher {id}");
+        }
+    }
+
+    /// <summary>
+    /// The double entry a posted voucher makes.
+    ///
+    /// A RECEIPT is money arriving: the cash or bank account is debited and
+    /// Accounts Receivable is credited against the party, which is what clears
+    /// their invoice. A PAYMENT is the mirror -- Accounts Payable is debited
+    /// against the supplier and the cash or bank account is credited.
+    ///
+    /// The party goes on the control-account line as PartyUserId, exactly the
+    /// way the seeded vouchers do it, so an aged-receivables report can still
+    /// tell whose money this was.
+    ///
+    /// Sets Voucher.EntryId. Returns the refusal message, or null on success.
+    /// </summary>
+    private async Task<string?> PostVoucherToLedger(Voucher v)
+    {
+        var type = await _db.VoucherTypes.AsNoTracking()
+            .FirstOrDefaultAsync(t => t.VoucherTypeId == v.VoucherTypeId);
+        if (type is null) return "The voucher has no type, so no entry can be written for it.";
+
+        if (v.CashBankAccountId is null)
+            return $"{v.VoucherNo} has no cash or bank account, so it cannot be posted.";
+
+        /* The control account the party owes through, or is owed through. */
+        var controlCode = type.IsReceipt ? "1130" : "2101";
+        var control = await _db.Accounts.AsNoTracking()
+            .FirstOrDefaultAsync(a => a.AccountCode == controlCode && !a.IsGroup);
+        if (control is null)
+            return $"Account {controlCode} ({(type.IsReceipt ? "Accounts Receivable" : "Accounts Payable")}) is not in the chart of accounts.";
+
+        var period = await _db.FiscalPeriods
+            .FirstOrDefaultAsync(fp => fp.StartDate <= v.VoucherDate && fp.EndDate >= v.VoucherDate);
+        if (period is null) return $"No fiscal period covers {v.VoucherDate:yyyy-MM-dd}, so {v.VoucherNo} cannot be posted.";
+        if (period.IsClosed) return $"{period.PeriodName} is closed. {v.VoucherNo} cannot be posted into it.";
+
+        var posted = await _db.PostingStatuses.FirstOrDefaultAsync(x => x.StatusKey == Posted);
+        if (posted is null) return "No POSTED status is configured.";
+
+        var entryType = await _db.JournalEntryTypes
+            .FirstOrDefaultAsync(t => t.TypeKey == (type.IsReceipt ? "RECEIPT" : "PAYMENT"))
+            ?? await _db.JournalEntryTypes.FirstAsync();
+
+        var entry = new JournalEntry
+        {
+            EntryNo = await NextNumber("JV"),
+            EntryDate = v.VoucherDate,
+            EntryTypeId = entryType.EntryTypeId,
+            PeriodId = period.PeriodId,
+            LocationId = v.LocationId,
+            ReferenceNo = v.VoucherNo,
+            Narration = string.IsNullOrWhiteSpace(v.Narration) ? $"{type.TypeName} {v.VoucherNo}" : v.Narration,
+            StatusId = posted.StatusId,
+            CreatedByUserId = CurrentUserId(),
+            PostedByUserId = CurrentUserId(),
+            CreatedAt = Today()
+        };
+        _db.JournalEntries.Add(entry);
+        await _db.SaveChangesAsync();
+
+        if (type.IsReceipt)
+        {
+            _db.JournalEntryLines.AddRange(
+                new JournalEntryLine
+                {
+                    EntryId = entry.EntryId, LineNo = 1, AccountId = v.CashBankAccountId.Value,
+                    Description = $"Received against {v.VoucherNo}",
+                    DebitAmount = v.Amount, CreditAmount = 0m
+                },
+                new JournalEntryLine
+                {
+                    EntryId = entry.EntryId, LineNo = 2, AccountId = control.AccountId,
+                    PartyUserId = v.PartyUserId,
+                    Description = $"Settled by {v.VoucherNo}",
+                    DebitAmount = 0m, CreditAmount = v.Amount
+                });
+        }
+        else
+        {
+            _db.JournalEntryLines.AddRange(
+                new JournalEntryLine
+                {
+                    EntryId = entry.EntryId, LineNo = 1, AccountId = control.AccountId,
+                    PartyUserId = v.PartyUserId,
+                    Description = $"Settled by {v.VoucherNo}",
+                    DebitAmount = v.Amount, CreditAmount = 0m
+                },
+                new JournalEntryLine
+                {
+                    EntryId = entry.EntryId, LineNo = 2, AccountId = v.CashBankAccountId.Value,
+                    Description = $"Paid against {v.VoucherNo}",
+                    DebitAmount = 0m, CreditAmount = v.Amount
+                });
+        }
+        await _db.SaveChangesAsync();
+
+        v.EntryId = entry.EntryId;
+        return null;
+    }
+
+    /// <summary>The checks CreateVoucher and UpdateVoucher both need.</summary>
+    private async Task<string?> ValidateVoucher(VoucherRequest body)
+    {
+        if (body.Amount <= 0) return "A voucher needs an amount above zero.";
+        if (!await _db.VoucherTypes.AnyAsync(t => t.VoucherTypeId == body.VoucherTypeId))
+            return "Pick a valid voucher type.";
+        if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+            return "Pick a valid location.";
+        if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
+            return "Pick a valid payment method.";
+        if (body.PartyId is not null && !await _db.Parties.AnyAsync(p => p.UserId == body.PartyId))
+            return "Pick a valid party.";
+        if (body.CashBankAccountId is not null
+            && !await _db.Accounts.AnyAsync(a => a.AccountId == body.CashBankAccountId && !a.IsGroup))
+            return "Pick a valid cash or bank account.";
+        return null;
+    }
+
+    // ══════════════════════ request bodies (part 2) ═════════════════════
+
+    /// <summary>Approve / reject, with the reason a rejection has to carry.</summary>
+    public record DecisionRequest(string StatusKey, string? Reason);
+
+    /// <summary>Reverse or cancel: why, and -- for a reversal -- into which date.</summary>
+    public record ReverseRequest(string? Reason, DateOnly? ReverseDate);
 
 }

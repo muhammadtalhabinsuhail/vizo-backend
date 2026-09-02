@@ -1,10 +1,11 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>vizo_backend</RootNamespace>
+    <UserSecretsId>517192f5-22da-4887-9a26-11f89d9fb979</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>

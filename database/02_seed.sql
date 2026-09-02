@@ -356,7 +356,7 @@ INSERT INTO "DocumentSeries" (series_id, series_key, label, prefix, include_year
 
 INSERT INTO "User" (user_id, role_id, requires_email, full_name, email, phone, password_hash, primary_location_id, is_active, created_at) VALUES
     /* ---- staff: e-mail mandatory and unique ---- */
-    (1,  1, TRUE,  'Umer Memon',    'admin@advpos.pk',     '0300 7287607', '$2b$12$PLACEHOLDER.REPLACE.ON.FIRST.LOGIN.aaaaaaaaaaaaaaaaaaaaaa', 1, TRUE,  '2025-08-01'),
+    (1,  1, TRUE,  'Umer Memon',    'vizo.com.pk@gmail.com',     '0300 7287607', '$2b$12$PLACEHOLDER.REPLACE.ON.FIRST.LOGIN.aaaaaaaaaaaaaaaaaaaaaa', 1, TRUE,  '2025-08-01'),
     (2,  2, TRUE,  'Hassan Raza',   'accounts@advpos.pk',  '0321 1234567', '$2b$12$PLACEHOLDER.REPLACE.ON.FIRST.LOGIN.aaaaaaaaaaaaaaaaaaaaaa', 1, TRUE,  '2025-08-01'),
     (3,  2, TRUE,  'Nadia Hussain', 'nadia@vizo.com.pk',   '0301 8901234', '$2b$12$PLACEHOLDER.REPLACE.ON.FIRST.LOGIN.aaaaaaaaaaaaaaaaaaaaaa', 2, TRUE,  '2025-08-01'),
     (4,  3, TRUE,  'Bilal Ahmed',   'order@advpos.pk',     '0333 3456789', '$2b$12$PLACEHOLDER.REPLACE.ON.FIRST.LOGIN.aaaaaaaaaaaaaaaaaaaaaa', 2, TRUE,  '2025-08-01'),

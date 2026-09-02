@@ -142,12 +142,24 @@ Then point the API at it in `appsettings.json`:
 
 ---
 
-## 6. Configuration reference
+## 6. Configuration and secrets
+
+### Nothing secret is in `appsettings.json`
+
+It used to be, and this repository is **public**. The Neon connection string
+(with its password), the JWT signing key, both Cloudinary API secrets and the
+Gmail app password were all committed in plain text where anyone could read
+them. Those five keys are now blank in `appsettings.json` and the real values
+live outside the repo.
+
+`appsettings.json` still documents the *shape* of the configuration -- every key
+is still there, the secret ones are just empty:
 
 ```jsonc
 {
+  "ConnectionStrings": { "DefaultConnection": "" },   // secret
   "Jwt": {
-    "Key": "…64 chars…",   // CHANGE THIS. Min 32 bytes for HMAC-SHA256.
+    "Key": "",                                        // secret, min 32 bytes for HMAC-SHA256
     "Issuer": "AdvPOS.Api",
     "Audience": "AdvPOS.Web",
     "ExpiryMinutes": 480
@@ -155,35 +167,102 @@ Then point the API at it in `appsettings.json`:
   "Cors": { "AllowedOrigins": [ "http://localhost:3000", "https://www.vizo.com.pk" ] },
   "PasswordReset": { "CodeExpiryMinutes": 30, "MaxAttempts": 5 },
 
-  "CloudinaryImages": {                 // images only
+  "CloudinaryImages": {                               // images only
     "CloudName": "dzzuoem1w", "ApiKey": "266539435255924",
-    "ApiSecret": "<CLOUDINARY_IMAGES_SECRET>", "Folder": "advpos/images"
+    "ApiSecret": "", "Folder": "advpos/images"        // secret
   },
-  "CloudinaryPdfs": {                   // PDFs only
+  "CloudinaryPdfs": {                                 // PDFs only
     "CloudName": "dve3ucdo", "ApiKey": "637964151696244",
-    "ApiSecret": "<CLOUDINARY_PDFS_SECRET>", "Folder": "advpos/documents"
+    "ApiSecret": "", "Folder": "advpos/documents"     // secret
   },
 
   "EmailSettings": {
     "SmtpHost": "smtp.gmail.com", "SmtpPort": 587,
-    "SenderEmail": "…", "SenderPassword": "…",   // Gmail App Password, not the account password
-    "SenderName": "AdvPOS", "AdminAlertEmail": "…"
+    "SenderEmail": "vizo.com.pk@gmail.com",
+    "SenderPassword": "",                             // secret -- Gmail App Password
+    "SenderName": "AdvPOS", "AdminAlertEmail": "vizo.com.pk@gmail.com"
+  },
+
+  "VapidSettings": {                                  // Web Push
+    "Subject": "mailto:vizo.com.pk@gmail.com",
+    "PublicKey": "",                                  // safe to publish, but kept with its pair
+    "PrivateKey": ""                                  // secret
+  },
+
+  "Gemini": {                                         // AI features
+    "ApiKey": "",                                     // secret
+    "Model": "gemini-2.0-flash"
   }
 }
 ```
 
-**Before you deploy:** `appsettings.json` currently holds a JWT signing key, two
-Cloudinary API secrets and a Gmail app password in plain text. Anyone with repo
-access has all of them. Move them to environment variables or user-secrets and
-rotate the ones already committed:
+### Where the real values come from
+
+ASP.NET Core layers configuration sources, later ones winning. No reading code
+had to change when the values moved -- only where they are stored:
+
+| Order | Source | Used for |
+|---|---|---|
+| 1 | `appsettings.json` | non-secret settings only |
+| 2 | **User Secrets** | local development |
+| 3 | **Environment variables** | production |
+
+### Local development -- User Secrets
+
+Stored outside the repository folder entirely, so they cannot be committed by
+accident. The project already has a `UserSecretsId`; you only need to set the
+values:
 
 ```bash
-dotnet user-secrets init
-dotnet user-secrets set "Jwt:Key" "…"
-dotnet user-secrets set "EmailSettings:SenderPassword" "…"
-dotnet user-secrets set "CloudinaryImages:ApiSecret" "…"
-dotnet user-secrets set "CloudinaryPdfs:ApiSecret" "…"
+cd backend/vizo-backend
+dotnet user-secrets set "ConnectionStrings:DefaultConnection" "Host=...;Database=neondb;Username=...;Password=...;SSL Mode=Require"
+dotnet user-secrets set "Jwt:Key"                             "<64 random chars>"
+dotnet user-secrets set "CloudinaryImages:ApiSecret"          "<from the Cloudinary console>"
+dotnet user-secrets set "CloudinaryPdfs:ApiSecret"            "<from the Cloudinary console>"
+dotnet user-secrets set "EmailSettings:SenderPassword"        "<Gmail App Password>"
+dotnet user-secrets set "VapidSettings:PublicKey"             "<npx web-push generate-vapid-keys>"
+dotnet user-secrets set "VapidSettings:PrivateKey"            "<npx web-push generate-vapid-keys>"
+dotnet user-secrets set "Gemini:ApiKey"                       "<aistudio.google.com/apikey>"
+
+dotnet user-secrets list      # check what is set
 ```
+
+Generate a JWT key with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(64)[:64])"
+```
+
+### Production -- environment variables
+
+Same keys, with `:` replaced by `__`:
+
+```
+ConnectionStrings__DefaultConnection
+Jwt__Key
+CloudinaryImages__ApiSecret
+CloudinaryPdfs__ApiSecret
+EmailSettings__SenderPassword
+VapidSettings__PublicKey
+VapidSettings__PrivateKey
+Gemini__ApiKey
+```
+
+### The app refuses to start without them
+
+`Program.cs` checks the connection string and the JWT key at startup and throws
+with the key name and how to set it. An empty JWT key used to fail deep inside
+the token handler on the first login, and an empty connection string on the
+first query -- both of which read as "the app is broken" rather than "you did
+not set a secret".
+
+### ⚠️ If you are picking this repo up after 31 Aug 2026
+
+The five secrets above were exposed in git history. **They were rotated, but
+check before assuming:** the values still recoverable from old commits are dead
+only if somebody actually rotated them at the provider. Rotate at the source
+(Neon dashboard, Cloudinary console, Google account app passwords), not just in
+config -- and see `database/db_ans.pdf` and `HANDOFF.md` for what was done.
 
 ---
 
@@ -278,7 +357,7 @@ changes needed.
 
 | Role | Email | Password |
 |---|---|---|
-| Super Admin | `admin@advpos.pk` | `Admin@1234` |
+| Super Admin | `vizo.com.pk@gmail.com` | `Admin@1234` |
 | Accountant | `accounts@advpos.pk` | `Accounts@1234` |
 | Order Department | `order@advpos.pk` | `Order@1234` |
 | Sales | `sales@advpos.pk` | `Sales@1234` |

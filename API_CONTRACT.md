@@ -77,7 +77,7 @@ Mutations return `{ "message": "..." }` and creates also return `{ "id": n }`.
 
 ```jsonc
 { "items": [ { "id": 1, "fullName": "Umer Memon", "initials": "UM",
-               "email": "admin@advpos.pk", "phone": "0300 7287607",
+               "email": "vizo.com.pk@gmail.com", "phone": "0300 7287607",
                "employeeCode": "EMP-001", "roleId": 1, "roles": ["Super Admin"],
                "locations": ["LOC-01","LOC-02","LOC-03"],
                "isActive": true, "isLocked": false,

@@ -135,6 +135,60 @@ using vizo_backend.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
+/*  SECRETS -- NOTHING SECRET LIVES IN appsettings.json ANY MORE.
+
+    It used to. The Neon connection string with its password, the JWT signing
+    key, both Cloudinary API secrets and the Gmail app password were all in a
+    file committed to a PUBLIC GitHub repository. Anyone could read them,
+    connect straight to the production database, or forge a valid login token.
+
+    Those keys are blank in appsettings.json now. The real values come from,
+    in order of precedence:
+
+      1. Environment variables -- production. Double-underscore form, e.g.
+         ConnectionStrings__DefaultConnection   Jwt__Key
+      2. User Secrets -- local development. Stored outside the repo folder
+         entirely, so it cannot be committed by accident:
+             dotnet user-secrets set "Jwt:Key" "..."
+      3. appsettings.json -- non-secret settings only
+
+    ASP.NET Core already layers these in that order, so no reading code had to
+    change; only the values moved.
+
+    The check below exists because a MISSING secret used to fail late and
+    quietly: an empty JWT key throws deep inside the token handler on the first
+    login, and an empty connection string fails on the first query. Both read as
+    "the app is broken" rather than "you did not set a secret".                */
+
+var requiredSecrets = new (string Key, string What)[]
+{
+    ("ConnectionStrings:DefaultConnection", "the Neon Postgres connection string"),
+    ("Jwt:Key",                             "the JWT signing key"),
+};
+
+var missingSecrets = requiredSecrets
+    .Where(x => string.IsNullOrWhiteSpace(builder.Configuration[x.Key]))
+    .ToList();
+
+if (missingSecrets.Count > 0)
+{
+    throw new InvalidOperationException(
+        "Missing configuration:"
+        + Environment.NewLine
+        + string.Join(Environment.NewLine, missingSecrets.Select(m => $"  {m.Key}   ({m.What})"))
+        + Environment.NewLine + Environment.NewLine
+        + "Local development:" + Environment.NewLine
+        + "  cd vizo-backend" + Environment.NewLine
+        + "  dotnet user-secrets set \"Jwt:Key\" \"<value>\"" + Environment.NewLine + Environment.NewLine
+        + "Production: set them as environment variables, with ':' replaced by '__',"
+        + Environment.NewLine
+        + "  e.g. ConnectionStrings__DefaultConnection" + Environment.NewLine + Environment.NewLine
+        + "See SETUP.md. Do NOT put them back in appsettings.json -- that file is"
+        + Environment.NewLine
+        + "committed to a public repository.");
+}
+
+
 /* ─────────────────────────── Database ─────────────────────────── */
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));

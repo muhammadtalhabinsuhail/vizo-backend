@@ -41,9 +41,9 @@ CREATE TABLE "PasswordResetCode" (
    re-running this file with hashes of your own.
    --------------------------------------------------------------------------- */
 
--- admin@advpos.pk       Admin@1234
+-- vizo.com.pk@gmail.com       Admin@1234
 UPDATE "User" SET password_hash = '$2a$11$AWgWJx0rFP3N7gDbmgnYEegJaXUyfsNdVxcAo.gpt8DnH.Es73JMG'
-WHERE email = 'admin@advpos.pk';
+WHERE email = 'vizo.com.pk@gmail.com';
 
 -- accounts@advpos.pk    Accounts@1234
 UPDATE "User" SET password_hash = '$2a$11$.1zBr29CWX0SU3fsCJf4du2XCG54CSf/Uc53Vv7fLNhFti6.jBDmq'

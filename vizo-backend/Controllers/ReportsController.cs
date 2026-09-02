@@ -560,6 +560,476 @@ public class ReportsController : ApiControllerBase
     };
 
     /// <summary>The report as a PDF, built on request. Print and Preview use this.</summary>
+    // ══════════════════════════════════════════════════════════════════
+    //  ROLE DASHBOARDS
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  Three of the four dashboards used to be built entirely from mock files
+        in the frontend -- accountant, order-dept and sales. They are the first
+        screen each of those roles sees after signing in, and every number on
+        them belonged to nobody.
+
+        One endpoint each. They deliberately return SMALL, FLAT payloads: the
+        dashboard shows counts and totals, and a screen that has to pull three
+        thousand rows to display the number 12 is the slowest screen in the
+        app.                                                                  */
+
+    /// <summary>
+    /// The accountant's morning: what is waiting on them, what is owed, and
+    /// what is in the drawer.
+    /// </summary>
+    [HttpGet("dashboard/accountant")]
+    public async Task<IActionResult> AccountantDashboard()
+    {
+        try
+        {
+            var today = Today();
+            var monthStart = new DateOnly(today.Year, today.Month, 1);
+
+            /* Cash and bank, from the ledger rather than from a guess. Opening
+               balance plus posted movement, exactly the way the trial balance
+               computes it -- otherwise the dashboard and the statements would
+               disagree about how much money there is. */
+            var cashAccounts = await _db.Accounts.AsNoTracking()
+                .Where(a => !a.IsGroup && a.AccountType.TypeName == "Cash & Bank")
+                .Select(a => new
+                {
+                    id = a.AccountId,
+                    name = a.AccountName,
+                    code = a.AccountCode,
+                    opening = a.OpeningBalance,
+                    debit = a.JournalEntryLines
+                        .Where(l => l.Entry.Status.StatusKey == "POSTED")
+                        .Sum(l => (decimal?)l.DebitAmount) ?? 0m,
+                    credit = a.JournalEntryLines
+                        .Where(l => l.Entry.Status.StatusKey == "POSTED")
+                        .Sum(l => (decimal?)l.CreditAmount) ?? 0m
+                })
+                .ToListAsync();
+
+            var cashBreakdown = cashAccounts
+                .Select(a => new { a.id, a.name, a.code, balance = a.opening + a.debit - a.credit })
+                .OrderByDescending(a => a.balance)
+                .ToList();
+
+            /* Collections waiting on this accountant to confirm. */
+            var awaiting = await _db.Collections.AsNoTracking()
+                .Where(c => c.Status.StatusKey == "AWAITING")
+                .Select(c => new
+                {
+                    id = c.CollectionId,
+                    receiptNo = c.ReceiptNo,
+                    customerName = c.CustomerUser.LegalName,
+                    collectedBy = c.CollectedByUser.User.FullName,
+                    collectedOn = c.CollectedOn,
+                    amount = c.Amount,
+                    method = c.Method.MethodName,
+                    reference = c.ReferenceNo
+                })
+                .OrderBy(c => c.collectedOn)
+                .Take(8)
+                .ToListAsync();
+
+            var awaitingCount = await _db.Collections.CountAsync(c => c.Status.StatusKey == "AWAITING");
+            var awaitingTotal = await _db.Collections
+                .Where(c => c.Status.StatusKey == "AWAITING")
+                .SumAsync(c => (decimal?)c.Amount) ?? 0m;
+
+            var confirmedToday = await _db.Collections
+                .Where(c => c.Status.StatusKey == "CONFIRMED" && c.ConfirmedOn == today)
+                .Select(c => c.Amount)
+                .ToListAsync();
+
+            /* Money in and out this month, posted vouchers only. */
+            var receiptsMonth = await _db.Vouchers
+                .Where(v => v.Status.StatusKey == "POSTED" && v.VoucherType.IsReceipt && v.VoucherDate >= monthStart)
+                .SumAsync(v => (decimal?)v.Amount) ?? 0m;
+            var paymentsMonth = await _db.Vouchers
+                .Where(v => v.Status.StatusKey == "POSTED" && !v.VoucherType.IsReceipt && v.VoucherDate >= monthStart)
+                .SumAsync(v => (decimal?)v.Amount) ?? 0m;
+            var receiptsToday = await _db.Vouchers
+                .Where(v => v.Status.StatusKey == "POSTED" && v.VoucherType.IsReceipt && v.VoucherDate == today)
+                .SumAsync(v => (decimal?)v.Amount) ?? 0m;
+            var paymentsToday = await _db.Vouchers
+                .Where(v => v.Status.StatusKey == "POSTED" && !v.VoucherType.IsReceipt && v.VoucherDate == today)
+                .SumAsync(v => (decimal?)v.Amount) ?? 0m;
+
+            /* Last month as well. On the 1st of a month "this month" is
+               legitimately zero, and a card that only ever shows zero on the
+               day people most want to look at it is a card nobody trusts. */
+            var prevMonthStart = monthStart.AddMonths(-1);
+            var receiptsPrevMonth = await _db.Vouchers
+                .Where(v => v.Status.StatusKey == "POSTED" && v.VoucherType.IsReceipt
+                         && v.VoucherDate >= prevMonthStart && v.VoucherDate < monthStart)
+                .SumAsync(v => (decimal?)v.Amount) ?? 0m;
+            var paymentsPrevMonth = await _db.Vouchers
+                .Where(v => v.Status.StatusKey == "POSTED" && !v.VoucherType.IsReceipt
+                         && v.VoucherDate >= prevMonthStart && v.VoucherDate < monthStart)
+                .SumAsync(v => (decimal?)v.Amount) ?? 0m;
+
+            /* Payables: the supplier bill total less whatever posted vouchers
+               have been allocated to it. Neither invoice table carries a
+               "paid" column, so this is the only honest way to compute it. */
+            var payablesRaw = await _db.PurchaseInvoices.AsNoTracking()
+                .Where(i => i.Status.StatusKey != "CANCELLED")
+                .Select(i => new
+                {
+                    id = i.PiId,
+                    invoiceNo = i.InvoiceNo,
+                    supplier = i.SupplierUser.LegalName,
+                    dueDate = i.DueDate,
+                    total = i.TotalAmount,
+                    paid = i.VoucherAllocations
+                        .Where(a => a.Voucher.Status.StatusKey == "POSTED")
+                        .Sum(a => (decimal?)a.Amount) ?? 0m
+                })
+                .ToListAsync();
+
+            var payables = payablesRaw
+                .Select(i => new { i.id, i.invoiceNo, i.supplier, i.dueDate, i.total, balance = i.total - i.paid })
+                .Where(i => i.balance > 0.004m)
+                .OrderBy(i => i.dueDate)
+                .ToList();
+
+            var dueSoon = payables.Where(i => i.dueDate <= today.AddDays(3)).ToList();
+
+            /* Receivables, in the aging buckets the recovery report uses. */
+            var receivablesRaw = await _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.Status.StatusKey != "CANCELLED")
+                .Select(i => new
+                {
+                    dueDate = i.DueDate,
+                    total = i.TotalAmount,
+                    paid = i.VoucherAllocations
+                        .Where(a => a.Voucher.Status.StatusKey == "POSTED")
+                        .Sum(a => (decimal?)a.Amount) ?? 0m
+                })
+                .ToListAsync();
+
+            var openReceivables = receivablesRaw
+                .Select(i => new { i.dueDate, balance = i.total - i.paid })
+                .Where(i => i.balance > 0.004m)
+                .ToList();
+
+            decimal Bucket(int fromDays, int? toDays) => openReceivables
+                .Where(r =>
+                {
+                    var age = today.DayNumber - r.dueDate.DayNumber;
+                    return age >= fromDays && (toDays is null || age <= toDays);
+                })
+                .Sum(r => r.balance);
+
+            var draftExpenses = await _db.Expenses.CountAsync(e => e.Status.StatusKey == "DRAFT");
+            var draftExpenseValue = await _db.Expenses
+                .Where(e => e.Status.StatusKey == "DRAFT")
+                .SumAsync(e => (decimal?)e.Amount) ?? 0m;
+
+            return Ok(new
+            {
+                asOf = today,
+                cash = new
+                {
+                    total = cashBreakdown.Sum(a => a.balance),
+                    breakdown = cashBreakdown
+                },
+                collections = new
+                {
+                    awaitingCount,
+                    awaitingTotal,
+                    confirmedTodayCount = confirmedToday.Count,
+                    confirmedTodayTotal = confirmedToday.Sum(),
+                    queue = awaiting
+                },
+                money = new { receiptsToday, paymentsToday, receiptsMonth, paymentsMonth, receiptsPrevMonth, paymentsPrevMonth },
+                payables = new
+                {
+                    openCount = payables.Count,
+                    openTotal = payables.Sum(p => p.balance),
+                    dueSoonCount = dueSoon.Count,
+                    dueSoonTotal = dueSoon.Sum(p => p.balance),
+                    dueSoon = dueSoon.Take(6)
+                },
+                receivables = new
+                {
+                    total = openReceivables.Sum(r => r.balance),
+                    current = Bucket(int.MinValue, 0),
+                    days1To30 = Bucket(1, 30),
+                    days31To60 = Bucket(31, 60),
+                    days60Plus = Bucket(61, null)
+                },
+                expenses = new { draftCount = draftExpenses, draftValue = draftExpenseValue }
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the accountant dashboard");
+        }
+    }
+
+    /// <summary>
+    /// The order department's board: what is queued, what is short, what is
+    /// stuck with a supplier.
+    /// </summary>
+    [HttpGet("dashboard/order-dept")]
+    public async Task<IActionResult> OrderDeptDashboard()
+    {
+        try
+        {
+            var today = Today();
+
+            var byStatus = await _db.SalesOrders.AsNoTracking()
+                .GroupBy(o => o.Status.StatusKey)
+                .Select(g => new { status = g.Key, count = g.Count(), value = g.Sum(o => o.TotalAmount) })
+                .ToListAsync();
+
+            int CountOf(string key) => byStatus.FirstOrDefault(s => s.status == key)?.count ?? 0;
+            decimal ValueOf(string key) => byStatus.FirstOrDefault(s => s.status == key)?.value ?? 0m;
+
+            /* The oldest waiting orders, because those are the ones somebody
+               is already on the phone about. */
+            var queue = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.Status.StatusKey == "SUBMITTED" || o.Status.StatusKey == "CONFIRMED"
+                         || o.Status.StatusKey == "PROCESSING")
+                .OrderBy(o => o.OrderDate).ThenBy(o => o.OrderId)
+                .Take(8)
+                .Select(o => new
+                {
+                    id = o.OrderId,
+                    orderNo = o.OrderNo,
+                    customer = o.CustomerUser.LegalName,
+                    orderDate = o.OrderDate,
+                    deliveryDate = o.DeliveryDate,
+                    total = o.TotalAmount,
+                    status = o.Status.StatusKey,
+                    statusName = o.Status.StatusName,
+                    itemCount = o.SalesOrderItems.Count
+                })
+                .ToListAsync();
+
+            /* Low stock: total on hand across every location against the
+               product's own minimum. Summing first and comparing after is
+               deliberate -- a product with 2 in the shop and 200 in the
+               warehouse is not short. */
+            var stockLevels = await _db.Products.AsNoTracking()
+                .Where(p => p.IsActive && p.MinQty > 0)
+                .Select(p => new
+                {
+                    id = p.ProductId,
+                    sku = p.Sku,
+                    name = p.ProductName,
+                    minQty = p.MinQty,
+                    onHand = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
+                })
+                .ToListAsync();
+
+            var lowStock = stockLevels
+                .Where(p => p.onHand < p.minQty)
+                .OrderBy(p => p.onHand)
+                .ToList();
+
+            var openClaims = await _db.Claims.AsNoTracking()
+                .Where(c => c.Stage.IsOpen)
+                .Select(c => new
+                {
+                    id = c.ClaimId,
+                    claimNo = c.ClaimNo,
+                    customer = c.CustomerUser.LegalName,
+                    product = c.Product.ProductName,
+                    quantity = c.Quantity,
+                    value = c.Quantity * c.UnitCost,
+                    stage = c.Stage.StageName,
+                    receivedOn = c.ReceivedOn,
+                    remindersSent = c.RemindersSent
+                })
+                .OrderBy(c => c.receivedOn)
+                .ToListAsync();
+
+            var dispatchedToday = await _db.Deliveries
+                .CountAsync(d => d.BookedDate == today);
+            var awaitingDispatch = await _db.Deliveries
+                .CountAsync(d => d.Status.StatusKey == "NOT_DISPATCHED");
+            var inTransit = await _db.Deliveries
+                .CountAsync(d => d.Status.StatusKey == "IN_TRANSIT" || d.Status.StatusKey == "OUT_FOR_DELIVERY"
+                              || d.Status.StatusKey == "AWAITING" || d.Status.StatusKey == "BOOKED");
+
+            /* Transfers still on the road, which is stock nobody can sell. */
+            var transfersInTransit = await _db.StockTransfers
+                .CountAsync(t => t.Status.StatusKey != "RECEIVED" && t.Status.StatusKey != "CANCELLED");
+
+            return Ok(new
+            {
+                asOf = today,
+                orders = new
+                {
+                    submitted = CountOf("SUBMITTED"),
+                    submittedValue = ValueOf("SUBMITTED"),
+                    confirmed = CountOf("CONFIRMED"),
+                    processing = CountOf("PROCESSING"),
+                    packed = CountOf("PACKED"),
+                    creditHold = CountOf("CREDIT_HOLD"),
+                    creditHoldValue = ValueOf("CREDIT_HOLD"),
+                    queue
+                },
+                packing = new { waiting = CountOf("CONFIRMED") + CountOf("PROCESSING"), packed = CountOf("PACKED") },
+                dispatch = new { dispatchedToday, awaitingDispatch, inTransit, transfersInTransit },
+                stock = new
+                {
+                    lowCount = lowStock.Count,
+                    items = lowStock.Take(8)
+                },
+                claims = new
+                {
+                    openCount = openClaims.Count,
+                    openValue = openClaims.Sum(c => c.value),
+                    items = openClaims.Take(6)
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the order department dashboard");
+        }
+    }
+
+    /// <summary>
+    /// One rep's own numbers. Scoped to the signed-in user throughout -- a
+    /// dashboard that showed a rep somebody else's orders would be worse than
+    /// showing nothing.
+    /// </summary>
+    [HttpGet("dashboard/sales")]
+    public async Task<IActionResult> SalesDashboard()
+    {
+        try
+        {
+            var me = CurrentUserId();
+            var today = Today();
+            var monthStart = new DateOnly(today.Year, today.Month, 1);
+            var prevStart = monthStart.AddMonths(-1);
+
+            var mine = _db.SalesOrders.AsNoTracking().Where(o => o.SalesPersonUserId == me);
+
+            var monthOrders = await mine
+                .Where(o => o.OrderDate >= monthStart && o.Status.StatusKey != "CANCELLED")
+                .Select(o => o.TotalAmount)
+                .ToListAsync();
+
+            var prevMonthTotal = await mine
+                .Where(o => o.OrderDate >= prevStart && o.OrderDate < monthStart && o.Status.StatusKey != "CANCELLED")
+                .SumAsync(o => (decimal?)o.TotalAmount) ?? 0m;
+
+            var recent = await mine
+                .OrderByDescending(o => o.OrderDate).ThenByDescending(o => o.OrderId)
+                .Take(8)
+                .Select(o => new
+                {
+                    id = o.OrderId,
+                    orderNo = o.OrderNo,
+                    customer = o.CustomerUser.LegalName,
+                    orderDate = o.OrderDate,
+                    total = o.TotalAmount,
+                    status = o.Status.StatusKey,
+                    statusName = o.Status.StatusName
+                })
+                .ToListAsync();
+
+            var onHold = await mine
+                .Where(o => o.Status.StatusKey == "CREDIT_HOLD")
+                .Select(o => new
+                {
+                    id = o.OrderId,
+                    orderNo = o.OrderNo,
+                    customer = o.CustomerUser.LegalName,
+                    total = o.TotalAmount,
+                    reason = o.CreditHoldReason
+                })
+                .ToListAsync();
+
+            /* Collections this rep took that the accountant has not confirmed
+               yet -- money they have physically handled and are answerable for. */
+            var pendingCollections = await _db.Collections.AsNoTracking()
+                .Where(c => c.CollectedByUserId == me && c.Status.StatusKey == "AWAITING")
+                .Select(c => new
+                {
+                    id = c.CollectionId,
+                    receiptNo = c.ReceiptNo,
+                    customer = c.CustomerUser.LegalName,
+                    amount = c.Amount,
+                    collectedOn = c.CollectedOn
+                })
+                .OrderBy(c => c.collectedOn)
+                .ToListAsync();
+
+            var visitsToday = await _db.CustomerVisits
+                .CountAsync(v => v.SalesPersonUserId == me
+                              && v.VisitedAt >= today.ToDateTime(TimeOnly.MinValue)
+                              && v.VisitedAt < today.AddDays(1).ToDateTime(TimeOnly.MinValue));
+
+            var visitsMonth = await _db.CustomerVisits
+                .CountAsync(v => v.SalesPersonUserId == me
+                              && v.VisitedAt >= monthStart.ToDateTime(TimeOnly.MinValue));
+
+            /* What this rep's own customers still owe.
+
+               "Mine" is deliberately BOTH: customers formally assigned to this
+               rep, and customers they have actually taken an order for. The
+               assignment alone is too narrow -- a rep who covers for a
+               colleague is answerable for that money too, and in this database
+               plenty of orders are taken by someone the customer is not
+               assigned to. Neither list alone matches what the rep thinks of
+               as their book. */
+            var assignedIds = await _db.Parties.AsNoTracking()
+                .Where(pa => pa.SalesPersonUserId == me)
+                .Select(pa => pa.UserId)
+                .ToListAsync();
+
+            var soldToIds = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.SalesPersonUserId == me)
+                .Select(o => o.CustomerUserId)
+                .Distinct()
+                .ToListAsync();
+
+            var myCustomerIds = assignedIds.Union(soldToIds).ToList();
+
+            var owedRaw = await _db.SalesInvoices.AsNoTracking()
+                .Where(i => myCustomerIds.Contains(i.CustomerUserId) && i.Status.StatusKey != "CANCELLED")
+                .Select(i => new
+                {
+                    total = i.TotalAmount,
+                    paid = i.VoucherAllocations
+                        .Where(a => a.Voucher.Status.StatusKey == "POSTED")
+                        .Sum(a => (decimal?)a.Amount) ?? 0m
+                })
+                .ToListAsync();
+
+            var outstanding = owedRaw.Sum(i => i.total - i.paid);
+
+            return Ok(new
+            {
+                asOf = today,
+                orders = new
+                {
+                    monthCount = monthOrders.Count,
+                    monthValue = monthOrders.Sum(),
+                    prevMonthValue = prevMonthTotal,
+                    recent
+                },
+                creditHolds = new { count = onHold.Count, value = onHold.Sum(o => o.total), items = onHold },
+                collections = new
+                {
+                    pendingCount = pendingCollections.Count,
+                    pendingTotal = pendingCollections.Sum(c => c.amount),
+                    items = pendingCollections.Take(6)
+                },
+                customers = new { count = myCustomerIds.Count, outstanding },
+                visits = new { today = visitsToday, month = visitsMonth }
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the sales dashboard");
+        }
+    }
+
     [HttpGet("{key}/pdf")]
     public async Task<IActionResult> RenderPdf(string key,
         [FromQuery] DateOnly? from, [FromQuery] DateOnly? to, [FromQuery] int? locationId,

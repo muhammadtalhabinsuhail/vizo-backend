@@ -191,6 +191,60 @@ public class PurchasesController : ApiControllerBase
     //  GOODS RECEIPTS
     // ══════════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// The two counts the supplier list shows above its table.
+    ///
+    /// They were hard-coded in the markup -- "Open POs = 8", "Pending GRNs =
+    /// 2" -- on a page whose every other figure is real, which is the worst
+    /// place to put a made-up number: nobody thinks to check it.
+    /// </summary>
+    [HttpGet("summary")]
+    public async Task<IActionResult> GetPurchasesSummary()
+    {
+        try
+        {
+            /* Open = ordered and not yet fully received. DRAFT and
+               PENDING_APPROVAL are not open orders, they are paperwork; and
+               RECEIVED/CLOSED/CANCELLED are done. */
+            var openPos = await _db.PurchaseOrders
+                .CountAsync(o => o.Status.StatusKey == "APPROVED"
+                              || o.Status.StatusKey == "PARTIALLY_RECEIVED");
+
+            var openPoValue = await _db.PurchaseOrders
+                .Where(o => o.Status.StatusKey == "APPROVED" || o.Status.StatusKey == "PARTIALLY_RECEIVED")
+                .SumAsync(o => (decimal?)o.TotalAmount) ?? 0m;
+
+            /* "Pending" means goods are in but the supplier's bill has not been
+               entered against them -- the gap where money is owed and nobody
+               has written it down. */
+            var pendingGrns = await _db.GoodsReceipts
+                .CountAsync(g => !_db.PurchaseInvoices.Any(i => i.PoId != null && i.PoId == g.PoId));
+
+            var payablesRaw = await _db.PurchaseInvoices.AsNoTracking()
+                .Where(i => i.Status.StatusKey != "CANCELLED")
+                .Select(i => new
+                {
+                    total = i.TotalAmount,
+                    paid = i.VoucherAllocations
+                        .Where(a => a.Voucher.Status.StatusKey == "POSTED")
+                        .Sum(a => (decimal?)a.Amount) ?? 0m
+                })
+                .ToListAsync();
+
+            return Ok(new
+            {
+                openPos,
+                openPoValue,
+                pendingGrns,
+                payableTotal = payablesRaw.Sum(i => i.total - i.paid)
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the purchases summary");
+        }
+    }
+
     [HttpGet("grns")]
     public async Task<IActionResult> GetGrns([FromQuery] string? q, [FromQuery] string? status)
     {
@@ -230,7 +284,7 @@ public class PurchasesController : ApiControllerBase
                 })
                 .ToListAsync();
 
-            return Ok(items.Select(g => new
+            var rowsOut = items.Select(g => new
             {
                 g.id, g.grnNo, g.poId, g.poNo, g.supplierId, g.supplierName,
                 supplierInitials = Initials(g.supplierName),
@@ -238,7 +292,31 @@ public class PurchasesController : ApiControllerBase
                 g.totalValue, g.status, g.statusName, g.receivedBy,
                 g.itemCount, g.unitsReceived, g.unitsDamaged,
                 unitsAccepted = g.unitsReceived - g.unitsDamaged
-            }));
+            }).ToList();
+
+            /* The four figures the screen shows above the table. They used to
+               be typed into the markup -- "GRNs This Week = 5", "Units
+               Received = 1,000", "Damaged Units = 9" -- so the page looked
+               live and lied in four places at once.
+
+               Computed over the WHOLE filter, not the page being displayed:
+               a summary that changes when you turn a page is not a summary. */
+            var weekStart = Today().AddDays(-7);
+            var poInTransit = await _db.PurchaseOrders
+                .CountAsync(o => o.Status.StatusKey == "APPROVED"
+                              || o.Status.StatusKey == "PARTIALLY_RECEIVED");
+
+            var summary = new
+            {
+                grnsThisWeek = items.Count(g => g.receiptDate >= weekStart),
+                poInTransit,
+                unitsReceived = items.Sum(g => g.unitsReceived),
+                unitsDamaged = items.Sum(g => g.unitsDamaged),
+                totalValue = items.Sum(g => g.totalValue),
+                count = items.Count
+            };
+
+            return Ok(new { summary, items = rowsOut });
         }
         catch (Exception ex)
         {

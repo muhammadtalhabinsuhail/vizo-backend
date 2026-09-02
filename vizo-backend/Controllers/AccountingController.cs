@@ -793,6 +793,18 @@ public class AccountingController : ApiControllerBase
                the summary cards on the screen show, and both are over the WHOLE
                filter, not just the page. `items` is the page. */
             var paged = items.Skip((page - 1) * pageSize).Take(pageSize).ToList();
+
+            /* The biggest category across the WHOLE filter, not the page on
+               screen. The card used to say "(this page)" because the browser
+               could only see the rows it had been handed -- honest, but it
+               answered a question nobody had asked. */
+            var topCategory = items
+                .Where(e => e.status != "REJECTED" && e.status != "CANCELLED")
+                .GroupBy(e => string.IsNullOrWhiteSpace(e.categoryName) ? "Uncategorised" : e.categoryName)
+                .Select(g => new { name = g.Key, amount = g.Sum(x => x.amount) })
+                .OrderByDescending(g => g.amount)
+                .FirstOrDefault();
+
             return Ok(new
             {
                 total = items.Sum(e => e.amount),
@@ -800,6 +812,8 @@ public class AccountingController : ApiControllerBase
                 page,
                 pageSize,
                 pageCount = (int)Math.Ceiling(items.Count / (double)pageSize),
+                topCategory,
+                draftCount = items.Count(e => e.status == "DRAFT"),
                 items = paged
             });
         }

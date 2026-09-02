@@ -30,9 +30,9 @@ CREATE INDEX IF NOT EXISTS "ix_prc_user" ON "PasswordResetCode" ("UserId");
       which is not a valid BCrypt hash -- those accounts cannot sign in at all.
       Only rows whose hash is still the placeholder are touched. */
 
--- admin@advpos.pk       Admin@1234
+-- vizo.com.pk@gmail.com       Admin@1234
 UPDATE "User" SET "PasswordHash" = '$2a$11$AWgWJx0rFP3N7gDbmgnYEegJaXUyfsNdVxcAo.gpt8DnH.Es73JMG'
-WHERE "Email" = 'admin@advpos.pk' AND "PasswordHash" LIKE '$2b$12$PLACEHOLDER%';
+WHERE "Email" = 'vizo.com.pk@gmail.com' AND "PasswordHash" LIKE '$2b$12$PLACEHOLDER%';
 
 -- accounts@advpos.pk    Accounts@1234
 UPDATE "User" SET "PasswordHash" = '$2a$11$.1zBr29CWX0SU3fsCJf4du2XCG54CSf/Uc53Vv7fLNhFti6.jBDmq'

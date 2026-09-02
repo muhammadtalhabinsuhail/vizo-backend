@@ -1087,6 +1087,531 @@ public class ReportsController : ApiControllerBase
         }
     }
 
+    /// <summary>
+    /// #3 -- customers who look like they are drifting away.
+    ///
+    /// The RISK IS ARITHMETIC: how often this customer used to order, how long
+    /// it has been since the last one, and whether their average order is
+    /// shrinking. AI only writes the one-line reason.
+    /// </summary>
+    [HttpGet("customers/at-risk")]
+    public async Task<IActionResult> CustomersAtRisk([FromQuery] int take = 15, CancellationToken ct = default)
+    {
+        try
+        {
+            if (take is < 1 or > 100) take = 15;
+            var today = Today();
+
+            var orders = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.Status.StatusKey != "CANCELLED" && o.Status.StatusKey != "DRAFT")
+                .Select(o => new
+                {
+                    o.CustomerUserId,
+                    name = o.CustomerUser.LegalName,
+                    phone = o.CustomerUser.User.Phone,
+                    rep = o.CustomerUser.SalesPersonUser != null
+                        ? o.CustomerUser.SalesPersonUser.User.FullName : null,
+                    o.OrderDate,
+                    o.TotalAmount
+                })
+                .ToListAsync(ct);
+
+            var rows = orders
+                .GroupBy(o => new { o.CustomerUserId, o.name, o.phone, o.rep })
+                .Select(g =>
+                {
+                    var dates = g.Select(x => x.OrderDate).OrderBy(d => d).ToList();
+                    var last = dates.Last();
+                    var daysSince = today.DayNumber - last.DayNumber;
+
+                    /* Average gap between orders. Needs at least three orders to
+                       mean anything -- two orders give one gap, and one gap is
+                       not a habit. */
+                    double? avgGap = null;
+                    if (dates.Count >= 3)
+                    {
+                        var gaps = dates.Zip(dates.Skip(1), (a, b) => b.DayNumber - a.DayNumber).ToList();
+                        avgGap = gaps.Average();
+                    }
+
+                    /* Is the order value trending down? Last three against the
+                       three before them. */
+                    var byDate = g.OrderBy(x => x.OrderDate).Select(x => x.TotalAmount).ToList();
+                    decimal? recentAvg = null, earlierAvg = null;
+                    if (byDate.Count >= 4)
+                    {
+                        var half = byDate.Count / 2;
+                        earlierAvg = byDate.Take(half).Average();
+                        recentAvg = byDate.Skip(half).Average();
+                    }
+
+                    return new
+                    {
+                        id = g.Key.CustomerUserId,
+                        name = g.Key.name,
+                        phone = g.Key.phone,
+                        rep = g.Key.rep,
+                        orders = dates.Count,
+                        lastOrder = last,
+                        daysSinceLastOrder = daysSince,
+                        typicalGapDays = avgGap is null ? (int?)null : (int)Math.Round(avgGap.Value),
+                        lifetimeValue = g.Sum(x => x.TotalAmount),
+                        earlierAverage = earlierAvg,
+                        recentAverage = recentAvg,
+                        /* Overdue by how many times their own normal gap. Two
+                           means they have gone twice as long as they ever
+                           usually do. */
+                        overdueRatio = avgGap is > 0 ? Math.Round(daysSince / avgGap.Value, 1) : (double?)null
+                    };
+                })
+                .Where(c => c.overdueRatio >= 1.5
+                         || (c.recentAverage is not null && c.earlierAverage > 0
+                             && c.recentAverage < c.earlierAverage * 0.6m))
+                .OrderByDescending(c => c.lifetimeValue)
+                .Take(take)
+                .ToList();
+
+            var advice = rows.Count == 0 ? null : await _ai.ExplainAsync(
+                "These customers have either stopped ordering as often as they used to, or their " +
+                "orders have got much smaller.\n\n" +
+                "Give ONE line per customer: the name, and the most likely reason based only on " +
+                "the numbers here (gone quiet, orders shrinking, or both). Put the ones worth the " +
+                "most first. Finish with one sentence saying which single customer to ring first " +
+                "and what to say.",
+                JsonSerializer.Serialize(new { asOf = today, customers = rows }, ExportJson), ct);
+
+            return Ok(new
+            {
+                asOf = today,
+                count = rows.Count,
+                valueAtRisk = rows.Sum(c => c.lifetimeValue),
+                customers = rows,
+                advice,
+                aiAvailable = _ai.IsConfigured,
+                disclaimer = "Risk worked out from order history. The commentary is AI-written -- check it."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "work out which customers are at risk");
+        }
+    }
+
+    /// <summary>
+    /// #4 -- what to reorder and how much.
+    ///
+    /// The QUANTITY IS A MOVING AVERAGE, computed here. AI is asked only to
+    /// explain the reasoning and comment on timing -- never to produce the
+    /// number, because a hallucinated reorder quantity is money spent.
+    /// </summary>
+    [HttpGet("demand-forecast")]
+    public async Task<IActionResult> DemandForecast(
+        [FromQuery] int lookbackDays = 180, [FromQuery] int coverDays = 30,
+        [FromQuery] int take = 25, CancellationToken ct = default)
+    {
+        try
+        {
+            if (lookbackDays is < 30 or > 730) lookbackDays = 180;
+            if (coverDays is < 7 or > 180) coverDays = 30;
+            if (take is < 1 or > 200) take = 25;
+
+            var today = Today();
+            var since = today.AddDays(-lookbackDays);
+
+            var sold = await _db.SalesInvoiceItems.AsNoTracking()
+                .Where(l => l.Invoice.Status.StatusKey != "CANCELLED" && l.Invoice.InvoiceDate >= since)
+                .GroupBy(l => l.ProductId)
+                .Select(g => new { productId = g.Key, qty = g.Sum(x => x.Quantity) })
+                .ToListAsync(ct);
+            var soldMap = sold.ToDictionary(x => x.productId, x => x.qty);
+
+            var products = await _db.Products.AsNoTracking()
+                .Where(p => p.IsActive)
+                .Select(p => new
+                {
+                    id = p.ProductId,
+                    sku = p.Sku,
+                    name = p.ProductName,
+                    minQty = p.MinQty,
+                    maxQty = p.MaxQty,
+                    cost = p.CostPrice,
+                    onHand = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
+                })
+                .ToListAsync(ct);
+
+            var rows = products
+                .Select(p =>
+                {
+                    var qty = soldMap.TryGetValue(p.id, out var q) ? q : 0;
+                    /* Plain moving average: units a day over the window. No
+                       seasonality, no curve fitting -- an honest simple number
+                       beats a clever one nobody can check. */
+                    var perDay = (decimal)qty / lookbackDays;
+                    var daysOfCover = perDay > 0 ? (int)Math.Floor(p.onHand / perDay) : (int?)null;
+                    var needed = (int)Math.Ceiling(perDay * coverDays) - p.onHand;
+
+                    return new
+                    {
+                        p.id, p.sku, p.name, p.onHand, p.minQty, p.cost,
+                        soldInWindow = qty,
+                        perDay = Math.Round(perDay, 2),
+                        daysOfCover,
+                        suggestedOrder = Math.Max(0, needed),
+                        estimatedCost = Math.Max(0, needed) * p.cost
+                    };
+                })
+                .Where(p => p.suggestedOrder > 0 && p.soldInWindow > 0)
+                .OrderBy(p => p.daysOfCover ?? int.MaxValue)
+                .Take(take)
+                .ToList();
+
+            var advice = rows.Count == 0 ? null : await _ai.ExplainAsync(
+                $"These are reorder quantities ALREADY CALCULATED from {lookbackDays} days of " +
+                $"sales, to cover the next {coverDays} days.\n\n" +
+                "Do NOT change any quantity. Explain in a few lines which items are most urgent " +
+                "and why, mention anything where the stock will run out within a week, and note " +
+                "the total money involved. If a season or an event might affect any of these, say " +
+                "so as a caution, not as a change to the numbers.",
+                JsonSerializer.Serialize(new { lookbackDays, coverDays, asOf = today, items = rows }, ExportJson), ct);
+
+            return Ok(new
+            {
+                asOf = today,
+                lookbackDays,
+                coverDays,
+                count = rows.Count,
+                estimatedSpend = rows.Sum(r => r.estimatedCost),
+                items = rows,
+                advice,
+                aiAvailable = _ai.IsConfigured,
+                disclaimer = "Quantities are a moving average from real sales. The commentary is AI-written."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "build the demand forecast");
+        }
+    }
+
+    /// <summary>
+    /// #7 -- margins that have gone thin, and what a discount would do.
+    /// </summary>
+    [HttpGet("margin-watch")]
+    public async Task<IActionResult> MarginWatch(
+        [FromQuery] decimal thinBelowPercent = 10m, [FromQuery] int days = 90,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            if (days is < 7 or > 730) days = 90;
+            var today = Today();
+            var since = today.AddDays(-days);
+
+            /* What was actually charged, not the list price. A product with a
+               healthy list price and a habit of being discounted to the bone is
+               exactly what this is looking for. */
+            var lines = await _db.SalesInvoiceItems.AsNoTracking()
+                .Where(l => l.Invoice.Status.StatusKey != "CANCELLED" && l.Invoice.InvoiceDate >= since)
+                .Select(l => new
+                {
+                    l.ProductId,
+                    name = l.Product.ProductName,
+                    cost = l.Product.CostPrice,
+                    listPrice = l.Product.SalePrice,
+                    l.Quantity,
+                    l.LineTotal
+                })
+                .ToListAsync(ct);
+
+            var rows = lines
+                .GroupBy(l => new { l.ProductId, l.name, l.cost, l.listPrice })
+                .Select(g =>
+                {
+                    var qty = g.Sum(x => x.Quantity);
+                    var revenue = g.Sum(x => x.LineTotal);
+                    var avgSold = qty > 0 ? revenue / qty : 0m;
+                    var cost = g.Key.cost;
+                    return new
+                    {
+                        id = g.Key.ProductId,
+                        name = g.Key.name,
+                        cost,
+                        listPrice = g.Key.listPrice,
+                        averageSoldAt = Math.Round(avgSold, 2),
+                        unitsSold = qty,
+                        revenue,
+                        marginPercent = avgSold > 0 ? Math.Round((avgSold - cost) / avgSold * 100, 1) : 0m,
+                        listMarginPercent = g.Key.listPrice > 0
+                            ? Math.Round((g.Key.listPrice - cost) / g.Key.listPrice * 100, 1) : 0m,
+                        /* The floor: sell below this and the sale loses money. */
+                        breakEvenPrice = cost
+                    };
+                })
+                .Where(r => r.marginPercent < thinBelowPercent)
+                .OrderBy(r => r.marginPercent)
+                .ToList();
+
+            var advice = rows.Count == 0 ? null : await _ai.ExplainAsync(
+                $"These products have been selling on a margin below {thinBelowPercent}% over the " +
+                $"last {days} days. `averageSoldAt` is what was really charged; `listPrice` is what " +
+                "it should have been.\n\n" +
+                "Say which are actually losing money, which are just thin, and for each of the " +
+                "worst few what the price would have to be to reach a sensible margin. Use only " +
+                "the figures given.",
+                JsonSerializer.Serialize(new { thinBelowPercent, days, items = rows }, ExportJson), ct);
+
+            return Ok(new
+            {
+                asOf = today,
+                days,
+                thinBelowPercent,
+                count = rows.Count,
+                items = rows,
+                advice,
+                aiAvailable = _ai.IsConfigured,
+                disclaimer = "Margins are computed from real invoice lines. The commentary is AI-written."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "check the margins");
+        }
+    }
+
+    /// <summary>
+    /// #9 -- the month in one page, written out.
+    /// </summary>
+    [HttpGet("month-end-summary")]
+    public async Task<IActionResult> MonthEndSummary(
+        [FromQuery] int? year, [FromQuery] int? month, CancellationToken ct = default)
+    {
+        try
+        {
+            var today = Today();
+            var y = year ?? today.Year;
+            var m = month ?? today.Month;
+            if (m is < 1 or > 12) return BadRequest(new { message = "Month must be 1 to 12." });
+
+            var from = new DateOnly(y, m, 1);
+            var to = from.AddMonths(1).AddDays(-1);
+
+            var invoices = _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.Status.StatusKey != "CANCELLED" && i.InvoiceDate >= from && i.InvoiceDate <= to);
+
+            var revenue = await invoices.SumAsync(i => (decimal?)i.TotalAmount, ct) ?? 0m;
+            var invoiceCount = await invoices.CountAsync(ct);
+
+            var topCustomers = await invoices
+                .GroupBy(i => i.CustomerUser.LegalName)
+                .Select(g => new { name = g.Key, amount = g.Sum(x => x.TotalAmount), invoices = g.Count() })
+                .OrderByDescending(x => x.amount).Take(5).ToListAsync(ct);
+
+            var topProducts = await _db.SalesInvoiceItems.AsNoTracking()
+                .Where(l => l.Invoice.Status.StatusKey != "CANCELLED"
+                         && l.Invoice.InvoiceDate >= from && l.Invoice.InvoiceDate <= to)
+                .GroupBy(l => l.Product.ProductName)
+                .Select(g => new { name = g.Key, qty = g.Sum(x => x.Quantity), amount = g.Sum(x => x.LineTotal) })
+                .OrderByDescending(x => x.amount).Take(5).ToListAsync(ct);
+
+            var expenses = await _db.Expenses.AsNoTracking()
+                .Where(e => e.Status.StatusKey == "POSTED" && e.ExpenseDate >= from && e.ExpenseDate <= to)
+                .GroupBy(e => e.CategoryName)
+                .Select(g => new { category = g.Key, amount = g.Sum(x => x.Amount) })
+                .OrderByDescending(x => x.amount).ToListAsync(ct);
+
+            var receipts = await _db.Vouchers.AsNoTracking()
+                .Where(v => v.Status.StatusKey == "POSTED" && v.VoucherType.IsReceipt
+                         && v.VoucherDate >= from && v.VoucherDate <= to)
+                .SumAsync(v => (decimal?)v.Amount, ct) ?? 0m;
+
+            /* Last month, so the summary can say whether this was better. */
+            var prevFrom = from.AddMonths(-1);
+            var prevTo = from.AddDays(-1);
+            var prevRevenue = await _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.Status.StatusKey != "CANCELLED" && i.InvoiceDate >= prevFrom && i.InvoiceDate <= prevTo)
+                .SumAsync(i => (decimal?)i.TotalAmount, ct) ?? 0m;
+
+            var facts = new
+            {
+                month = from.ToString("MMMM yyyy"),
+                period = new { from, to },
+                revenue,
+                invoiceCount,
+                previousMonthRevenue = prevRevenue,
+                moneyReceived = receipts,
+                expenseTotal = expenses.Sum(e => e.amount),
+                topCustomers,
+                topProducts,
+                expensesByCategory = expenses
+            };
+
+            var summary = await _ai.ExplainAsync(
+                "Write the owner a one-page summary of this month.\n\n" +
+                "Three short paragraphs: what went well, what went badly, and what to watch next " +
+                "month. Name the actual customers and products from the data. Compare against last " +
+                "month's revenue. The reader runs the shop and does not want jargon.",
+                JsonSerializer.Serialize(facts, ExportJson), ct);
+
+            return Ok(new
+            {
+                facts.month,
+                facts.period,
+                facts.revenue,
+                facts.invoiceCount,
+                facts.previousMonthRevenue,
+                facts.moneyReceived,
+                facts.expenseTotal,
+                facts.topCustomers,
+                facts.topProducts,
+                facts.expensesByCategory,
+                summary,
+                aiAvailable = _ai.IsConfigured,
+                disclaimer = "Figures are from the ledger. The write-up is AI-written -- check it."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "build the month-end summary");
+        }
+    }
+
+    /// <summary>
+    /// #8 -- ask a question in Urdu or English and get the right report.
+    ///
+    /// The model NEVER writes a query. It is shown a fixed menu of reports
+    /// (Services/ReportCatalogue.cs) and its only job is to pick one and fill
+    /// in the parameters. Whatever it picks, the caller could have opened
+    /// themselves, and the same permission checks apply.
+    ///
+    /// Two steps, so that a wrong guess is visible rather than convincing:
+    ///   1. choose the report
+    ///   2. run it, then answer FROM ITS OUTPUT
+    /// </summary>
+    [HttpPost("ask")]
+    public async Task<IActionResult> Ask([FromBody] AskRequest body, CancellationToken ct = default)
+    {
+        try
+        {
+            var question = (body?.Question ?? "").Trim();
+            if (question.Length < 3)
+                return BadRequest(new { message = "What would you like to know?" });
+            if (question.Length > 500)
+                return BadRequest(new { message = "That question is too long. Try asking it more briefly." });
+
+            if (!_ai.IsConfigured)
+                return Ok(new
+                {
+                    question,
+                    answer = (string?)null,
+                    aiAvailable = false,
+                    message = "Asking questions needs the AI to be set up. The reports themselves all work.",
+                    reports = ReportCatalogue.All.Select(e => new { e.Key, e.Answers, e.Screen })
+                });
+
+            /* ── step 1: which report ──────────────────────────────────────
+               Answer forced to a tiny JSON shape. A model asked for prose here
+               will write prose, and then there is nothing to act on. */
+            var choiceText = await _ai.ExplainAsync(
+                "Pick the ONE report that answers the question below. Reply with nothing but JSON:\n" +
+                "{\"key\": \"<report key>\", \"params\": {}, \"why\": \"<a few words>\"}\n\n" +
+                "If no report fits, use key \"none\".\n\n" +
+                "THE REPORTS:\n" + ReportCatalogue.AsPrompt() + "\n\n" +
+                "THE QUESTION:\n" + question,
+                "{}", ct);
+
+            var key = ExtractJsonString(choiceText, "key");
+            var chosen = ReportCatalogue.Find(key);
+
+            if (chosen is null)
+            {
+                return Ok(new
+                {
+                    question,
+                    answer = (string?)null,
+                    matched = (string?)null,
+                    aiAvailable = true,
+                    message = "There is no report that answers that. Try asking about sales, money owed, "
+                            + "stock, margins or a customer.",
+                    reports = ReportCatalogue.All.Select(e => new { e.Key, e.Answers, e.Screen })
+                });
+            }
+
+            /* ── step 2: run it, and answer from what it returned ──────────
+               The report is executed here, in-process, with this user's
+               identity -- not by the model, which never sees a connection. */
+            var data = chosen.Key switch
+            {
+                "sales-drop"        => await SalesDrop(null, null, null, null),
+                "recovery-priority" => await RecoveryPriority(ct),
+                "at-risk"           => await CustomersAtRisk(15, ct),
+                "demand-forecast"   => await DemandForecast(180, 30, 25, ct),
+                "dead-stock"        => await DeadStockAdvice(90, ct),
+                "margin-watch"      => await MarginWatch(10m, 90, ct),
+                "month-end"         => await MonthEndSummary(null, null, ct),
+                "sales-summary"     => await SalesSummary(null, null, null),
+                "customer-aging"    => await CustomerAging(null),
+                "top-customers"     => await TopCustomers(null, null, 10),
+                _                   => null
+            };
+
+            if (data is not OkObjectResult ok || ok.Value is null)
+                return Ok(new
+                {
+                    question,
+                    matched = chosen.Key,
+                    answer = (string?)null,
+                    aiAvailable = true,
+                    message = "That report could not be run just now."
+                });
+
+            var answer = await _ai.ExplainAsync(
+                "Answer the question below using ONLY the report data that follows. Two or three " +
+                "sentences, with the actual figures. If the data does not answer it, say so.\n\n" +
+                "QUESTION: " + question,
+                JsonSerializer.Serialize(ok.Value, ExportJson), ct);
+
+            return Ok(new
+            {
+                question,
+                matched = chosen.Key,
+                matchedAnswers = chosen.Answers,
+                screen = chosen.Screen,
+                answer,
+                aiAvailable = true,
+                disclaimer = "Answered by AI from the report shown. Open it to check."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "answer the question");
+        }
+    }
+
+    /// <summary>
+    /// Pull one string out of a model's JSON reply, tolerating the code fence
+    /// it wraps things in about half the time.
+    /// </summary>
+    private static string? ExtractJsonString(string? text, string property)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        try
+        {
+            var t = text.Trim();
+            var start = t.IndexOf('{');
+            var end = t.LastIndexOf('}');
+            if (start < 0 || end <= start) return null;
+
+            using var doc = JsonDocument.Parse(t[start..(end + 1)]);
+            return doc.RootElement.TryGetProperty(property, out var v) ? v.GetString() : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public record AskRequest(string Question);
+
     // ══════════════════════════════════════════════════════════════════
     //  ROLE DASHBOARDS
     // ══════════════════════════════════════════════════════════════════

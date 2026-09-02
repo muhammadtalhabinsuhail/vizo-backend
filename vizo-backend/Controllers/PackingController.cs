@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -22,9 +23,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "OrderDept")]
 public class PackingController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public PackingController(AppDbContext db, IConfiguration cfg,
-        ILogger<PackingController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<PackingController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     /* The two states that mean "this needs packing". */
     private static readonly string[] Queue = { "CONFIRMED", "PROCESSING" };
@@ -220,6 +224,18 @@ public class PackingController : ApiControllerBase
 
             await Log("ORDER_PACKED", "SalesOrder", order.OrderNo,
                 $"{order.SalesOrderItems.Count} lines", 1);
+
+            /* -- A6 -- the rep who took it is told, because the customer will
+               ring THEM to ask where it is. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "order-dept" },
+                NotificationKinds.OrderPacked,
+                $"Order packed by {CurrentUserName()}",
+                $"{order.OrderNo} is packed and ready to go out.",
+                url: $"/sales/orders/{order.OrderId}",
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: order.SalesPersonUserId is null
+                    ? null : new[] { order.SalesPersonUserId.Value });
 
             return Ok(new
             {

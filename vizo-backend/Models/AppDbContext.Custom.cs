@@ -32,6 +32,19 @@ public partial class AppDbContext
     /// </summary>
     public virtual DbSet<DocumentFile> DocumentFiles { get; set; } = null!;
 
+    /// <summary>
+    /// One row per BROWSER that has allowed notifications -- not per user.
+    /// Created on Neon by backend/database/13_push_subscriptions.sql.
+    /// </summary>
+    public virtual DbSet<PushSubscription> PushSubscriptions { get; set; } = null!;
+
+    /// <summary>
+    /// Only the notification kinds somebody has deliberately switched off.
+    /// A missing row means on.
+    /// Created on Neon by backend/database/13_push_subscriptions.sql.
+    /// </summary>
+    public virtual DbSet<NotificationPreference> NotificationPreferences { get; set; } = null!;
+
     partial void OnModelCreatingPartial(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<PasswordResetCode>(entity =>
@@ -111,6 +124,52 @@ public partial class AppDbContext
                 .HasForeignKey(d => d.DecidedByUserId)
                 .OnDelete(DeleteBehavior.ClientSetNull)
                 .HasConstraintName("FK_SalesReturn_DecidedBy");
+        });
+
+        modelBuilder.Entity<PushSubscription>(entity =>
+        {
+            entity.HasKey(e => e.PushSubscriptionId).HasName("PushSubscription_pkey");
+            entity.ToTable("PushSubscription");
+
+            entity.Property(e => e.Endpoint).HasMaxLength(500);
+            entity.Property(e => e.P256dh).HasMaxLength(255);
+            entity.Property(e => e.Auth).HasMaxLength(255);
+            entity.Property(e => e.UserAgent).HasMaxLength(300);
+
+            /* Npgsql maps a bare DateTime to "timestamp WITH time zone" and
+               then refuses one whose Kind is Unspecified. Same declaration the
+               rest of this schema uses -- see SalesReturn.DecidedAt. */
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamp without time zone");
+            entity.Property(e => e.LastUsedAt).HasColumnType("timestamp without time zone");
+
+            /* A browser re-subscribes on its own after a service-worker update.
+               Without this the same person collects a row per update and gets
+               every notification three or four times. */
+            entity.HasIndex(e => e.Endpoint).IsUnique().HasDatabaseName("PushSubscription_Endpoint_key");
+
+            entity.HasOne(e => e.User).WithMany()
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade)
+                .HasConstraintName("PushSubscription_UserId_fkey");
+        });
+
+        modelBuilder.Entity<NotificationPreference>(entity =>
+        {
+            entity.HasKey(e => e.PreferenceId).HasName("NotificationPreference_pkey");
+            entity.ToTable("NotificationPreference");
+
+            entity.Property(e => e.Kind).HasMaxLength(60);
+            entity.Property(e => e.PushEnabled).HasDefaultValue(true);
+            entity.Property(e => e.BellEnabled).HasDefaultValue(true);
+
+            entity.HasIndex(e => new { e.UserId, e.Kind })
+                .IsUnique()
+                .HasDatabaseName("NotificationPreference_User_Kind_key");
+
+            entity.HasOne(e => e.User).WithMany()
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade)
+                .HasConstraintName("NotificationPreference_UserId_fkey");
         });
 
         modelBuilder.Entity<JournalEntry>(entity =>

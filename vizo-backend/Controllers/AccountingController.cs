@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Documents;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -30,9 +31,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "Accountant")]
 public class AccountingController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public AccountingController(AppDbContext db, IConfiguration cfg,
-        ILogger<AccountingController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<AccountingController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     private const string Posted = "POSTED";
 
@@ -485,6 +489,15 @@ public class AccountingController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("JOURNAL_POSTED", "JournalEntry", entry.EntryNo, $"{d:N2}", 2);
 
+            /* -- C4 -- */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.JournalPosted,
+                $"Entry posted by {CurrentUserName()}",
+                $"{entry.EntryNo} -- PKR {d:N0} over {entry.JournalEntryLines.Count} lines.",
+                url: $"/accounting/journal-entries/{entry.EntryId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id, message = $"{entry.EntryNo} posted." });
         }
         catch (Exception ex)
@@ -732,6 +745,17 @@ public class AccountingController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("COLLECTION_CONFIRMED", "Collection", c.ReceiptNo, $"{c.Amount:N2}", 2);
 
+            /* -- C8 -- addressed to the rep who physically took the cash and is
+               answerable for it until this happens. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.CollectionConfirmed,
+                $"Collection confirmed by {CurrentUserName()}",
+                $"{c.ReceiptNo} -- PKR {c.Amount:N0} has been confirmed.",
+                url: "/accounting/collections",
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: new[] { c.CollectedByUserId });
+
             return Ok(new { id, message = $"{c.ReceiptNo} confirmed." });
         }
         catch (Exception ex)
@@ -904,6 +928,16 @@ public class AccountingController : ApiControllerBase
                failure here is logged and swallowed -- the document is saved
                either way and the PDF can be rebuilt from the row. */
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
+
+            /* -- C1 -- someone has to approve this before it reaches the
+               ledger, so the people who can approve it are told. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.ExpenseCreated,
+                $"Expense filed by {CurrentUserName()}",
+                $"{e.ExpenseNo} -- {e.VendorName}, PKR {e.Amount:N0}. Waiting for approval.",
+                url: $"/accounting/expenses/{e.ExpenseId}",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id = e.ExpenseId, expenseNo = e.ExpenseNo, message = $"Expense {e.ExpenseNo} saved." });
         }
@@ -1224,6 +1258,16 @@ public class AccountingController : ApiControllerBase
             period.ClosedByUserId = CurrentUserId();
             await _db.SaveChangesAsync();
             await Log("PERIOD_CLOSED", "FiscalPeriod", period.PeriodName, null, 3);
+
+            /* -- C9 -- anybody about to book something into that month needs to
+               know they no longer can. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.PeriodChanged,
+                $"Period closed by {CurrentUserName()}",
+                $"{period.PeriodName} is closed. No further entries can be made in it.",
+                url: "/accounting/period-close",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{period.PeriodName} closed." });
         }
@@ -1879,6 +1923,23 @@ public class AccountingController : ApiControllerBase
 
             var entryNo = await _db.JournalEntries.AsNoTracking()
                 .Where(e => e.EntryId == v.EntryId).Select(e => e.EntryNo).FirstOrDefaultAsync();
+
+            /* -- C6 -- the rep who looks after this customer is told, because
+               "have they paid yet" is a question they get asked. */
+            var partyName = v.PartyUserId is null ? null : await _db.Parties.AsNoTracking()
+                .Where(pa => pa.UserId == v.PartyUserId).Select(pa => pa.LegalName).FirstOrDefaultAsync();
+            var repId = v.PartyUserId is null ? null : await _db.Parties.AsNoTracking()
+                .Where(pa => pa.UserId == v.PartyUserId).Select(pa => pa.SalesPersonUserId).FirstOrDefaultAsync();
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.VoucherPosted,
+                $"Payment posted by {CurrentUserName()}",
+                $"{v.VoucherNo} -- PKR {v.Amount:N0}" +
+                (partyName is null ? "." : $" with {partyName}."),
+                url: $"/accounting/vouchers/{v.VoucherId}",
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: repId is null ? null : new[] { repId.Value });
 
             return Ok(new { id, entryNo, message = $"{v.VoucherNo} posted." });
         }
@@ -2592,6 +2653,20 @@ public class AccountingController : ApiControllerBase
 
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
 
+            /* -- C2 -- the person who filed it is the one waiting on the
+               answer, so they are told by name whatever their role. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.ExpenseDecided,
+                $"Expense {(key == "POSTED" ? "approved" : "rejected")} by {CurrentUserName()}",
+                key == "POSTED"
+                    ? $"{e.ExpenseNo} -- PKR {e.Amount:N0} to {e.VendorName}, posted to the ledger."
+                    : $"{e.ExpenseNo} was rejected." +
+                      (string.IsNullOrWhiteSpace(body.Reason) ? "" : $" Reason: {body.Reason!.Trim()}"),
+                url: $"/accounting/expenses/{e.ExpenseId}",
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: new[] { e.CreatedByUserId });
+
             return Ok(new
             {
                 id,
@@ -2743,6 +2818,18 @@ public class AccountingController : ApiControllerBase
             await Log("EXPENSE_REVERSED", "Expense", e.ExpenseNo, body.Reason!.Trim(), 3);
 
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
+
+            /* -- C3 -- severe: money that was recorded as spent has been
+               un-spent, and the books moved to make that true. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.ExpenseReversed,
+                $"Expense reversed by {CurrentUserName()}",
+                $"{e.ExpenseNo} -- PKR {e.Amount:N0} undone" +
+                (mirrorNo is null ? "." : $" by {mirrorNo}.") + $" Reason: {body!.Reason!.Trim()}",
+                url: $"/accounting/expenses/{e.ExpenseId}",
+                severe: true,
+                exceptUserId: CurrentUserId());
 
             return Ok(new
             {
@@ -3021,6 +3108,16 @@ public class AccountingController : ApiControllerBase
 
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "journal-entry", mirror.EntryId, CurrentUserId());
 
+            /* -- C5 -- severe: the ledger has been moved after the fact. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.JournalReversed,
+                $"Entry reversed by {CurrentUserName()}",
+                $"{entry.EntryNo} was undone by {mirror.EntryNo}.{why}",
+                url: $"/accounting/journal-entries/{entry.EntryId}",
+                severe: true,
+                exceptUserId: CurrentUserId());
+
             return Ok(new
             {
                 id,
@@ -3268,6 +3365,19 @@ public class AccountingController : ApiControllerBase
             await Log("VOUCHER_CANCELLED", "Voucher", v.VoucherNo, body.Reason.Trim(), 3);
 
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "voucher", v.VoucherId, CurrentUserId());
+
+            /* -- C7 -- severe, and it must reach Sales. Money that was recorded
+               as received has gone back: the invoice is owing again and the rep
+               will otherwise keep telling the customer it is settled. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant", "sales" },
+                NotificationKinds.VoucherCancelled,
+                $"Payment cancelled by {CurrentUserName()}",
+                $"{v.VoucherNo} -- PKR {v.Amount:N0} reversed. " +
+                $"Anything it settled is outstanding again. Reason: {body.Reason.Trim()}",
+                url: $"/accounting/vouchers/{v.VoucherId}",
+                severe: true,
+                exceptUserId: CurrentUserId());
 
             return Ok(new
             {

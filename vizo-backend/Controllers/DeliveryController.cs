@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -23,9 +24,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "BackOffice")]
 public class DeliveryController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public DeliveryController(AppDbContext db, IConfiguration cfg,
-        ILogger<DeliveryController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<DeliveryController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     // ══════════════════════════════════════════════════════════════════
     //  LIST
@@ -176,6 +180,15 @@ public class DeliveryController : ApiControllerBase
             await Log("DELIVERY_CONFIRMED", "Delivery", delivery.DeliveryNo,
                 $"{delivery.Channel.ChannelName}", 2);
 
+            /* -- A8 -- */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "order-dept", "accountant" },
+                NotificationKinds.OrderDelivered,
+                "Order delivered",
+                $"{delivery.DeliveryNo} reached the customer.",
+                url: $"/delivery/{delivery.DeliveryId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id, message = $"{delivery.DeliveryNo} confirmed as delivered." });
         }
         catch (Exception ex)
@@ -200,6 +213,17 @@ public class DeliveryController : ApiControllerBase
             delivery.IsCodSettled = true;
             await _db.SaveChangesAsync();
             await Log("COD_SETTLED", "Delivery", delivery.DeliveryNo, $"{delivery.CodAmount:N2}", 2);
+
+            /* -- A9 -- money arriving. Severe: this is cash the courier was
+               holding, and the moment it lands is worth knowing immediately. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "sales" },
+                NotificationKinds.CodSettled,
+                $"COD received by {CurrentUserName()}",
+                $"PKR {delivery.CodAmount:N0} settled on {delivery.DeliveryNo}.",
+                url: $"/delivery/{delivery.DeliveryId}",
+                severe: true,
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"COD on {delivery.DeliveryNo} settled." });
         }

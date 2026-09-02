@@ -70,6 +70,26 @@ public abstract class ApiControllerBase : ControllerBase
     protected int CurrentUserId() =>
         int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var id) ? id : 0;
 
+    /// <summary>
+    /// The signed-in person's name, from the JWT rather than the database --
+    /// it is already in the token, and a notification is not worth a query.
+    ///
+    /// Used by every notification title: they all read
+    /// "VIZO — Order created by Ahmed", and this is the "Ahmed".
+    /// Falls back to the first name only, because a lock screen shows about
+    /// forty characters of a title and "Muhammad Talha bin Suhail" would eat
+    /// all of them.
+    /// </summary>
+    protected string CurrentUserName(bool firstNameOnly = true)
+    {
+        var full = User.FindFirstValue(ClaimTypes.Name);
+        if (string.IsNullOrWhiteSpace(full)) return "somebody";
+        if (!firstNameOnly) return full;
+
+        var space = full.IndexOf(' ');
+        return space > 0 ? full[..space] : full;
+    }
+
     /* NOTE for anyone reading the scaffolded models: "User" carries TWO
        location collections and they are easy to mix up.
            User.Locations           -> locations this person is IN CHARGE OF

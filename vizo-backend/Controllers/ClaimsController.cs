@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -27,9 +28,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "BackOffice")]
 public class ClaimsController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public ClaimsController(AppDbContext db, IConfiguration cfg,
-        ILogger<ClaimsController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<ClaimsController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     // ══════════════════════════════════════════════════════════════════
     //  LIST
@@ -268,6 +272,17 @@ public class ClaimsController : ApiControllerBase
             await Log("CLAIM_RECEIVED", "Claim", claim.ClaimNo,
                       $"{claim.Quantity} x {product.ProductName} ({reason.ReasonName})", 1);
 
+            /* -- E1 -- a claim is money tied up in stock that cannot be sold,
+               which is why Accounts hears about it and not just the warehouse. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.ClaimCreated,
+                $"Claim raised by {CurrentUserName()}",
+                $"{claim.ClaimNo} -- {claim.Quantity} x {product.ProductName}, " +
+                $"PKR {claim.UnitCost * claim.Quantity:N0} ({reason.ReasonName}).",
+                url: $"/claims/{claim.ClaimId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new
             {
                 id = claim.ClaimId,
@@ -311,6 +326,15 @@ public class ClaimsController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("CLAIM_SENT", "Claim", claim.ClaimNo, body.Note, 1);
 
+            /* -- E2 -- */
+            await _push.NotifyRoleAsync(
+                "super-admin",
+                NotificationKinds.ClaimSent,
+                $"Claim sent by {CurrentUserName()}",
+                $"{claim.ClaimNo} has gone to the supplier.",
+                url: $"/claims/{claim.ClaimId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id, message = $"{claim.ClaimNo} sent to the supplier." });
         }
         catch (Exception ex)
@@ -349,6 +373,15 @@ public class ClaimsController : ApiControllerBase
             await Log("CLAIM_REMINDER", "Claim", claim.ClaimNo,
                       $"Chased the supplier (reminder {claim.RemindersSent})", 3);
 
+            /* -- E3 -- */
+            await _push.NotifyRoleAsync(
+                "super-admin",
+                NotificationKinds.ClaimReminded,
+                $"Claim chased by {CurrentUserName()}",
+                $"{claim.ClaimNo} -- reminder {claim.RemindersSent} sent to the supplier.",
+                url: $"/claims/{claim.ClaimId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new
             {
                 id,
@@ -381,6 +414,15 @@ public class ClaimsController : ApiControllerBase
             claim.SupplierNote = body.Note ?? claim.SupplierNote;
             await _db.SaveChangesAsync();
             await Log("CLAIM_SETTLED", "Claim", claim.ClaimNo, $"{stage.StageName}: {body.Note}", 2);
+
+            /* -- E4 -- */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.ClaimSettled,
+                $"Claim settled by {CurrentUserName()}",
+                $"{claim.ClaimNo} -- {stage.StageName}, PKR {claim.UnitCost * claim.Quantity:N0}.",
+                url: $"/claims/{claim.ClaimId}",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, stage = stage.StageKey, message = $"{claim.ClaimNo} marked {stage.StageName}." });
         }

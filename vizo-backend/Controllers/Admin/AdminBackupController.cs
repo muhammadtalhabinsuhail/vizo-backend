@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers.Admin;
 
@@ -24,8 +25,11 @@ namespace vizo_backend.Controllers.Admin;
 [Authorize(Policy = "SuperAdmin")]
 public class AdminBackupController : AdminControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public AdminBackupController(AppDbContext db, IConfiguration cfg, ILogger<AdminBackupController> logger,
-        IWebHostEnvironment env) : base(db, cfg, logger, env) { }
+        IWebHostEnvironment env, PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
 
     // ══════════════════════════════════════════════════════════════════
@@ -116,6 +120,19 @@ public class AdminBackupController : AdminControllerBase
             await _db.SaveChangesAsync();
 
             await Log("BACKUP_STARTED", "BackupHistory", $"#{row.BackupId}", $"{type.TypeName} backup requested", 1);
+
+            /* -- F3 -- the mapped event is "backup finished", but nothing in
+               this application finishes one: the row is created and a separate
+               process is expected to complete it. Announcing "finished" here
+               would be a lie, so this says what actually happened. */
+            await _push.NotifyRoleAsync(
+                "super-admin",
+                NotificationKinds.BackupDone,
+                $"Backup started by {CurrentUserName()}",
+                $"A {type.TypeName.ToLowerInvariant()} backup is running.",
+                url: "/admin/backup",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id = row.BackupId, message = "Backup started. It will appear in the list when it finishes." });
         }
         catch (Exception ex)

@@ -14,6 +14,7 @@ using vizo_backend.Models;
 /* "Claim" is a warranty claim in this domain, so the security one needs a
    name of its own wherever both are in scope. */
 using SecurityClaim = System.Security.Claims.Claim;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -31,9 +32,13 @@ public class AuthController : ControllerBase
     private readonly ILogger<AuthController> _logger;
     private readonly IWebHostEnvironment _env;
 
+    private readonly PushNotificationService _push;
+
     public AuthController(AppDbContext db, IConfiguration cfg,
-        ILogger<AuthController> logger, IWebHostEnvironment env)
+        ILogger<AuthController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
     {
+        _push = push;
         _db = db;
         _cfg = cfg;
         _logger = logger;
@@ -68,7 +73,14 @@ public class AuthController : ControllerBase
                different reply for each tells an attacker which addresses exist. */
             if (user is null || string.IsNullOrEmpty(user.PasswordHash) ||
                 !BCrypt.Net.BCrypt.Verify(body.Password, user.PasswordHash))
+            {
+                await NoteFailedAttempt(email);
                 return Unauthorized(new { message = "Email or password is incorrect." });
+            }
+
+            /* A good sign-in clears the count -- somebody who mistyped their
+               password four times and then got it right is not an attack. */
+            FailedAttempts.TryRemove(email, out _);
 
             if (!user.IsActive)
                 return StatusCode(403, new { message = "This account has been deactivated. Contact your administrator." });
@@ -100,7 +112,69 @@ public class AuthController : ControllerBase
         }
         catch (Exception ex)
         {
-            return Fail(ex, "save C:/Program Files/Git/api/auth/login");
+            return Fail(ex, "sign in");
+        }
+    }
+
+    /* ═══════════════════ REPEATED SIGN-IN FAILURES ═══════════════════ */
+
+    /*  F4 in the notification map is "5 failed password attempts -- locked for
+        10 minutes". Only half of that exists in this application: there is no
+        failed-attempt counter and no automatic lock. Employee.IsLocked is a
+        flag an administrator sets by hand.
+
+        Rather than announce a lockout that never happens, this counts failures
+        and TELLS THE ADMINISTRATOR when one address is being hammered. They can
+        then lock the account from /admin/users, which is the control that
+        genuinely exists.
+
+        Held in memory on purpose: it is a five-minute signal, not a record, and
+        a row per wrong password would be a gift to anyone wanting to fill the
+        database. It resets when the API restarts, which for this purpose is
+        fine -- so does the attack.
+
+        A real automatic lockout wants a column on Employee and belongs with the
+        rest of the auth work, not smuggled in behind a notification.          */
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int Count, DateTime First)>
+        FailedAttempts = new();
+
+    private const int FailureThreshold = 5;
+    private static readonly TimeSpan FailureWindow = TimeSpan.FromMinutes(10);
+
+    private async Task NoteFailedAttempt(string email)
+    {
+        try
+        {
+            var now = DateTime.UtcNow;
+
+            var entry = FailedAttempts.AddOrUpdate(
+                email,
+                _ => (1, now),
+                (_, prev) => now - prev.First > FailureWindow
+                    ? (1, now)                       // the old run has expired
+                    : (prev.Count + 1, prev.First));
+
+            /* Exactly AT the threshold, not above it. Otherwise every further
+               attempt in the window sends another notification, and an attacker
+               gets to decide how many times the administrator's phone buzzes. */
+            if (entry.Count != FailureThreshold) return;
+
+            await _push.NotifyRoleAsync(
+                "super-admin",
+                NotificationKinds.LoginBlocked,
+                "Repeated sign-in failures",
+                $"{FailureThreshold} wrong passwords for {email} in the last " +
+                $"{FailureWindow.TotalMinutes:N0} minutes. Lock the account from Setup if this was not them.",
+                url: "/admin/users",
+                severe: true);
+        }
+        catch (Exception ex)
+        {
+            /* Never let this break a sign-in attempt -- including the attacker's,
+               because failing differently here would tell them they had been
+               noticed. */
+            _logger.LogWarning(ex, "Could not record a failed sign-in attempt.");
         }
     }
 

@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Documents;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -40,9 +41,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "Staff")]
 public class SalesController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public SalesController(AppDbContext db, IConfiguration cfg,
-        ILogger<SalesController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<SalesController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     /// <summary>The shared party every walk-in counter sale is booked against.</summary>
     private const string WalkInPartyCode = "VZ-C-WALKIN";
@@ -407,6 +411,52 @@ public class SalesController : ApiControllerBase
 
             var bill = invoice is null ? null : await TryBuildBill(invoice.InvoiceId);
 
+            /* ── A1 / B1 ──────────────────────────────────────────────────
+               Fired last, after every database write has already succeeded,
+               and it cannot fail the request -- see PushNotificationService.
+
+               An order held on a credit limit is a different message to a
+               different audience: it is the one place in this whole flow where
+               money is stuck, so it goes to Accounts as well and it is the kind
+               that buzzes a phone. */
+            var customerName = await _db.Parties.AsNoTracking()
+                .Where(pa => pa.UserId == order.CustomerUserId)
+                .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
+            var takenBy = CurrentUserName();
+
+            if (overLimit)
+            {
+                await _push.NotifyRolesAsync(
+                    new[] { "super-admin", "accountant", "sales" },
+                    NotificationKinds.CreditHold,
+                    $"Order held by {takenBy}",
+                    $"{order.OrderNo} is stuck -- {customerName} is over their credit limit. " +
+                    $"{order.TotalAmount:N0} cannot move until somebody clears it.",
+                    url: $"/sales/credit-holds",
+                    severe: true);
+            }
+            else
+            {
+                await _push.NotifyRolesAsync(
+                    new[] { "super-admin", "order-dept" },
+                    NotificationKinds.OrderCreated,
+                    $"Order created by {takenBy}",
+                    $"{order.OrderNo} -- {customerName}, PKR {order.TotalAmount:N0}.",
+                    url: $"/sales/orders/{order.OrderId}",
+                    exceptUserId: CurrentUserId());
+            }
+
+            if (invoice is not null)
+            {
+                await _push.NotifyRolesAsync(
+                    new[] { "super-admin", "accountant" },
+                    NotificationKinds.InvoiceRaised,
+                    $"Invoice raised by {takenBy}",
+                    $"{invoice.InvoiceNo} -- {customerName}, PKR {invoice.TotalAmount:N0}, for {order.OrderNo}.",
+                    url: $"/sales/invoices/{invoice.InvoiceId}",
+                    exceptUserId: CurrentUserId());
+            }
+
             return Ok(new
             {
                 id = order.OrderId,
@@ -594,6 +644,17 @@ public class SalesController : ApiControllerBase
 
             var bill = await TryBuildBill(inv.InvoiceId);
 
+            /* ── B3 ─────────────────────────────────────────────────────── */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.InvoiceRaised,
+                $"Invoice raised by {CurrentUserName()}",
+                $"{inv.InvoiceNo} -- PKR {inv.TotalAmount:N0}, against {order.OrderNo}.",
+                url: $"/sales/invoices/{inv.InvoiceId}",
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: order.SalesPersonUserId is null
+                    ? null : new[] { order.SalesPersonUserId.Value });
+
             return Ok(new
             {
                 invoiceId = inv.InvoiceId,
@@ -644,6 +705,38 @@ public class SalesController : ApiControllerBase
 
             await Log(body.StatusKey == "CANCELLED" ? "ORDER_CANCELLED" : "ORDER_STATUS_CHANGED",
                 "SalesOrder", order.OrderNo, detail, body.StatusKey == "CANCELLED" ? 2 : 1);
+
+            /* ── A2 · A6 · A7 · A8 ────────────────────────────────────────
+               One status endpoint drives several of the mapped trigger points,
+               so the audience is chosen from the status rather than repeated
+               four times. The rep who took the order is told about their own
+               order specifically -- that is the person waiting to hear. */
+            var salesRepId = order.SalesPersonUserId;
+            var custName = await _db.Parties.AsNoTracking()
+                .Where(pa => pa.UserId == order.CustomerUserId)
+                .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
+
+            var (kind, purpose, line) = status.StatusKey switch
+            {
+                "CONFIRMED"  => (NotificationKinds.OrderConfirmed,  $"Order confirmed by {CurrentUserName()}",
+                                 $"{order.OrderNo} for {custName} has been confirmed."),
+                "PACKED"     => (NotificationKinds.OrderPacked,     $"Order packed by {CurrentUserName()}",
+                                 $"{order.OrderNo} for {custName} is packed and ready to send."),
+                "DISPATCHED" => (NotificationKinds.OrderDispatched, $"Order dispatched by {CurrentUserName()}",
+                                 $"{order.OrderNo} for {custName} has left."),
+                "DELIVERED"  => (NotificationKinds.OrderDelivered,  $"Order delivered",
+                                 $"{order.OrderNo} reached {custName}."),
+                _            => ("", "", "")
+            };
+
+            if (kind.Length > 0)
+            {
+                await _push.NotifyRolesAsync(
+                    new[] { "super-admin", "order-dept" }, kind, purpose, line,
+                    url: $"/sales/orders/{order.OrderId}",
+                    exceptUserId: CurrentUserId(),
+                    alsoUserIds: salesRepId is null ? null : new[] { salesRepId.Value });
+            }
 
             return Ok(new
             {
@@ -799,6 +892,20 @@ public class SalesController : ApiControllerBase
                     await TryBuildBill(raised.InvoiceId);
                 }
             }
+
+            /* ── B2 ───────────────────────────────────────────────────────
+               The rep whose order was stuck is the one who has been waiting for
+               this, so they are named explicitly rather than left to the role
+               sweep. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "order-dept" },
+                NotificationKinds.CreditHoldCleared,
+                $"Limit cleared by {CurrentUserName()}",
+                $"{order.OrderNo} has been released and can move again.",
+                url: $"/sales/orders/{order.OrderId}",
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: order.SalesPersonUserId is null
+                    ? null : new[] { order.SalesPersonUserId.Value });
 
             return Ok(new
             {
@@ -1382,6 +1489,20 @@ public class SalesController : ApiControllerBase
 
             await Log($"SALES_RETURN_{key}", "SalesReturn", ret.ReturnNo, detail, key == "REJECTED" ? 3 : 2);
 
+            /* ── B7 ───────────────────────────────────────────────────────
+               Warehouse is told because a return going through means stock
+               physically comes back to a shelf. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant", "order-dept" },
+                NotificationKinds.ReturnDecided,
+                $"Return {target.StatusName.ToLowerInvariant()} by {CurrentUserName()}",
+                key == "REJECTED"
+                    ? $"{ret.ReturnNo} was refused." +
+                      (string.IsNullOrWhiteSpace(body?.Reason) ? "" : $" Reason: {body!.Reason!.Trim()}")
+                    : $"{ret.ReturnNo} approved -- stock is back and a credit note follows.",
+                url: $"/sales/returns/{ret.ReturnId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new
             {
                 id,
@@ -1639,6 +1760,17 @@ public class SalesController : ApiControllerBase
 
             var bill = await TryBuildBill(inv.InvoiceId);
 
+            /* -- B4 -- an invoice raised with no order behind it. Worth telling
+               Accounts about precisely because it did not come through the
+               usual route. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.InvoiceDirect,
+                $"Direct invoice by {CurrentUserName()}",
+                $"{inv.InvoiceNo} -- PKR {inv.TotalAmount:N0}, raised without an order.",
+                url: $"/sales/invoices/{inv.InvoiceId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new
             {
                 id = inv.InvoiceId,
@@ -1789,6 +1921,17 @@ public class SalesController : ApiControllerBase
 
             await Log("SALES_RETURN_CREATED", "SalesReturn", ret.ReturnNo,
                 $"{body.Lines.Count} lines, {refund:N0} against {inv.InvoiceNo}. {body.Reason.Trim()}", 2);
+
+            /* -- B6 -- the order department hears about it too: if it is
+               approved, stock is coming back to a shelf they look after. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant", "order-dept" },
+                NotificationKinds.ReturnRequested,
+                $"Return requested by {CurrentUserName()}",
+                $"{ret.ReturnNo} -- {body.Lines.Count} " +
+                $"{(body.Lines.Count == 1 ? "line" : "lines")}, PKR {refund:N0} against {inv.InvoiceNo}. Needs a decision.",
+                url: $"/sales/returns/{ret.ReturnId}",
+                exceptUserId: CurrentUserId());
 
             return Ok(new
             {
@@ -1992,6 +2135,18 @@ public class SalesController : ApiControllerBase
                timeout must not roll back a sale where the cash is already in
                the drawer and the stock has walked out of the door. */
             var bill = await TryBuildBill(inv.InvoiceId);
+
+            /* -- B5 -- deliberately NOT severe. A busy shop rings up dozens of
+               these a day, and an Admin whose phone buzzes for each one turns
+               notifications off within a week, taking the credit-limit alert
+               with them. It lands quietly in the bell. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.CounterSale,
+                $"Counter sale by {CurrentUserName()}",
+                $"{inv.InvoiceNo} -- PKR {inv.TotalAmount:N0} {method.MethodName}.",
+                url: $"/sales/invoices/{inv.InvoiceId}",
+                exceptUserId: CurrentUserId());
 
             return Ok(new
             {

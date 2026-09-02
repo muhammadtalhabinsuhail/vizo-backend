@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers.Admin;
 
@@ -23,8 +24,11 @@ namespace vizo_backend.Controllers.Admin;
 [Authorize(Policy = "SuperAdmin")]
 public class AdminRolesController : AdminControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public AdminRolesController(AppDbContext db, IConfiguration cfg, ILogger<AdminRolesController> logger,
-        IWebHostEnvironment env) : base(db, cfg, logger, env) { }
+        IWebHostEnvironment env, PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
 
     // ══════════════════════════════════════════════════════════════════
@@ -174,6 +178,18 @@ public class AdminRolesController : AdminControllerBase
 
             await _db.SaveChangesAsync();
             await Log("UPDATED", "Role", role.RoleName, $"Now {perms.Count} permissions", 3);
+
+            /* -- F2 -- ALWAYS sent, and severe. Changing what a role may do is
+               the most consequential action in the whole application: it can
+               hand somebody the ability to approve their own expenses. */
+            await _push.NotifyRoleAsync(
+                "super-admin",
+                NotificationKinds.RoleChanged,
+                $"Permissions changed by {CurrentUserName()}",
+                $"{role.RoleName} now has {perms.Count} " +
+                $"{(perms.Count == 1 ? "permission" : "permissions")}.",
+                url: "/admin/roles",
+                severe: true);
 
             return Ok(new { message = $"{role.RoleName} saved." });
         }

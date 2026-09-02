@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Documents;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -30,9 +31,21 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "Staff")]
 public class ReportsController : ApiControllerBase
 {
+    /* Cycle-safe serialisation for the payloads handed to the model. The
+       entity graph is heavily self-referencing and a plain Serialize would
+       recurse forever. */
+    private static readonly JsonSerializerOptions ExportJson = new()
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles,
+        WriteIndented = false
+    };
+
+    private readonly GeminiClient _ai;
+
     public ReportsController(AppDbContext db, IConfiguration cfg,
-        ILogger<ReportsController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<ReportsController> logger, IWebHostEnvironment env,
+        GeminiClient ai)
+        : base(db, cfg, logger, env) => _ai = ai;
 
     // ══════════════════════════════════════════════════════════════════
     //  SALES SUMMARY
@@ -560,6 +573,520 @@ public class ReportsController : ApiControllerBase
     };
 
     /// <summary>The report as a PDF, built on request. Print and Preview use this.</summary>
+    // ══════════════════════════════════════════════════════════════════
+    //  WHY DID SALES FALL
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  This endpoint contains NO AI. Not a single call.
+
+        It takes two periods and breaks the difference between them apart, six
+        ways, in SQL. Which customers bought less. Which products fell. What was
+        out of stock. Whether the price moved. Which rep's number dropped. Which
+        cost line jumped.
+
+        That separation is the whole design. Ask a language model "why did sales
+        drop" and it will produce a fluent, confident, invented answer. Give it
+        THESE numbers and ask it to explain them, and it can only rearrange
+        facts. /reports/sales-drop/explain does that second step; this does the
+        first, and it is useful on its own with no model configured at all.     */
+
+    /// <summary>
+    /// One period against another, broken down into the pieces that can
+    /// account for the difference. Defaults to this month against last.
+    /// </summary>
+    [HttpGet("sales-drop")]
+    public async Task<IActionResult> SalesDrop(
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to,
+        [FromQuery] DateOnly? baseFrom, [FromQuery] DateOnly? baseTo)
+    {
+        try
+        {
+            var today = Today();
+
+            /* Default: the month so far against the same stretch of last month.
+               Comparing a half-finished month against a whole one is the most
+               common way a sales report frightens somebody for no reason. */
+            var curFrom = from ?? new DateOnly(today.Year, today.Month, 1);
+            var curTo = to ?? today;
+            var prevFrom = baseFrom ?? curFrom.AddMonths(-1);
+            var prevTo = baseTo ?? curTo.AddMonths(-1);
+
+            if (curTo < curFrom || prevTo < prevFrom)
+                return BadRequest(new { message = "The end of a period cannot be before its start." });
+
+            var invoices = _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.Status.StatusKey != "CANCELLED");
+
+            var cur = invoices.Where(i => i.InvoiceDate >= curFrom && i.InvoiceDate <= curTo);
+            var prev = invoices.Where(i => i.InvoiceDate >= prevFrom && i.InvoiceDate <= prevTo);
+
+            var curTotal = await cur.SumAsync(i => (decimal?)i.TotalAmount) ?? 0m;
+            var prevTotal = await prev.SumAsync(i => (decimal?)i.TotalAmount) ?? 0m;
+            var curCount = await cur.CountAsync();
+            var prevCount = await prev.CountAsync();
+
+            // ── by customer ────────────────────────────────────────────────
+            var curByCustomer = await cur
+                .GroupBy(i => new { i.CustomerUserId, i.CustomerUser.LegalName })
+                .Select(g => new { g.Key.CustomerUserId, g.Key.LegalName, amount = g.Sum(i => i.TotalAmount), orders = g.Count() })
+                .ToListAsync();
+            var prevByCustomer = await prev
+                .GroupBy(i => new { i.CustomerUserId, i.CustomerUser.LegalName })
+                .Select(g => new { g.Key.CustomerUserId, g.Key.LegalName, amount = g.Sum(i => i.TotalAmount), orders = g.Count() })
+                .ToListAsync();
+
+            var customerRows = prevByCustomer
+                .Select(pv =>
+                {
+                    var now = curByCustomer.FirstOrDefault(c => c.CustomerUserId == pv.CustomerUserId);
+                    var nowAmt = now?.amount ?? 0m;
+                    return new
+                    {
+                        id = pv.CustomerUserId,
+                        name = pv.LegalName,
+                        was = pv.amount,
+                        now = nowAmt,
+                        change = nowAmt - pv.amount,
+                        stoppedBuying = now is null
+                    };
+                })
+                .Where(c => c.change < 0)
+                .OrderBy(c => c.change)
+                .Take(10)
+                .ToList();
+
+            // ── by product ─────────────────────────────────────────────────
+            var curByProduct = await _db.SalesInvoiceItems.AsNoTracking()
+                .Where(l => l.Invoice.Status.StatusKey != "CANCELLED"
+                         && l.Invoice.InvoiceDate >= curFrom && l.Invoice.InvoiceDate <= curTo)
+                .GroupBy(l => new { l.ProductId, l.Product.ProductName })
+                .Select(g => new { g.Key.ProductId, g.Key.ProductName, qty = g.Sum(x => x.Quantity), amount = g.Sum(x => x.LineTotal) })
+                .ToListAsync();
+
+            var prevByProduct = await _db.SalesInvoiceItems.AsNoTracking()
+                .Where(l => l.Invoice.Status.StatusKey != "CANCELLED"
+                         && l.Invoice.InvoiceDate >= prevFrom && l.Invoice.InvoiceDate <= prevTo)
+                .GroupBy(l => new { l.ProductId, l.Product.ProductName })
+                .Select(g => new { g.Key.ProductId, g.Key.ProductName, qty = g.Sum(x => x.Quantity), amount = g.Sum(x => x.LineTotal) })
+                .ToListAsync();
+
+            var productRows = prevByProduct
+                .Select(pv =>
+                {
+                    var now = curByProduct.FirstOrDefault(c => c.ProductId == pv.ProductId);
+                    return new
+                    {
+                        id = pv.ProductId,
+                        name = pv.ProductName,
+                        wasQty = pv.qty,
+                        nowQty = now?.qty ?? 0,
+                        was = pv.amount,
+                        now = now?.amount ?? 0m,
+                        change = (now?.amount ?? 0m) - pv.amount
+                    };
+                })
+                .Where(p => p.change < 0)
+                .OrderBy(p => p.change)
+                .Take(10)
+                .ToList();
+
+            // ── stock: things that used to sell and are now empty ──────────
+            var soldBefore = prevByProduct.Select(p => p.ProductId).ToHashSet();
+            var stockNow = await _db.Products.AsNoTracking()
+                .Where(pr => soldBefore.Contains(pr.ProductId))
+                .Select(pr => new
+                {
+                    id = pr.ProductId,
+                    name = pr.ProductName,
+                    minQty = pr.MinQty,
+                    onHand = pr.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
+                })
+                .ToListAsync();
+
+            var stockOut = stockNow
+                .Where(p => p.onHand <= 0)
+                .Select(p => new
+                {
+                    p.id,
+                    p.name,
+                    p.onHand,
+                    soldLastPeriod = prevByProduct.First(x => x.ProductId == p.id).amount
+                })
+                .OrderByDescending(p => p.soldLastPeriod)
+                .Take(10)
+                .ToList();
+
+            // ── price and discount ─────────────────────────────────────────
+            var curPricing = await cur
+                .Select(i => new { i.Subtotal, i.DiscountAmount, i.TotalAmount })
+                .ToListAsync();
+            var prevPricing = await prev
+                .Select(i => new { i.Subtotal, i.DiscountAmount, i.TotalAmount })
+                .ToListAsync();
+
+            var curSubtotal = curPricing.Sum(x => x.Subtotal);
+            var prevSubtotal = prevPricing.Sum(x => x.Subtotal);
+            var curDiscount = curPricing.Sum(x => x.DiscountAmount);
+            var prevDiscount = prevPricing.Sum(x => x.DiscountAmount);
+
+            // ── by rep ─────────────────────────────────────────────────────
+            var curByRep = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.Status.StatusKey != "CANCELLED" && o.SalesPersonUserId != null
+                         && o.OrderDate >= curFrom && o.OrderDate <= curTo)
+                .GroupBy(o => new { o.SalesPersonUserId, o.SalesPersonUser!.User.FullName })
+                .Select(g => new { id = g.Key.SalesPersonUserId, name = g.Key.FullName, amount = g.Sum(o => o.TotalAmount) })
+                .ToListAsync();
+
+            var prevByRep = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.Status.StatusKey != "CANCELLED" && o.SalesPersonUserId != null
+                         && o.OrderDate >= prevFrom && o.OrderDate <= prevTo)
+                .GroupBy(o => new { o.SalesPersonUserId, o.SalesPersonUser!.User.FullName })
+                .Select(g => new { id = g.Key.SalesPersonUserId, name = g.Key.FullName, amount = g.Sum(o => o.TotalAmount) })
+                .ToListAsync();
+
+            var repRows = prevByRep
+                .Select(pv => new
+                {
+                    pv.id,
+                    pv.name,
+                    was = pv.amount,
+                    now = curByRep.FirstOrDefault(c => c.id == pv.id)?.amount ?? 0m
+                })
+                .Select(r => new { r.id, r.name, r.was, r.now, change = r.now - r.was })
+                .Where(r => r.change < 0)
+                .OrderBy(r => r.change)
+                .ToList();
+
+            // ── expenses that jumped ───────────────────────────────────────
+            var curExpenses = await _db.Expenses.AsNoTracking()
+                .Where(e => e.Status.StatusKey == "POSTED" && e.ExpenseDate >= curFrom && e.ExpenseDate <= curTo)
+                .GroupBy(e => e.CategoryName)
+                .Select(g => new { category = g.Key, amount = g.Sum(x => x.Amount) })
+                .ToListAsync();
+
+            var prevExpenses = await _db.Expenses.AsNoTracking()
+                .Where(e => e.Status.StatusKey == "POSTED" && e.ExpenseDate >= prevFrom && e.ExpenseDate <= prevTo)
+                .GroupBy(e => e.CategoryName)
+                .Select(g => new { category = g.Key, amount = g.Sum(x => x.Amount) })
+                .ToListAsync();
+
+            var expenseRows = curExpenses
+                .Select(c => new
+                {
+                    c.category,
+                    now = c.amount,
+                    was = prevExpenses.FirstOrDefault(p => p.category == c.category)?.amount ?? 0m
+                })
+                .Select(e => new { e.category, e.was, e.now, change = e.now - e.was })
+                .Where(e => e.change > 0)
+                .OrderByDescending(e => e.change)
+                .Take(8)
+                .ToList();
+
+            return Ok(new
+            {
+                period = new { from = curFrom, to = curTo },
+                comparedWith = new { from = prevFrom, to = prevTo },
+                headline = new
+                {
+                    was = prevTotal,
+                    now = curTotal,
+                    change = curTotal - prevTotal,
+                    changePercent = prevTotal > 0
+                        ? Math.Round((curTotal - prevTotal) / prevTotal * 100, 1)
+                        : (decimal?)null,
+                    invoicesWas = prevCount,
+                    invoicesNow = curCount
+                },
+                byCustomer = new
+                {
+                    lost = customerRows.Count(c => c.stoppedBuying),
+                    lostValue = customerRows.Where(c => c.stoppedBuying).Sum(c => c.was),
+                    items = customerRows
+                },
+                byProduct = new { items = productRows },
+                stockOut = new
+                {
+                    count = stockOut.Count,
+                    valueLastPeriod = stockOut.Sum(p => p.soldLastPeriod),
+                    items = stockOut
+                },
+                pricing = new
+                {
+                    subtotalWas = prevSubtotal,
+                    subtotalNow = curSubtotal,
+                    discountWas = prevDiscount,
+                    discountNow = curDiscount,
+                    discountPercentWas = prevSubtotal > 0 ? Math.Round(prevDiscount / prevSubtotal * 100, 2) : 0m,
+                    discountPercentNow = curSubtotal > 0 ? Math.Round(curDiscount / curSubtotal * 100, 2) : 0m,
+                    averageInvoiceWas = prevCount > 0 ? Math.Round(prevTotal / prevCount, 0) : 0m,
+                    averageInvoiceNow = curCount > 0 ? Math.Round(curTotal / curCount, 0) : 0m
+                },
+                byRep = new { items = repRows },
+                expensesUp = new { items = expenseRows }
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "work out why sales moved");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  AI: EXPLAINING NUMBERS THE DATABASE ALREADY WORKED OUT
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  Every action in this section follows the same two steps:
+
+          1. call the SQL endpoint above and get finished numbers
+          2. hand those numbers to the model and ask it to put them in order
+             and say them in a sentence
+
+        The model is never asked a question it would have to compute an answer
+        to, and it is never given database access. If it is not configured, or
+        it fails, the endpoint still returns the numbers with `explanation:
+        null` and the screen shows the figures without the commentary.        */
+
+    /// <summary>
+    /// The sales-drop breakdown, plus a few lines saying what it means.
+    /// `explanation` is null when the model is unavailable -- the numbers are
+    /// always there.
+    /// </summary>
+    [HttpGet("sales-drop/explain")]
+    public async Task<IActionResult> ExplainSalesDrop(
+        [FromQuery] DateOnly? from, [FromQuery] DateOnly? to,
+        [FromQuery] DateOnly? baseFrom, [FromQuery] DateOnly? baseTo,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var action = await SalesDrop(from, to, baseFrom, baseTo);
+            if (action is not OkObjectResult ok || ok.Value is null) return action;
+
+            var facts = JsonSerializer.Serialize(ok.Value, ExportJson);
+
+            var explanation = await _ai.ExplainAsync(
+                "You are looking at one shop's sales for two periods, already worked out. " +
+                "Say what changed and why, then what to do about it.\n\n" +
+                "Answer in this shape:\n" +
+                "- Two or three sentences naming the BIGGEST causes, largest first, with the " +
+                "actual figures from the data.\n" +
+                "- Then a line 'Ab yeh karein:' followed by exactly three short actions, each " +
+                "naming a specific customer, product or number from the data.\n\n" +
+                "If a customer stopped buying entirely, that is almost always the main story -- " +
+                "say who. If stock ran out on something that used to sell, say which. " +
+                "Do not blame anything the data does not show.",
+                facts, ct);
+
+            return Ok(new
+            {
+                data = ok.Value,
+                explanation,
+                aiAvailable = _ai.IsConfigured,
+                /* The screen must label this. It is a reading of the numbers,
+                   not another number. */
+                disclaimer = "Written by AI from the figures above. Check it before acting on it."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "explain the sales movement");
+        }
+    }
+
+    /// <summary>
+    /// Who to chase for money, in the order most likely to actually pay --
+    /// which is not the same as oldest-debt-first.
+    /// </summary>
+    [HttpGet("recovery-priority")]
+    public async Task<IActionResult> RecoveryPriority(CancellationToken ct = default)
+    {
+        try
+        {
+            var today = Today();
+
+            /* Step 1, SQL. Everything the ranking could possibly rest on:
+               what is owed, how old it is, whether this customer has a habit of
+               paying, and how close they are to their limit. */
+            var raw = await _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.Status.StatusKey != "CANCELLED")
+                .Select(i => new
+                {
+                    i.InvoiceId,
+                    i.InvoiceNo,
+                    i.CustomerUserId,
+                    customer = i.CustomerUser.LegalName,
+                    phone = i.CustomerUser.User.Phone,
+                    creditLimit = i.CustomerUser.CreditLimit,
+                    creditDays = i.CustomerUser.CreditDays,
+                    rep = i.CustomerUser.SalesPersonUser != null
+                        ? i.CustomerUser.SalesPersonUser.User.FullName : null,
+                    i.DueDate,
+                    i.InvoiceDate,
+                    total = i.TotalAmount,
+                    paid = i.VoucherAllocations
+                        .Where(a => a.Voucher.Status.StatusKey == "POSTED")
+                        .Sum(a => (decimal?)a.Amount) ?? 0m
+                })
+                .ToListAsync();
+
+            var open = raw
+                .Select(i => new { i, balance = i.total - i.paid })
+                .Where(x => x.balance > 0.004m)
+                .ToList();
+
+            var byCustomer = open
+                .GroupBy(x => new { x.i.CustomerUserId, x.i.customer, x.i.phone, x.i.creditLimit, x.i.rep })
+                .Select(g =>
+                {
+                    var oldest = g.Min(x => x.i.DueDate);
+                    var owed = g.Sum(x => x.balance);
+                    var invoiced = g.Sum(x => x.i.total);
+                    return new
+                    {
+                        id = g.Key.CustomerUserId,
+                        name = g.Key.customer,
+                        phone = g.Key.phone,
+                        rep = g.Key.rep,
+                        creditLimit = g.Key.creditLimit,
+                        owed,
+                        invoices = g.Count(),
+                        oldestDueDate = oldest,
+                        daysOverdue = Math.Max(0, today.DayNumber - oldest.DayNumber),
+                        /* How much of what they were billed they have actually
+                           paid. A customer who pays 90% slowly is a better call
+                           than one who has paid nothing at all. */
+                        settledRatio = invoiced > 0 ? Math.Round(g.Sum(x => x.i.paid) / invoiced * 100, 0) : 0m,
+                        overLimit = g.Key.creditLimit > 0 && owed > g.Key.creditLimit
+                    };
+                })
+                .OrderByDescending(c => c.owed)
+                .Take(15)
+                .ToList();
+
+            var facts = JsonSerializer.Serialize(new
+            {
+                asOf = today,
+                totalOutstanding = byCustomer.Sum(c => c.owed),
+                customers = byCustomer
+            }, ExportJson);
+
+            // Step 2, AI. Ordering and wording only.
+            var advice = await _ai.ExplainAsync(
+                "This is who owes the shop money. Put them in the order they should be " +
+                "telephoned TODAY.\n\n" +
+                "Do not simply order by oldest or largest. Weigh how much is owed, how late it " +
+                "is, whether they have paid most of their bills before (settledRatio), and " +
+                "whether they are over their credit limit.\n\n" +
+                "Answer as a numbered list, at most six entries. Each line: the name, the amount, " +
+                "and a few words on why they come at that position. Then one short WhatsApp " +
+                "message in Roman Urdu that would suit the first customer on the list.",
+                facts, ct);
+
+            return Ok(new
+            {
+                asOf = today,
+                totalOutstanding = byCustomer.Sum(c => c.owed),
+                customers = byCustomer,
+                advice,
+                aiAvailable = _ai.IsConfigured,
+                disclaimer = "The order was suggested by AI from the figures above. Check it before acting on it."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "work out the recovery priority");
+        }
+    }
+
+    /// <summary>
+    /// Dead and slow-moving stock, with a line on what to do with each.
+    /// </summary>
+    [HttpGet("dead-stock/advice")]
+    public async Task<IActionResult> DeadStockAdvice([FromQuery] int days = 90, CancellationToken ct = default)
+    {
+        try
+        {
+            if (days is < 7 or > 730) days = 90;
+            var today = Today();
+            var since = today.AddDays(-days);
+
+            /* Sold quantity in the window, per product, alongside what is
+               sitting on the shelf and what it cost. */
+            var soldSince = await _db.SalesInvoiceItems.AsNoTracking()
+                .Where(l => l.Invoice.Status.StatusKey != "CANCELLED" && l.Invoice.InvoiceDate >= since)
+                .GroupBy(l => l.ProductId)
+                .Select(g => new { productId = g.Key, qty = g.Sum(x => x.Quantity), lastSold = g.Max(x => x.Invoice.InvoiceDate) })
+                .ToListAsync();
+
+            var soldMap = soldSince.ToDictionary(x => x.productId);
+
+            var products = await _db.Products.AsNoTracking()
+                .Where(p => p.IsActive)
+                .Select(p => new
+                {
+                    id = p.ProductId,
+                    sku = p.Sku,
+                    name = p.ProductName,
+                    brand = p.Brand.BrandName,
+                    cost = p.CostPrice,
+                    price = p.SalePrice,
+                    onHand = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
+                })
+                .ToListAsync();
+
+            var dead = products
+                .Where(p => p.onHand > 0)
+                .Select(p => new
+                {
+                    p.id, p.sku, p.name, p.brand, p.cost, p.price, p.onHand,
+                    soldInWindow = soldMap.TryGetValue(p.id, out var srec) ? srec.qty : 0,
+                    lastSold = soldMap.TryGetValue(p.id, out var lrec) ? lrec.lastSold : (DateOnly?)null,
+                    cashTiedUp = p.onHand * p.cost,
+                    marginPercent = p.price > 0 ? Math.Round((p.price - p.cost) / p.price * 100, 1) : 0m
+                })
+                .Where(p => p.soldInWindow == 0)
+                .OrderByDescending(p => p.cashTiedUp)
+                .Take(20)
+                .ToList();
+
+            var facts = JsonSerializer.Serialize(new
+            {
+                windowDays = days,
+                asOf = today,
+                deadCount = dead.Count,
+                totalCashTiedUp = dead.Sum(p => p.cashTiedUp),
+                items = dead
+            }, ExportJson);
+
+            var advice = await _ai.ExplainAsync(
+                $"These products have not sold at all in {days} days but stock is still sitting " +
+                "on the shelf, with money in it.\n\n" +
+                "For each of the top items give ONE line: the product, how much cash is stuck in " +
+                "it, and what to do -- a specific discount percentage, what to bundle it with, " +
+                "or send it back to the supplier. Use the margin figure to decide how much " +
+                "discount is even possible without a loss.\n\n" +
+                "Finish with one sentence giving the total amount of cash that would be freed.",
+                facts, ct);
+
+            return Ok(new
+            {
+                windowDays = days,
+                asOf = today,
+                deadCount = dead.Count,
+                totalCashTiedUp = dead.Sum(p => p.cashTiedUp),
+                items = dead,
+                advice,
+                aiAvailable = _ai.IsConfigured,
+                disclaimer = "Suggestions written by AI from the figures above. Check them before acting."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "advise on the dead stock");
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════
     //  ROLE DASHBOARDS
     // ══════════════════════════════════════════════════════════════════

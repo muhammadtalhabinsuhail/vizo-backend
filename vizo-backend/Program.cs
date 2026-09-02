@@ -193,6 +193,26 @@ if (missingSecrets.Count > 0)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 
+/* ─────────────────────────── AI ────────────────────────────────
+   One client, server-side only. It never calculates -- it reads numbers the
+   database already worked out and puts them into a sentence. See
+   Services/GeminiClient.cs for why that separation matters. */
+builder.Services.AddHttpClient();
+builder.Services.AddScoped<vizo_backend.Services.GeminiClient>();
+
+/* ─────────────────────────── Notifications ─────────────────────────
+   Writes the bell row and, best effort, pushes to the person's browsers.
+   Every trigger point in the app goes through this one class -- see
+   Services/PushNotificationService.cs for why a failure here must never fail
+   the request that caused it. */
+builder.Services.AddScoped<vizo_backend.Services.PushNotificationService>();
+
+/* Once a night: the low-stock digest and the anomaly check. The deviation
+   arithmetic is done here, not by a model -- see NightlyInsightsService for
+   why asking an AI "is anything wrong" every night produces something wrong
+   every night. */
+builder.Services.AddHostedService<vizo_backend.Services.NightlyInsightsService>();
+
 /* ─────────────────────────── Controllers ───────────────────────── */
 builder.Services.AddControllers()
     .AddJsonOptions(o =>

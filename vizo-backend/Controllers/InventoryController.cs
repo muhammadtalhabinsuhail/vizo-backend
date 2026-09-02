@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Documents;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -24,9 +25,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "BackOffice")]
 public class InventoryController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public InventoryController(AppDbContext db, IConfiguration cfg,
-        ILogger<InventoryController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<InventoryController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     // ══════════════════════════════════════════════════════════════════
     //  PRODUCTS
@@ -1011,6 +1015,17 @@ public class InventoryController : ApiControllerBase
                either way and the PDF can be rebuilt from the row. */
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "stock-adjustment", adj.AdjustmentId, CurrentUserId());
 
+            /* -- D6 -- ALWAYS reaches Admin, and marked severe.
+               Writing stock up or down is the easiest way to cover a theft, so
+               this is one of the few that is allowed to buzz a phone. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.StockAdjusted,
+                $"Stock corrected by {CurrentUserName()}",
+                $"{adj.AdjustmentNo} -- {moved} {(moved == 1 ? "line" : "lines")} changed.",
+                url: $"/inventory/adjustments/{adj.AdjustmentId}",
+                severe: true);
+
             return Ok(new
             {
                 id = adj.AdjustmentId,
@@ -1131,6 +1146,30 @@ public class InventoryController : ApiControllerBase
                either way and the PDF can be rebuilt from the row. */
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "stock-transfer", tr.TransferId, CurrentUserId());
 
+            /* -- A3 and A4 together --
+               The mapped flow treats "stock requested" and "stock sent" as two
+               separate events with two different audiences. This action is both
+               at once: creating a transfer moves the stock out of the source in
+               the same call. Separating them needs a status on StockTransfer
+               that distinguishes raised from sent, which is a schema change, so
+               one notification carries both facts rather than inventing a
+               "sent" event that did not happen independently. */
+            var locNames = await _db.Locations.AsNoTracking()
+                .Where(l => l.LocationId == body.FromLocationId || l.LocationId == body.ToLocationId)
+                .ToDictionaryAsync(l => l.LocationId, l => l.LocationName);
+            var fromName = locNames.GetValueOrDefault(body.FromLocationId, "a location");
+            var toName = locNames.GetValueOrDefault(body.ToLocationId, "a location");
+            var lineCount = body.Lines.Count;
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "order-dept" },
+                NotificationKinds.TransferSent,
+                $"Stock sent by {CurrentUserName()}",
+                $"{tr.TransferNo} -- {fromName} to {toName}, {lineCount} " +
+                $"{(lineCount == 1 ? "item" : "items")} now in transit.",
+                url: $"/inventory/transfers/{tr.TransferId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new
             {
                 id = tr.TransferId,
@@ -1203,6 +1242,16 @@ public class InventoryController : ApiControllerBase
             await tx.CommitAsync();
 
             await Log("TRANSFER_RECEIVED", "StockTransfer", tr.TransferNo, null, 2);
+
+            /* -- A5 -- whoever sent it is waiting to hear it arrived. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "order-dept" },
+                NotificationKinds.TransferReceived,
+                $"Stock received by {CurrentUserName()}",
+                $"{tr.TransferNo} has arrived and is on the shelf.",
+                url: $"/inventory/transfers/{tr.TransferId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id, message = $"{tr.TransferNo} received. Stock is now on the destination shelf." });
         }
         catch (Exception ex)

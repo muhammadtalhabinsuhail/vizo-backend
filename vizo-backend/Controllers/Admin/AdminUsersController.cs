@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers.Admin;
 
@@ -24,8 +25,11 @@ namespace vizo_backend.Controllers.Admin;
 [Authorize(Policy = "SuperAdmin")]
 public class AdminUsersController : AdminControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public AdminUsersController(AppDbContext db, IConfiguration cfg, ILogger<AdminUsersController> logger,
-        IWebHostEnvironment env) : base(db, cfg, logger, env) { }
+        IWebHostEnvironment env, PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
 
     // ══════════════════════════════════════════════════════════════════
@@ -226,6 +230,16 @@ public class AdminUsersController : AdminControllerBase
             await _db.SaveChangesAsync();
             await Log("CREATED", "User", user.Email ?? user.FullName, $"{role.RoleName} account created", 1);
 
+            /* -- F1 -- other admins only. Somebody gaining access to the system
+               is an admin's business and nobody else's. */
+            await _push.NotifyRoleAsync(
+                "super-admin",
+                NotificationKinds.UserChanged,
+                $"User added by {CurrentUserName()}",
+                $"{user.FullName} -- {role.RoleName}.",
+                url: $"/admin/users/{user.UserId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id = user.UserId, message = $"{user.FullName} added." });
         }
         catch (Exception ex)
@@ -291,6 +305,17 @@ public class AdminUsersController : AdminControllerBase
             await _db.SaveChangesAsync();
             await Log("UPDATED", "User", user.Email ?? user.FullName,
                       body.Value ? "Account activated" : "Account deactivated", 3);
+
+            /* -- F1 -- deactivating somebody is the half of this that matters:
+               it is how access is taken away, and it should be visible. */
+            await _push.NotifyRoleAsync(
+                "super-admin",
+                NotificationKinds.UserChanged,
+                $"User {(body.Value ? "activated" : "deactivated")} by {CurrentUserName()}",
+                $"{user.FullName}'s account was {(body.Value ? "activated" : "deactivated")}.",
+                url: $"/admin/users/{user.UserId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { message = body.Value ? "Account activated." : "Account deactivated." });
         }
         catch (Exception ex)

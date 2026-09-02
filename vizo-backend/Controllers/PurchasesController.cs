@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Documents;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -32,9 +33,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "BackOffice")]
 public class PurchasesController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public PurchasesController(AppDbContext db, IConfiguration cfg,
-        ILogger<PurchasesController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<PurchasesController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     // ══════════════════════════════════════════════════════════════════
     //  PURCHASE ORDERS
@@ -805,6 +809,16 @@ public class PurchasesController : ApiControllerBase
                either way and the PDF can be rebuilt from the row. */
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-order", po.PoId, CurrentUserId());
 
+            /* -- D1 -- money about to leave the business, so Accounts is told
+               at the point it is proposed rather than when the bill lands. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.PoCreated,
+                $"Purchase order raised by {CurrentUserName()}",
+                $"{po.PoNo} -- PKR {po.TotalAmount:N0}. Needs approval.",
+                url: $"/purchases/orders/{po.PoId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id = po.PoId, poNo = po.PoNo, message = $"Purchase order {po.PoNo} saved." });
         }
         catch (Exception ex)
@@ -838,6 +852,16 @@ public class PurchasesController : ApiControllerBase
             po.ApprovedByUserId = me.Value;
             await _db.SaveChangesAsync();
             await Log("PO_APPROVED", "PurchaseOrder", po.PoNo, $"{po.TotalAmount:N0}", 2);
+
+            /* -- D2 -- the order department is waiting for this before they can
+               send anything to the supplier. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant", "order-dept" },
+                NotificationKinds.PoApproved,
+                $"Purchase order approved by {CurrentUserName()}",
+                $"{po.PoNo} -- PKR {po.TotalAmount:N0}. It can go to the supplier.",
+                url: $"/purchases/orders/{po.PoId}",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{po.PoNo} approved." });
         }
@@ -977,6 +1001,16 @@ public class PurchasesController : ApiControllerBase
                either way and the PDF can be rebuilt from the row. */
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "goods-receipt", grn.GrnId, CurrentUserId());
 
+            /* -- D3 -- stock has physically arrived, so the order department
+               can start promising it and Accounts can expect a bill. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant", "order-dept" },
+                NotificationKinds.GrnCreated,
+                $"Goods received by {CurrentUserName()}",
+                $"{grn.GrnNo} -- PKR {grn.TotalValue:N0} of stock is in.",
+                url: $"/purchases/grns/{grn.GrnId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id = grn.GrnId, grnNo = grn.GrnNo, message = $"{grn.GrnNo} received and stock updated." });
         }
         catch (Exception ex)
@@ -1067,6 +1101,15 @@ public class PurchasesController : ApiControllerBase
                failure here is logged and swallowed -- the document is saved
                either way and the PDF can be rebuilt from the row. */
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-invoice", pi.PiId, CurrentUserId());
+
+            /* -- D4 -- */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.PurchaseInvoice,
+                $"Supplier bill entered by {CurrentUserName()}",
+                $"{pi.InvoiceNo} -- PKR {pi.TotalAmount:N0}, due {pi.DueDate:dd MMM yyyy}.",
+                url: $"/purchases/invoices/{pi.PiId}",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id = pi.PiId, invoiceNo = pi.InvoiceNo, message = $"Purchase invoice {pi.InvoiceNo} saved." });
         }
@@ -1166,6 +1209,19 @@ public class PurchasesController : ApiControllerBase
                failure here is logged and swallowed -- the document is saved
                either way and the PDF can be rebuilt from the row. */
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-return", pr.PrId, CurrentUserId());
+
+            /* -- D5 -- */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.PurchaseReturn,
+                $"Return to supplier by {CurrentUserName()}",
+                /* PurchaseReturn carries no total -- the value lives on its
+                   lines. Say what the row actually knows rather than compute a
+                   figure here that the return screen might disagree with. */
+                $"{pr.ReturnNo} -- {body.Lines.Count} " +
+                $"{(body.Lines.Count == 1 ? "line" : "lines")} going back. {pr.Reason}",
+                url: $"/purchases/returns/{pr.PrId}",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id = pr.PrId, returnNo = pr.ReturnNo, message = $"Purchase return {pr.ReturnNo} saved." });
         }

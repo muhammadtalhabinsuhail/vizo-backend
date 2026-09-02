@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -26,9 +27,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "OrderDept")]
 public class DispatchController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public DispatchController(AppDbContext db, IConfiguration cfg,
-        ILogger<DispatchController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<DispatchController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     // ══════════════════════════════════════════════════════════════════
     //  THE QUEUE
@@ -199,6 +203,19 @@ public class DispatchController : ApiControllerBase
 
             await Log("ORDER_DISPATCHED", "SalesOrder", order.OrderNo,
                 $"{channel.ChannelName}{(body.TrackingNo is null ? "" : $" / {body.TrackingNo}")}", 1);
+
+            /* -- A7 -- Accounts is included: a dispatch is the point a COD
+               order starts being money somebody has to chase. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "order-dept", "accountant" },
+                NotificationKinds.OrderDispatched,
+                $"Order dispatched by {CurrentUserName()}",
+                $"{order.OrderNo} has left via {channel.ChannelName}" +
+                (string.IsNullOrWhiteSpace(body.TrackingNo) ? "." : $", tracking {body.TrackingNo}."),
+                url: $"/delivery/{delivery.DeliveryId}",
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: order.SalesPersonUserId is null
+                    ? null : new[] { order.SalesPersonUserId.Value });
 
             return Ok(new
             {

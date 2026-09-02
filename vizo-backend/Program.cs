@@ -1,126 +1,28 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  CONFIGURATION -- the two files this project needs that are NOT in git
+//  CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════
 //
-//  Both files below are git-ignored because they carry live secrets: the Neon
-//  connection string, the JWT signing key, two Cloudinary API secrets and a
-//  Gmail app password. They are reproduced here in FULL STRUCTURE so whoever
-//  clones this repository knows exactly what to create and where.
+//  Backend settings, INCLUDING the credentials, live in
+//  vizo-backend/appsettings.json, which is committed to this repository. The
+//  Neon connection string, the JWT signing key, both Cloudinary API secrets,
+//  the Gmail app password and the VAPID pair are all in that file.
 //
-//  THE SECRET VALUES ARE REDACTED TO <PLACEHOLDERS>. This repository is PUBLIC.
-//  Committing the real ones here would publish a live database password, a JWT
-//  signing key and a Gmail app password to anybody who opens the page. Copy the
-//  real values from the running machine, or better, from user-secrets.
+//  Frontend variables live in vizo-erp/.env.local, which is NOT committed --
+//  copy vizo-erp/.env.example and fill it in. The only one that matters beyond
+//  the API URL is NEXT_PUBLIC_VAPID_PUBLIC_KEY, which must match
+//  VapidSettings:PublicKey in appsettings.json or push subscriptions are
+//  rejected when the server tries to use them.
 //
-//  NOTE: vizo-backend/appsettings.json is ALREADY COMMITTED to this repository
-//  with the real values in it, and they are in the git history. Redacting them
-//  here does not undo that. They need rotating -- see the README.
-//
-//  ROTATE THESE BEFORE THIS GOES ANYWHERE REAL, and move them to user-secrets:
-//      dotnet user-secrets set "ConnectionStrings:DefaultConnection" "..."
-//      dotnet user-secrets set "Jwt:Key" "..."
+//  Environment variables override appsettings.json where they are set, using
+//  the double-underscore form (ConnectionStrings__DefaultConnection). Nothing
+//  has to be set for the app to run.
 //
 //  ---------------------------------------------------------------------------
-//  1. backend/vizo-backend/appsettings.json
+//  CORS
 //  ---------------------------------------------------------------------------
 //
-//   {
-//     "Logging": {
-//       "LogLevel": {
-//         "Default": "Information",
-//         "Microsoft.AspNetCore": "Warning"
-//       }
-//     },
-//     "AllowedHosts": "*",
-//
-//     "ConnectionStrings": {
-//       "DefaultConnection": "Host=ep-rough-glitter-azbo8tb6.c-3.ap-southeast-1.aws.neon.tech;Database=neondb;Username=neondb_owner;Password=<NEON_PASSWORD>;SSL Mode=Require;Trust Server Certificate=true"
-//     },
-//
-//     "Jwt": {
-//       "Key": "<JWT_SIGNING_KEY -- 32+ random chars>",
-//       "Issuer": "AdvPOS.Api",
-//       "Audience": "AdvPOS.Web",
-//       "ExpiryMinutes": 480
-//     },
-//
-//     "Cors": {
-//       "AllowedOrigins": [ "http://localhost:3000", "https://localhost:3000", "https://www.vizo.com.pk" ]
-//     },
-//
-//     "PasswordReset": {
-//       "CodeExpiryMinutes": 30,
-//       "MaxAttempts": 5
-//     },
-//
-//     "CloudinaryImages": {
-//       "CloudName": "dzzuoem1w",
-//       "ApiKey": "266539435255924",
-//       "ApiSecret": "<CLOUDINARY_IMAGES_SECRET>",
-//       "Folder": "advpos/images"
-//     },
-//
-//     "CloudinaryPdfs": {
-//       "CloudName": "dve3ucdo",
-//       "ApiKey": "637964151696244",
-//       "ApiSecret": "<CLOUDINARY_PDFS_SECRET>",
-//       "Folder": "advpos/documents"
-//     },
-//
-//     "EmailSettings": {
-//       "SmtpHost": "smtp.gmail.com",
-//       "SmtpPort": 587,
-//       "SenderEmail": "muhammadtalhabinsuhail@gmail.com",
-//       "SenderPassword": "<GMAIL_APP_PASSWORD>",
-//       "SenderName": "AdvPOS",
-//       "AdminAlertEmail": "muhammadtalhabinsuhail@gmail.com"
-//     }
-//   }
-//
-//  ---------------------------------------------------------------------------
-//  2. vizo-erp/.env.local        (frontend)
-//  ---------------------------------------------------------------------------
-//
-//   # ─────────────────────────────────────────────────────────────────────────────
-//   # AdvPOS frontend environment
-//   #
-//   # NEXT_PUBLIC_ is required: these values are read in the browser by the axios
-//   # calls that live inside the page components. Nothing secret belongs here --
-//   # anything with this prefix ships in the client bundle.
-//   #
-//   # Change API_BASE_URL for each environment and nothing else has to move.
-//   #
-//   # HTTPS on 7177 is the "https" profile in
-//   # backend/vizo-backend/Properties/launchSettings.json. The browser must trust
-//   # the ASP.NET dev certificate or every request fails as a network error with
-//   # nothing in the console: run `dotnet dev-certs https --trust` once.
-//   # ─────────────────────────────────────────────────────────────────────────────
-//
-//   NEXT_PUBLIC_API_BASE_URL=https://localhost:7177/api
-//
-//   # Names of the cookies the login page writes and src/proxy.ts reads.
-//   # Keep them in step with src/proxy.ts if you rename them.
-//   NEXT_PUBLIC_TOKEN_COOKIE=advpos_token
-//   NEXT_PUBLIC_ROLE_COOKIE=advpos_role
-//
-//  ---------------------------------------------------------------------------
-//  How the two line up
-//  ---------------------------------------------------------------------------
-//
-//  The API listens on https://localhost:7177 (the "https" profile in
-//  Properties/launchSettings.json) and the frontend points at
-//  https://localhost:7177/api. Change the port in ONE place and it must change
-//  in the other, or every request fails as a bare network error with nothing in
-//  the browser console to explain it.
-//
-//  The browser must also trust the ASP.NET development certificate, or the same
-//  silent failure happens on a fresh machine:
-//
-//      dotnet dev-certs https --trust
-//
-//  Cors:AllowedOrigins must contain the frontend's origin (http://localhost:3000).
-//  CORS is applied before authentication in the pipeline below -- get that order
-//  wrong and the browser's pre-flight OPTIONS gets a 401 before any CORS header
+//  Cors:AllowedOrigins must list the exact origin the browser sends, scheme and
+//  port included. A missing entry fails the preflight before any of this code
 //  is written, which looks exactly like a CORS bug and is not one.
 //
 // ═══════════════════════════════════════════════════════════════════════════
@@ -135,58 +37,16 @@ using vizo_backend.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
-/*  SECRETS -- NOTHING SECRET LIVES IN appsettings.json ANY MORE.
+/*  Configuration comes from appsettings.json.
 
-    It used to. The Neon connection string with its password, the JWT signing
-    key, both Cloudinary API secrets and the Gmail app password were all in a
-    file committed to a PUBLIC GitHub repository. Anyone could read them,
-    connect straight to the production database, or forge a valid login token.
+    The connection string, the JWT signing key, both Cloudinary API secrets, the
+    Gmail app password and the VAPID pair all live there, by the project owner's
+    decision.
 
-    Those keys are blank in appsettings.json now. The real values come from,
-    in order of precedence:
-
-      1. Environment variables -- production. Double-underscore form, e.g.
-         ConnectionStrings__DefaultConnection   Jwt__Key
-      2. User Secrets -- local development. Stored outside the repo folder
-         entirely, so it cannot be committed by accident:
-             dotnet user-secrets set "Jwt:Key" "..."
-      3. appsettings.json -- non-secret settings only
-
-    ASP.NET Core already layers these in that order, so no reading code had to
-    change; only the values moved.
-
-    The check below exists because a MISSING secret used to fail late and
-    quietly: an empty JWT key throws deep inside the token handler on the first
-    login, and an empty connection string fails on the first query. Both read as
-    "the app is broken" rather than "you did not set a secret".                */
-
-var requiredSecrets = new (string Key, string What)[]
-{
-    ("ConnectionStrings:DefaultConnection", "the Neon Postgres connection string"),
-    ("Jwt:Key",                             "the JWT signing key"),
-};
-
-var missingSecrets = requiredSecrets
-    .Where(x => string.IsNullOrWhiteSpace(builder.Configuration[x.Key]))
-    .ToList();
-
-if (missingSecrets.Count > 0)
-{
-    throw new InvalidOperationException(
-        "Missing configuration:"
-        + Environment.NewLine
-        + string.Join(Environment.NewLine, missingSecrets.Select(m => $"  {m.Key}   ({m.What})"))
-        + Environment.NewLine + Environment.NewLine
-        + "Local development:" + Environment.NewLine
-        + "  cd vizo-backend" + Environment.NewLine
-        + "  dotnet user-secrets set \"Jwt:Key\" \"<value>\"" + Environment.NewLine + Environment.NewLine
-        + "Production: set them as environment variables, with ':' replaced by '__',"
-        + Environment.NewLine
-        + "  e.g. ConnectionStrings__DefaultConnection" + Environment.NewLine + Environment.NewLine
-        + "See SETUP.md. Do NOT put them back in appsettings.json -- that file is"
-        + Environment.NewLine
-        + "committed to a public repository.");
-}
+    Environment variables still win where they are set -- ASP.NET Core layers
+    configuration that way by default, with the double-underscore form
+    (ConnectionStrings__DefaultConnection) -- so a deployment can override any
+    of it without editing the file. Nothing has to be set for the app to run. */
 
 
 /* ─────────────────────────── Database ─────────────────────────── */

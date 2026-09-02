@@ -5,7 +5,6 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>vizo_backend</RootNamespace>
-    <UserSecretsId>517192f5-22da-4887-9a26-11f89d9fb979</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>

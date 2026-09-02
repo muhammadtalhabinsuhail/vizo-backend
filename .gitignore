@@ -3,22 +3,5 @@ bin/
 obj/
 *.user
 
-# ─────────────────────────── Secrets ───────────────────────────
-#
-# This repository is PUBLIC. Nothing with a real credential in it may be
-# committed. appsettings.json stays tracked ON PURPOSE -- it documents the
-# shape of the config and every secret value in it is blank. Real values live
-# in User Secrets (local) or environment variables (production); see SETUP.md.
-#
-# The entries below are the files people reach for when they are in a hurry.
+# Local overrides only. appsettings.json itself IS committed, with its values.
 appsettings.Development.json
-appsettings.Local.json
-appsettings.*.Local.json
-secrets.json
-*.env
-.env
-.env.*
-
-# VAPID keys for Web Push, if anyone writes them to a file rather than secrets
-vapid*.json
-vapid*.txt

@@ -50,7 +50,9 @@ public class NotificationController : ControllerBase
                     title = n.Title,
                     body = n.Body,
                     createdAt = n.CreatedAt,
-                    isRead = n.IsRead
+                    isRead = n.IsRead,
+                    /* The page this row is about. Null rows are not clickable. */
+                    url = n.Url
                 })
                 .ToListAsync();
 
@@ -62,7 +64,7 @@ public class NotificationController : ControllerBase
         }
         catch (Exception ex)
         {
-            return Fail(ex, "load C:/Program Files/Git/api/notification");
+            return Fail(ex, "load your notifications");
         }
     }
 

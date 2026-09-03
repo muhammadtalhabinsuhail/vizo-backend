@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Documents;
 using vizo_backend.Models;
+using vizo_backend.Services;
 
 namespace vizo_backend.Controllers;
 
@@ -25,9 +26,12 @@ namespace vizo_backend.Controllers;
 [Authorize(Policy = "Staff")]
 public class PartiesController : ApiControllerBase
 {
+    private readonly PushNotificationService _push;
+
     public PartiesController(AppDbContext db, IConfiguration cfg,
-        ILogger<PartiesController> logger, IWebHostEnvironment env)
-        : base(db, cfg, logger, env) { }
+        ILogger<PartiesController> logger, IWebHostEnvironment env,
+        PushNotificationService push)
+        : base(db, cfg, logger, env) => _push = push;
 
     /* TRAP: Party.SalesPersonUserId is a foreign key to "Employee", NOT to
        "User" -- so the navigation is an Employee and the name lives one hop
@@ -538,6 +542,17 @@ public class PartiesController : ApiControllerBase
             await Log("PARTY_CREATED", "Party", body.PartyCode,
                 $"{body.LegalName} ({body.Type})", 1);
 
+            /* Opening an account is the owner's business -- it is where a
+               credit limit starts. Named, with the account on the line and a
+               link straight to it. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.PartyAdded,
+                $"Account opened by {CurrentUserName()}",
+                $"{body.LegalName} ({body.PartyCode}) was added as a {body.Type?.ToLowerInvariant() ?? "customer"}.",
+                url: $"/parties/{user.UserId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new
             {
                 id = user.UserId,
@@ -596,6 +611,14 @@ public class PartiesController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("PARTY_UPDATED", "Party", party.PartyCode, body.LegalName, 1);
 
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.PartyChanged,
+                $"Account edited by {CurrentUserName()}",
+                $"{body.LegalName} ({party.PartyCode}) was changed.",
+                url: $"/parties/{id}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id, message = $"{body.LegalName} saved." });
         }
         catch (Exception ex)
@@ -617,6 +640,17 @@ public class PartiesController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log(body.Value ? "PARTY_ACTIVATED" : "PARTY_DEACTIVATED",
                 "Party", id.ToString(), user.FullName, 2);
+
+            /* Switching an account off stops it trading. Worth interrupting the
+               owner for, which is why this one is flagged severe. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.PartyChanged,
+                $"Account {(body.Value ? "reopened" : "closed")} by {CurrentUserName()}",
+                $"{user.FullName} was {(body.Value ? "switched back on" : "switched off and can no longer trade")}.",
+                url: $"/parties/{id}",
+                severe: !body.Value,
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, isActive = body.Value });
         }

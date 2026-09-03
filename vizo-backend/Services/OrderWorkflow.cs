@@ -9,11 +9,15 @@ namespace vizo_backend.Services;
 ///   2  SUBMITTED                sales sends it in           -> admin must decide
 ///   3  CONFIRMED                admin says yes              (or DECLINED)
 ///   4  INVOICED                 sales OR admin bills it
-///   5  TO_ORDER_DEPT            warehouse keeper has the stock moving
-///   6  AT_ORDER_DEPT            order dept has it in hand
-///   7  PACKAGING                order dept is packing it
-///   8  DISPATCHED               order dept sends it out
-///   9  DELIVERED                sales confirms it arrived
+///   5  SEEN_BY_WAREHOUSE        warehouse keeper has picked it up
+///   6  TO_ORDER_DEPT            warehouse keeper has the stock moving
+///   7  AT_ORDER_DEPT            order dept has it in hand
+///   8  PACKAGING                order dept is packing it
+///   9  DISPATCHED               order dept sends it out
+///  10  DELIVERED                sales confirms it arrived
+///
+/// The warehouse keeper's two steps -- 5 and 6 -- open only once the order is
+/// INVOICED, and they are the only two moves that role will ever be offered.
 ///
 /// ─────────────────────────── AND WHO MOVES IT ──────────────────────────────
 ///
@@ -34,6 +38,7 @@ public static class OrderWorkflow
     public const string Confirmed    = "CONFIRMED";
     public const string Declined     = "DECLINED";
     public const string Invoiced     = "INVOICED";
+    public const string SeenByWarehouse = "SEEN_BY_WAREHOUSE";
     public const string ToOrderDept  = "TO_ORDER_DEPT";
     public const string AtOrderDept  = "AT_ORDER_DEPT";
     public const string Packaging    = "PACKAGING";
@@ -53,7 +58,7 @@ public static class OrderWorkflow
     /// <summary>The chain, in order. Step number is index + 1.</summary>
     public static readonly IReadOnlyList<string> Chain = new[]
     {
-        Draft, Submitted, Confirmed, Invoiced,
+        Draft, Submitted, Confirmed, Invoiced, SeenByWarehouse,
         ToOrderDept, AtOrderDept, Packaging, Dispatched, Delivered
     };
 
@@ -90,11 +95,17 @@ public static class OrderWorkflow
         // Billing it. The brief is explicit: sales OR admin, once confirmed.
         (Confirmed,   Invoiced,    new[] { RoleSales, RoleAdmin }),
 
-        // The warehouse keeper picks the stock and starts it moving. Allowed
-        // from either step: an order can be sent to the floor before the
-        // invoice is raised, and often is.
-        (Confirmed,   ToOrderDept, new[] { RoleWarehouse }),
-        (Invoiced,    ToOrderDept, new[] { RoleWarehouse }),
+        /* The warehouse keeper, and ONLY after the order has been invoiced.
+           Two moves, in order: acknowledge it, then send it. That is the whole
+           of what this role may do to an order -- AllowedTargets returns these
+           and nothing else, and the screen offers nothing else because it asks
+           this table rather than deciding for itself.
+
+           Deliberately NOT from CONFIRMED. Picking stock against an order the
+           office has not yet billed is how goods leave without an invoice
+           behind them. */
+        (Invoiced,        SeenByWarehouse, new[] { RoleWarehouse }),
+        (SeenByWarehouse, ToOrderDept,     new[] { RoleWarehouse }),
 
         // The order department takes it from there.
         (ToOrderDept, AtOrderDept, new[] { RoleOrderDept }),
@@ -208,6 +219,16 @@ public static class OrderWorkflow
                 $"Order invoiced by {actor}",
                 $"{orderNo} -- {customer} has been invoiced."),
 
+            /* The keeper has the order in hand. The owner wants to know work
+               has started; the rep wants to be able to tell the customer. The
+               rep is added by the caller through alsoUserIds. */
+            SeenByWarehouse => (NotificationKinds.OrderPacked,
+                new[] { RoleAdmin },
+                $"Order picked up by {actor}",
+                $"{orderNo} -- {customer}. The warehouse has it and is preparing the stock."),
+
+            /* This one the ORDER DEPARTMENT needs, because it is the moment
+               something starts heading towards them. */
             ToOrderDept => (NotificationKinds.TransferSent,
                 new[] { RoleAdmin, RoleOrderDept },
                 $"Stock sent by {actor}",

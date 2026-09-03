@@ -442,6 +442,16 @@ public class AccountingController : ApiControllerBase
             await Log(body.PostImmediately ? "JOURNAL_POSTED" : "JOURNAL_DRAFTED",
                 "JournalEntry", entry.EntryNo, $"{totalDebit:N2} over {body.Lines.Count} lines", 2);
 
+            /* Drafted or posted, the owner is told who wrote it. */
+            var wroteWhat = body.PostImmediately ? "posted" : "drafted";
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.JournalPosted,
+                $"Entry {wroteWhat} by {CurrentUserName()}",
+                $"{entry.EntryNo} -- PKR {totalDebit:N0} over {body.Lines.Count} lines.",
+                url: $"/accounting/journal-entries/{entry.EntryId}",
+                exceptUserId: CurrentUserId());
+
             /* The PDF exists the moment the document does. Print and Download
                then hand out the stored Cloudinary file rather than rendering a
                fresh one, so what is on screen is what is in the store. A
@@ -1319,6 +1329,15 @@ public class AccountingController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("PERIOD_REOPENED", "FiscalPeriod", period.PeriodName,
                       "Backdated postings allowed again", 3);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.PeriodChanged,
+                $"Period reopened by {CurrentUserName()}",
+                $"{period.PeriodName} is open again -- backdated postings are allowed.",
+                url: "/accounting/period-close",
+                severe: true,
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{period.PeriodName} reopened." });
         }
@@ -2566,6 +2585,14 @@ public class AccountingController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("EXPENSE_UPDATED", "Expense", e.ExpenseNo, $"{e.Amount:N2} to {e.VendorName}", 2);
 
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.ExpenseCreated,
+                $"Expense edited by {CurrentUserName()}",
+                $"{e.ExpenseNo} -- PKR {e.Amount:N0} to {e.VendorName}.",
+                url: $"/accounting/expenses/{e.ExpenseId}",
+                exceptUserId: CurrentUserId());
+
             /* The stored PDF is now out of date, so rebuild it rather than leave
                a document in the store that disagrees with the row. */
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
@@ -2594,6 +2621,15 @@ public class AccountingController : ApiControllerBase
             _db.Expenses.Remove(e);
             await _db.SaveChangesAsync();
             await Log("EXPENSE_DELETED", "Expense", no, $"{e.Amount:N2} to {e.VendorName}", 3);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.ExpenseReversed,
+                $"Expense deleted by {CurrentUserName()}",
+                $"{no} -- PKR {e.Amount:N0} to {e.VendorName} was removed.",
+                url: "/accounting/expenses",
+                severe: true,
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{no} deleted." });
         }
@@ -2958,6 +2994,14 @@ public class AccountingController : ApiControllerBase
             await Log(body.PostImmediately ? "JOURNAL_POSTED" : "JOURNAL_UPDATED",
                 "JournalEntry", entry.EntryNo, $"{total:N2} over {body.Lines.Count} lines", 2);
 
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.JournalPosted,
+                $"Entry edited by {CurrentUserName()}",
+                $"{entry.EntryNo} -- now PKR {total:N0} over {body.Lines.Count} lines.",
+                url: $"/accounting/journal-entries/{entry.EntryId}",
+                exceptUserId: CurrentUserId());
+
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "journal-entry", entry.EntryId, CurrentUserId());
 
             return Ok(new
@@ -3005,6 +3049,15 @@ public class AccountingController : ApiControllerBase
             _db.JournalEntries.Remove(entry);
             await _db.SaveChangesAsync();
             await Log("JOURNAL_DELETED", "JournalEntry", no, "draft discarded", 3);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.JournalReversed,
+                $"Draft entry deleted by {CurrentUserName()}",
+                $"{no} was discarded before it reached the ledger.",
+                url: "/accounting/journal-entries",
+                severe: true,
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{no} deleted." });
         }
@@ -3223,6 +3276,14 @@ public class AccountingController : ApiControllerBase
             await Log(body.PostImmediately ? "VOUCHER_POSTED" : "VOUCHER_UPDATED",
                 "Voucher", v.VoucherNo, $"{v.Amount:N2}", 2);
 
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.VoucherPosted,
+                $"Payment edited by {CurrentUserName()}",
+                $"{v.VoucherNo} -- PKR {v.Amount:N0}.",
+                url: $"/accounting/vouchers/{v.VoucherId}",
+                exceptUserId: CurrentUserId());
+
             await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "voucher", v.VoucherId, CurrentUserId());
 
             return Ok(new
@@ -3259,6 +3320,15 @@ public class AccountingController : ApiControllerBase
             _db.Vouchers.Remove(v);
             await _db.SaveChangesAsync();
             await Log("VOUCHER_DELETED", "Voucher", no, $"{v.Amount:N2} draft discarded", 3);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.VoucherCancelled,
+                $"Draft payment deleted by {CurrentUserName()}",
+                $"{no} -- PKR {v.Amount:N0} was discarded before posting.",
+                url: "/accounting/vouchers",
+                severe: true,
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{no} deleted." });
         }

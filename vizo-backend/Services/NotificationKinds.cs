@@ -60,6 +60,13 @@ public static class NotificationKinds
     public const string StockAdjusted      = "STOCK_ADJUSTED";
     public const string LowStock           = "LOW_STOCK";
 
+    /* The catalogue. A product appearing, changing price, or a category or
+       brand being added is somebody changing what the whole company sells --
+       the owner asked to be told, by name, who did it and to what. */
+    public const string ProductAdded       = "PRODUCT_ADDED";
+    public const string ProductChanged     = "PRODUCT_CHANGED";
+    public const string CatalogChanged     = "CATALOG_CHANGED";
+
     // ─────────────────────────── E. claims and delivery ────────────────────
     public const string ClaimCreated       = "CLAIM_CREATED";
     public const string ClaimSent          = "CLAIM_SENT";
@@ -67,6 +74,11 @@ public static class NotificationKinds
     public const string ClaimSettled       = "CLAIM_SETTLED";
 
     // ─────────────────────────── F. setup and security ─────────────────────
+    /* Customers and suppliers. A rep opening an account, or changing a
+       credit-relevant detail on one, is the owner's business. */
+    public const string PartyAdded         = "PARTY_ADDED";
+    public const string PartyChanged       = "PARTY_CHANGED";
+
     public const string UserChanged        = "USER_CHANGED";
     public const string RoleChanged        = "ROLE_CHANGED";
     public const string BackupDone         = "BACKUP_DONE";
@@ -110,6 +122,13 @@ public static class NotificationKinds
         new(TransferReceived,   "Stock", "Stock received",        "A stock transfer arrived."),
         new(StockAdjusted,      "Stock", "Stock corrected",       "Recorded stock was changed to match a count.", Severe: true),
         new(LowStock,           "Stock", "Running out",           "Items have fallen below their minimum. Sent once a day."),
+
+        new(ProductAdded,       "Catalogue", "Item added",        "Somebody put a new item in the catalogue."),
+        new(ProductChanged,     "Catalogue", "Item changed",      "An item's price, tax or details were edited."),
+        new(CatalogChanged,     "Catalogue", "Category or brand changed", "A category or brand was added, renamed or removed."),
+
+        new(PartyAdded,         "Customers", "Account opened",    "A customer or supplier account was created."),
+        new(PartyChanged,       "Customers", "Account changed",   "A customer or supplier's details were edited."),
 
         new(PoCreated,          "Purchasing", "Purchase order raised", "A purchase order needs approval."),
         new(PoApproved,         "Purchasing", "Purchase order approved", "A purchase order can go to the supplier."),

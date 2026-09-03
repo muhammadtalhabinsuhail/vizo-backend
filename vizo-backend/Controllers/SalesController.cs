@@ -371,6 +371,15 @@ public class SalesController : ApiControllerBase
         {
             /* One validator, shared with UpdateOrder. Two copies of the same
                rules is two sets of rules the day somebody edits one. */
+            /* The keeper reads orders and moves two steps. They do not write
+               one. Refused here rather than merely hidden on the screen,
+               because a hidden button is not a rule. */
+            if (CurrentRole() == OrderWorkflow.RoleWarehouse)
+                return StatusCode(403, new
+                {
+                    message = "The warehouse does not take orders. Sales or the order desk raises one."
+                });
+
             var invalidOrder = await ValidateOrderRequest(body);
             if (invalidOrder is not null) return BadRequest(new { message = invalidOrder });
 
@@ -1217,7 +1226,12 @@ public class SalesController : ApiControllerBase
                 canDelete = (isAdmin || Granted("DELETE")) && !invoiced,
                 editRequested = Asked("EDIT"),
                 deleteRequested = Asked("DELETE"),
-                canAsk = !isAdmin && mine,
+                /* Only a SALESPERSON applies for permission. The warehouse
+                   keeper and the order desk are not being kept from editing an
+                   order pending approval -- editing is simply not part of
+                   either job, so offering them a button that asks for it is
+                   offering something that will never be granted. */
+                canAsk = role == OrderWorkflow.RoleSales && mine,
                 invoiced
             });
         }
@@ -1349,7 +1363,11 @@ public class SalesController : ApiControllerBase
     {
         try
         {
-            var ready = new[] { OrderWorkflow.Confirmed, OrderWorkflow.Invoiced };
+            /* Invoiced, and anything the keeper has already acknowledged but
+               not yet sent. Not CONFIRMED any more: picking stock against an
+               order the office has not billed is how goods leave with no
+               invoice behind them. */
+            var ready = new[] { OrderWorkflow.Invoiced, OrderWorkflow.SeenByWarehouse };
 
             var rows = _db.SalesOrders.AsNoTracking()
                 .Where(o => ready.Contains(o.Status.StatusKey));
@@ -1377,6 +1395,12 @@ public class SalesController : ApiControllerBase
                     invoiceNo = _db.SalesInvoices
                         .Where(i => i.OrderId == o.OrderId)
                         .Select(i => i.InvoiceNo).FirstOrDefault(),
+                    /* The keeper is told to check the bill against what they
+                       are picking, so the invoice has to be reachable from the
+                       queue rather than two screens away. */
+                    invoiceId = _db.SalesInvoices
+                        .Where(i => i.OrderId == o.OrderId)
+                        .Select(i => (int?)i.InvoiceId).FirstOrDefault(),
                     lines = o.SalesOrderItems.OrderBy(l => l.LineNo).Select(l => new
                     {
                         productId = l.ProductId,

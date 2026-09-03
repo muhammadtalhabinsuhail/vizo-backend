@@ -129,7 +129,14 @@ public class PushNotificationService
                     SeverityId = severe ? SeverityDanger : SeverityInfo,
                     Icon = "bell",
                     Title = Truncate(title, 120),
-                    Body = Truncate(body, 400),
+                    /* 300, not 400. The column is VARCHAR(300); the old figure
+                       was wrong and a long body threw on the way in -- silently,
+                       because this class swallows its own failures. */
+                    Body = Truncate(body, 300),
+                    /* Where the bell sends you when the row is clicked. Every
+                       call site already passes this; until now only Web Push
+                       ever saw it. */
+                    Url = TruncateOrNull(url, 300),
                     CreatedAt = Now(),
                     IsRead = false
                 };
@@ -345,4 +352,11 @@ public class PushNotificationService
 
     private static string Truncate(string s, int max) =>
         string.IsNullOrEmpty(s) || s.Length <= max ? s : s[..(max - 1)] + "…";
+
+    /* Same, for the nullable url. A null stays null -- the bell reads that as
+       "nothing to open" rather than as an empty link. Named differently rather
+       than overloaded, because nullability alone does not distinguish an
+       overload to the compiler. */
+    private static string? TruncateOrNull(string? s, int max) =>
+        s is null ? null : Truncate(s, max);
 }

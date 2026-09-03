@@ -138,6 +138,15 @@ public partial class AppDbContext
             entity.Property(e => e.ConfirmRemindedAt).HasColumnType("timestamp without time zone");
         });
 
+        /* "Notification"."Url" -- added in 16_warehouse_and_notification_links.sql
+           so a row in the bell can be clicked through to the thing it is about.
+           Declared here rather than in the scaffolded context because that file
+           is regenerated from the database and would lose it. */
+        modelBuilder.Entity<Notification>(entity =>
+        {
+            entity.Property(e => e.Url).HasColumnName("Url").HasMaxLength(300);
+        });
+
         modelBuilder.Entity<OrderChangeRequest>(entity =>
         {
             entity.HasKey(e => e.RequestId).HasName("OrderChangeRequest_pkey");

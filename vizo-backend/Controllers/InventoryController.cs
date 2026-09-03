@@ -222,6 +222,19 @@ public class InventoryController : ApiControllerBase
             await tx.CommitAsync();
 
             await Log("PRODUCT_CREATED", "Product", product.Sku, product.ProductName, 1);
+
+            /* The owner asked to be told, by name, who added what: "Talha added
+               a new product" with the product on the line. Clicking it opens
+               the item. */
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.ProductAdded,
+                $"New item added by {CurrentUserName()}",
+                $"{product.ProductName} ({product.Sku}) is now in the catalogue" +
+                (product.SalePrice > 0 ? $" at PKR {product.SalePrice:N0}." : "."),
+                url: $"/inventory/products/{product.ProductId}",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id = product.ProductId, message = $"{product.ProductName} added." });
         }
         catch (Exception ex)
@@ -269,6 +282,15 @@ public class InventoryController : ApiControllerBase
 
             await _db.SaveChangesAsync();
             await Log("PRODUCT_UPDATED", "Product", product.Sku, product.ProductName, 1);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.ProductChanged,
+                $"Item edited by {CurrentUserName()}",
+                $"{product.ProductName} ({product.Sku}) was changed" +
+                (product.SalePrice > 0 ? $" -- now PKR {product.SalePrice:N0}." : "."),
+                url: $"/inventory/products/{product.ProductId}",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{product.ProductName} saved." });
         }
@@ -328,6 +350,14 @@ public class InventoryController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("CATEGORY_CREATED", "Category", c.CategoryId.ToString(), name, 1);
 
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.CatalogChanged,
+                $"Catalogue changed by {CurrentUserName()}",
+                $"Category {name} was added.",
+                url: "/inventory/categories",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id = c.CategoryId, message = $"{name} added." });
         }
         catch (Exception ex)
@@ -353,6 +383,14 @@ public class InventoryController : ApiControllerBase
             c.IsActive = body.IsActive;
             await _db.SaveChangesAsync();
             await Log("CATEGORY_UPDATED", "Category", id.ToString(), c.CategoryName, 1);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.CatalogChanged,
+                $"Catalogue changed by {CurrentUserName()}",
+                $"Category {c.CategoryName} was renamed or edited.",
+                url: "/inventory/categories",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{c.CategoryName} saved." });
         }
@@ -411,6 +449,14 @@ public class InventoryController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("BRAND_CREATED", "Brand", code, b.BrandName, 1);
 
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.CatalogChanged,
+                $"Catalogue changed by {CurrentUserName()}",
+                $"Brand {b.BrandName} was added.",
+                url: "/inventory/brands",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id = b.BrandId, message = $"{b.BrandName} added." });
         }
         catch (Exception ex)
@@ -439,6 +485,14 @@ public class InventoryController : ApiControllerBase
             b.IsActive = body.IsActive;
             await _db.SaveChangesAsync();
             await Log("BRAND_UPDATED", "Brand", code, b.BrandName, 1);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.CatalogChanged,
+                $"Catalogue changed by {CurrentUserName()}",
+                $"Brand {b.BrandName} was renamed or edited.",
+                url: "/inventory/brands",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{b.BrandName} saved." });
         }
@@ -482,6 +536,14 @@ public class InventoryController : ApiControllerBase
             await _db.SaveChangesAsync();
             await Log("CATEGORY_DELETED", "Category", id.ToString(), name, 3);
 
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.CatalogChanged,
+                $"Catalogue changed by {CurrentUserName()}",
+                $"Category {name} was deleted.",
+                url: "/inventory/categories",
+                exceptUserId: CurrentUserId());
+
             return Ok(new { id, message = $"{name} deleted." });
         }
         catch (Exception ex)
@@ -511,6 +573,14 @@ public class InventoryController : ApiControllerBase
             _db.Brands.Remove(b);
             await _db.SaveChangesAsync();
             await Log("BRAND_DELETED", "Brand", id.ToString(), name, 3);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin" },
+                NotificationKinds.CatalogChanged,
+                $"Catalogue changed by {CurrentUserName()}",
+                $"Brand {name} was deleted.",
+                url: "/inventory/brands",
+                exceptUserId: CurrentUserId());
 
             return Ok(new { id, message = $"{name} deleted." });
         }

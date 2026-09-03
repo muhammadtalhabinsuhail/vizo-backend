@@ -2178,7 +2178,7 @@ public class ReportsController : ApiControllerBase
         var company = await LetterHead();
         var cur = company.CurrencySymbol;
 
-        var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmm", CultureInfo.InvariantCulture);
+        var stamp = Now().ToString("yyyyMMdd-HHmm", CultureInfo.InvariantCulture);
 
         return key.ToLowerInvariant() switch
         {

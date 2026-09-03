@@ -44,7 +44,7 @@ public static class DocumentArchive
         byte[] pdf, int userId, string subFolder)
     {
         var stored = await PdfStore.UploadAsync(cfg, pdf, fileName, subFolder);
-        var now = DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Unspecified);
+        var now = vizo_backend.Services.BusinessClock.Now();
 
         var row = await db.DocumentFiles
             .FirstOrDefaultAsync(f => f.DocKind == docKind && f.DocKey == docKey);

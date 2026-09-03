@@ -67,6 +67,18 @@ public class SalesController : ApiControllerBase
 
             var rows = _db.SalesOrders.AsNoTracking().AsQueryable();
 
+            /* A salesperson sees THEIR OWN work and nothing else.
+
+               This is not a convenience -- it is the rule. Giving the Sales role
+               the right to handle returns must not turn into the right to read
+               every other rep's customers and prices. Accounts and the admin
+               see everything, because reconciling the books needs everything. */
+            if (CurrentRole() == OrderWorkflow.RoleSales)
+            {
+                var me = CurrentUserId();
+                rows = rows.Where(o => o.SalesPersonUserId == me || o.CreatedByUserId == me);
+            }
+
             if (!string.IsNullOrWhiteSpace(status))
                 rows = rows.Where(o => o.Status.StatusKey == status);
             if (customerId is not null)
@@ -166,11 +178,54 @@ public class SalesController : ApiControllerBase
     /// number, which means an order nobody has touched shows one entry rather
     /// than seven imaginary ones.
     /// </summary>
+    // ==================================================================
+    //  WHO SEES WHAT
+    // ==================================================================
+
+    /// <summary>
+    /// The user id a salesperson's view must be narrowed to, or null when the
+    /// caller is entitled to the whole book.
+    ///
+    /// The rule, in the words it was asked for: a rep sees the orders they
+    /// created and nothing else. Accounts and the Super Admin see everything,
+    /// because you cannot reconcile a ledger through a keyhole.
+    ///
+    /// Note this is deliberately about the ROLE, not the permission. Giving
+    /// Sales the right to handle returns opens the returns screen to them; it
+    /// does not turn them into an accountant.
+    /// </summary>
+    private int? SalesScopeUserId() =>
+        CurrentRole() == OrderWorkflow.RoleSales ? CurrentUserId() : null;
+
+    /// <summary>
+    /// May the caller open this invoice? Used by the endpoints that take an id
+    /// straight off the URL -- a list that hides a row does not stop somebody
+    /// asking for that row by number.
+    /// </summary>
+    private async Task<bool> MaySeeInvoice(int invoiceId)
+    {
+        var me = SalesScopeUserId();
+        if (me is null) return true;
+
+        return await _db.SalesInvoices.AsNoTracking().AnyAsync(i =>
+            i.InvoiceId == invoiceId &&
+            (i.CreatedByUserId == me ||
+             (i.Order != null && i.Order.SalesPersonUserId == me)));
+    }
+
+    private static ObjectResult NotYours(string what) =>
+        new ObjectResult(new { message = $"This {what} was not created by you." }) { StatusCode = 403 };
+
     [HttpGet("orders/{id:int}")]
     public async Task<IActionResult> GetOrder(int id)
     {
         try
         {
+            var me = SalesScopeUserId();
+            if (me is not null && !await _db.SalesOrders.AsNoTracking().AnyAsync(x =>
+                    x.OrderId == id && (x.SalesPersonUserId == me || x.CreatedByUserId == me)))
+                return NotYours("order");
+
             var o = await _db.SalesOrders.AsNoTracking()
                 .Where(x => x.OrderId == id)
                 .Select(x => new
@@ -314,26 +369,18 @@ public class SalesController : ApiControllerBase
     {
         try
         {
-            if (body.Lines is null || body.Lines.Count == 0)
-                return BadRequest(new { message = "An order needs at least one line." });
-            if (!await _db.Parties.AnyAsync(p => p.UserId == body.CustomerId))
-                return BadRequest(new { message = "Pick a valid customer." });
-            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
-                return BadRequest(new { message = "Pick a valid location." });
-            if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
-                return BadRequest(new { message = "Pick a valid payment method." });
+            /* One validator, shared with UpdateOrder. Two copies of the same
+               rules is two sets of rules the day somebody edits one. */
+            var invalidOrder = await ValidateOrderRequest(body);
+            if (invalidOrder is not null) return BadRequest(new { message = invalidOrder });
 
-            foreach (var l in body.Lines)
-            {
-                if (l.Qty <= 0) return BadRequest(new { message = "Every line needs a quantity above zero." });
-                if (l.Rate < 0) return BadRequest(new { message = "A rate cannot be negative." });
-                if (l.DiscountPercent is < 0 or > 100)
-                    return BadRequest(new { message = "A line discount must be between 0 and 100 percent." });
-                if (l.TaxPercent is < 0 or > 100)
-                    return BadRequest(new { message = "A line tax rate must be between 0 and 100 percent." });
-                if (!await _db.Products.AnyAsync(p => p.ProductId == l.ProductId))
-                    return BadRequest(new { message = $"Product {l.ProductId} does not exist." });
-            }
+            /* The chain is: sales writes it, the Super Admin confirms it, and
+               only then is it billed. A rep ticking "invoice it too" would step
+               straight over the confirmation, so for that role the tick is
+               ignored and the reply says so. The admin and the order desk can
+               still bill on the spot, which is what the counter needs. */
+            var raiseInvoice = body.RaiseInvoice && CurrentRole() != OrderWorkflow.RoleSales;
+            var invoiceRefused = body.RaiseInvoice && !raiseInvoice;
 
             var (subtotal, discount, tax, total) = Totals(body.Lines);
 
@@ -394,6 +441,15 @@ public class SalesController : ApiControllerBase
 
             var order = await SaveOrder(body, statusId, subtotal, discount, tax, total, holdReason);
 
+            /* Starts the six-hourly nudge running. The notification a few lines
+               below is reminder number one; ConfirmReminderService picks it up
+               from here. */
+            if (!overLimit)
+            {
+                order.ConfirmRemindedAt = Now();
+                await _db.SaveChangesAsync();
+            }
+
             await Log(overLimit ? "ORDER_CREATED_ON_HOLD" : "ORDER_CREATED",
                 "SalesOrder", order.OrderNo,
                 $"{body.Lines.Count} lines, {total:N0}", overLimit ? 2 : 1);
@@ -402,7 +458,7 @@ public class SalesController : ApiControllerBase
                is the whole point of the hold -- so it is only cut when the
                order went through clean. */
             SalesInvoice? invoice = null;
-            if (body.RaiseInvoice && !overLimit)
+            if (raiseInvoice && !overLimit)
             {
                 invoice = await RaiseInvoiceForOrder(order, body.Lines, body.MethodId, body.DueDate);
                 await Log("INVOICE_CREATED", "SalesInvoice", invoice.InvoiceNo,
@@ -471,7 +527,9 @@ public class SalesController : ApiControllerBase
                     ? $"Order {order.OrderNo} saved on credit hold -- it needs the owner's approval."
                     : invoice is not null
                         ? $"Order {order.OrderNo} saved and invoiced as {invoice.InvoiceNo}."
-                        : $"Order {order.OrderNo} saved."
+                        : invoiceRefused
+                            ? $"Order {order.OrderNo} submitted. It can be invoiced once the owner confirms it."
+                            : $"Order {order.OrderNo} saved."
             });
         }
         catch (Exception ex)
@@ -484,6 +542,36 @@ public class SalesController : ApiControllerBase
     /// Writes the order header and its lines inside one transaction. Shared by
     /// the draft path and the live path so the two can never drift.
     /// </summary>
+    /// <summary>
+    /// The checks an order has to pass, whether it is being created or edited.
+    /// Returns the message to refuse with, or null when it is sound.
+    /// </summary>
+    private async Task<string?> ValidateOrderRequest(OrderRequest body)
+    {
+        if (body.Lines is null || body.Lines.Count == 0)
+            return "An order needs at least one line.";
+        if (!await _db.Parties.AnyAsync(p => p.UserId == body.CustomerId))
+            return "Pick a valid customer.";
+        if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+            return "Pick a valid location.";
+        if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
+            return "Pick a valid payment method.";
+
+        foreach (var l in body.Lines)
+        {
+            if (l.Qty <= 0) return "Every line needs a quantity above zero.";
+            if (l.Rate < 0) return "A rate cannot be negative.";
+            if (l.DiscountPercent is < 0 or > 100)
+                return "A line discount must be between 0 and 100 percent.";
+            if (l.TaxPercent is < 0 or > 100)
+                return "A line tax rate must be between 0 and 100 percent.";
+            if (!await _db.Products.AnyAsync(p => p.ProductId == l.ProductId))
+                return $"Product {l.ProductId} does not exist.";
+        }
+
+        return null;
+    }
+
     private async Task<SalesOrder> SaveOrder(OrderRequest body, int statusId,
         decimal subtotal, decimal discount, decimal tax, decimal total, string? holdReason)
     {
@@ -607,7 +695,7 @@ public class SalesController : ApiControllerBase
     /// whatever is in the database, not whatever the browser is holding.
     /// </summary>
     [HttpPost("orders/{id:int}/invoice")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:invoices.create")]
     public async Task<IActionResult> InvoiceOrder(int id, [FromBody] InvoiceOrderRequest? body)
     {
         try
@@ -675,6 +763,470 @@ public class SalesController : ApiControllerBase
     /// written to the activity trail -- a cancellation with no recorded reason
     /// is the kind of thing that gets argued about a month later.
     /// </summary>
+    /// <summary>
+    /// Move an order along the chain -- or, for the Super Admin, anywhere at all.
+    ///
+    /// Every rule about who may make which move lives in
+    /// Services/OrderWorkflow.cs. This action asks that class and does what it
+    /// says; it does not carry a second copy of the rules.
+    /// </summary>
+    // ══════════════════════════════════════════════════════════════════
+    //  EDITING AND DELETING AN ORDER
+    // ══════════════════════════════════════════════════════════════════
+
+    /*  Only the Super Admin may do either.
+        A salesperson who needs an order changed files a request saying which
+        order and why; the admin approves it from their dashboard, and that
+        approval is a ONE-SHOT key for that one change. See OrderChangeRequest.
+
+        Editing an order that has already been invoiced RE-WRITES THE INVOICE to
+        match, including its stored PDF. An invoice that disagrees with the order
+        it was raised from is worse than either of them being wrong on its own. */
+
+    /// <summary>Replace an order's lines and details.</summary>
+    [HttpPut("orders/{id:int}")]
+    public async Task<IActionResult> UpdateOrder(int id, [FromBody] OrderRequest body)
+    {
+        try
+        {
+            var order = await _db.SalesOrders
+                .Include(o => o.SalesOrderItems)
+                /* Status is read a few lines down to refuse a delivered or
+                   cancelled order. Without this Include it is null and the
+                   check throws instead of refusing. */
+                .Include(o => o.Status)
+                .FirstOrDefaultAsync(o => o.OrderId == id);
+            if (order is null) return NotFound(new { message = $"No order with id {id}." });
+
+            var role = CurrentRole();
+            OrderChangeRequest? key = null;
+
+            if (role != OrderWorkflow.RoleAdmin)
+            {
+                /* Not an admin -- so this needs an approved request, and it has
+                   to belong to this person and this order. */
+                key = await _db.OrderChangeRequests
+                    .FirstOrDefaultAsync(r => r.OrderId == id
+                                           && r.RequestedByUserId == CurrentUserId()
+                                           && r.Kind == "EDIT"
+                                           && r.Status == "APPROVED");
+                if (key is null)
+                    return StatusCode(403, new
+                    {
+                        message = "Only the Super Admin can edit an order. "
+                                + "Ask for permission from the order screen and try again once it is approved."
+                    });
+            }
+
+            if (order.Status.StatusKey is OrderWorkflow.Delivered or OrderWorkflow.Cancelled)
+                return BadRequest(new
+                {
+                    message = $"{order.OrderNo} is {order.Status.StatusName.ToLowerInvariant()} and cannot be edited."
+                });
+
+            var invalid = await ValidateOrderRequest(body);
+            if (invalid is not null) return BadRequest(new { message = invalid });
+
+            var (subtotal, discount, tax, total) = Totals(body.Lines);
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            order.CustomerUserId = body.CustomerId;
+            order.LocationId = body.LocationId;
+            order.DeliveryDate = body.DeliveryDate;
+            order.MethodId = body.MethodId;
+            order.Notes = body.Notes;
+            order.Subtotal = subtotal;
+            order.DiscountAmount = discount;
+            order.TaxAmount = tax;
+            order.TotalAmount = total;
+            /* OrderDate is deliberately NOT moved. When a sale happened is a
+               fact about the business, not a field to tidy up later. */
+
+            _db.SalesOrderItems.RemoveRange(order.SalesOrderItems);
+            await _db.SaveChangesAsync();
+
+            short n = 1;
+            foreach (var l in body.Lines)
+            {
+                var gross = l.Qty * l.Rate;
+                var disc = gross * (l.DiscountPercent / 100m);
+                var net = gross - disc;
+                _db.SalesOrderItems.Add(new SalesOrderItem
+                {
+                    OrderId = order.OrderId,
+                    LineNo = n++,
+                    ProductId = l.ProductId,
+                    Quantity = l.Qty,
+                    UnitPrice = l.Rate,
+                    DiscountPercent = l.DiscountPercent,
+                    TaxPercent = l.TaxPercent,
+                    LineTotal = Money(net + net * (l.TaxPercent / 100m))
+                });
+            }
+
+            /* The invoice follows the order. */
+            var invoice = await _db.SalesInvoices
+                .Include(i => i.SalesInvoiceItems)
+                .FirstOrDefaultAsync(i => i.OrderId == id);
+
+            if (invoice is not null)
+            {
+                invoice.CustomerUserId = body.CustomerId;
+                invoice.LocationId = body.LocationId;
+                invoice.MethodId = body.MethodId;
+                invoice.Subtotal = subtotal;
+                invoice.DiscountAmount = discount;
+                invoice.TaxAmount = tax;
+                invoice.TotalAmount = total;
+
+                _db.SalesInvoiceItems.RemoveRange(invoice.SalesInvoiceItems);
+                await _db.SaveChangesAsync();
+
+                short m = 1;
+                foreach (var l in body.Lines)
+                {
+                    var gross = l.Qty * l.Rate;
+                    var disc = gross * (l.DiscountPercent / 100m);
+                    var net = gross - disc;
+                    _db.SalesInvoiceItems.Add(new SalesInvoiceItem
+                    {
+                        InvoiceId = invoice.InvoiceId,
+                        LineNo = m++,
+                        ProductId = l.ProductId,
+                        Quantity = l.Qty,
+                        UnitPrice = l.Rate,
+                        DiscountPercent = l.DiscountPercent,
+                        TaxPercent = l.TaxPercent,
+                        LineTotal = Money(net + net * (l.TaxPercent / 100m))
+                    });
+                }
+            }
+
+            if (key is not null) key.Status = "USED";   // the one-shot is spent
+
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("ORDER_UPDATED", "SalesOrder", order.OrderNo,
+                $"{body.Lines.Count} lines, {total:N0}" + (invoice is null ? "" : $"; invoice {invoice.InvoiceNo} rebuilt"), 2);
+
+            /* Rebuild the stored PDFs so the printed document matches. Swallowed
+               on failure, as everywhere else -- the edit is saved either way. */
+            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "sales-order", order.OrderId, CurrentUserId());
+            if (invoice is not null)
+            {
+                invoice.PdfUrl = null;      // force a fresh render
+                invoice.PdfPublicId = null;
+                await _db.SaveChangesAsync();
+                await TryBuildBill(invoice.InvoiceId);
+            }
+
+            var custName = await _db.Parties.AsNoTracking()
+                .Where(pa => pa.UserId == order.CustomerUserId)
+                .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.OrderCreated,
+                $"Order edited by {CurrentUserName()}",
+                $"{order.OrderNo} -- {custName} was changed to PKR {total:N0}"
+                    + (invoice is null ? "." : $", and {invoice.InvoiceNo} was rebuilt to match."),
+                url: $"/sales/orders/{order.OrderId}",
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: order.SalesPersonUserId is null ? null : new[] { order.SalesPersonUserId.Value });
+
+            return Ok(new
+            {
+                id = order.OrderId,
+                orderNo = order.OrderNo,
+                invoiceRebuilt = invoice?.InvoiceNo,
+                message = invoice is null
+                    ? $"{order.OrderNo} updated."
+                    : $"{order.OrderNo} updated, and {invoice.InvoiceNo} was rebuilt to match."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"update order {id}");
+        }
+    }
+
+    /// <summary>Delete an order outright. Super Admin, or an approved request.</summary>
+    [HttpDelete("orders/{id:int}")]
+    public async Task<IActionResult> DeleteOrder(int id)
+    {
+        try
+        {
+            var order = await _db.SalesOrders
+                .Include(o => o.SalesOrderItems)
+                .FirstOrDefaultAsync(o => o.OrderId == id);
+            if (order is null) return NotFound(new { message = $"No order with id {id}." });
+
+            var role = CurrentRole();
+            OrderChangeRequest? key = null;
+
+            if (role != OrderWorkflow.RoleAdmin)
+            {
+                key = await _db.OrderChangeRequests
+                    .FirstOrDefaultAsync(r => r.OrderId == id
+                                           && r.RequestedByUserId == CurrentUserId()
+                                           && r.Kind == "DELETE"
+                                           && r.Status == "APPROVED");
+                if (key is null)
+                    return StatusCode(403, new
+                    {
+                        message = "Only the Super Admin can delete an order. "
+                                + "Ask for permission from the order screen and try again once it is approved."
+                    });
+            }
+
+            /* An invoiced order is money that has been billed. Deleting it would
+               leave an invoice pointing at nothing, so it is refused outright --
+               even for the admin. A sales return is the way to undo a sale. */
+            var invoiceNo = await _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.OrderId == id).Select(i => i.InvoiceNo).FirstOrDefaultAsync();
+            if (invoiceNo is not null)
+                return BadRequest(new
+                {
+                    message = $"{order.OrderNo} has been invoiced as {invoiceNo}. "
+                            + "Raise a sales return instead of deleting it."
+                });
+
+            var no = order.OrderNo;
+            var custName = await _db.Parties.AsNoTracking()
+                .Where(pa => pa.UserId == order.CustomerUserId)
+                .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
+            var repId = order.SalesPersonUserId;
+
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
+            _db.SalesOrderItems.RemoveRange(order.SalesOrderItems);
+            if (key is not null) key.Status = "USED";
+            await _db.SaveChangesAsync();
+
+            _db.SalesOrders.Remove(order);
+            await _db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            await Log("ORDER_DELETED", "SalesOrder", no, $"{custName}", 3);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant", "order-dept" },
+                NotificationKinds.OrderCreated,
+                $"Order deleted by {CurrentUserName()}",
+                $"{no} -- {custName} was deleted.",
+                url: "/sales/orders",
+                severe: true,
+                exceptUserId: CurrentUserId(),
+                alsoUserIds: repId is null ? null : new[] { repId.Value });
+
+            return Ok(new { message = $"{no} deleted." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"delete order {id}");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ASKING PERMISSION TO EDIT OR DELETE
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>File a request. Sales cannot edit or delete; they ask.</summary>
+    [HttpPost("orders/{id:int}/change-request")]
+    public async Task<IActionResult> RequestOrderChange(int id, [FromBody] ChangeRequestBody body)
+    {
+        try
+        {
+            var kind = (body?.Kind ?? "").Trim().ToUpperInvariant();
+            if (kind is not ("EDIT" or "DELETE"))
+                return BadRequest(new { message = "Ask to EDIT or to DELETE." });
+            if (string.IsNullOrWhiteSpace(body!.Reason) || body.Reason.Trim().Length < 5)
+                return BadRequest(new { message = "Give a reason -- the admin has to decide on it." });
+
+            var order = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.OrderId == id)
+                .Select(o => new { o.OrderNo, o.SalesPersonUserId, o.CustomerUser.LegalName, o.TotalAmount })
+                .FirstOrDefaultAsync();
+            if (order is null) return NotFound(new { message = $"No order with id {id}." });
+
+            if (CurrentRole() == OrderWorkflow.RoleSales && order.SalesPersonUserId != CurrentUserId())
+                return StatusCode(403, new { message = "This is not your order." });
+
+            var already = await _db.OrderChangeRequests
+                .AnyAsync(r => r.OrderId == id && r.RequestedByUserId == CurrentUserId()
+                            && r.Kind == kind && r.Status == "PENDING");
+            if (already)
+                return BadRequest(new { message = "You have already asked. The admin has it on their dashboard." });
+
+            _db.OrderChangeRequests.Add(new OrderChangeRequest
+            {
+                OrderId = id,
+                RequestedByUserId = CurrentUserId(),
+                Kind = kind,
+                Reason = body.Reason.Trim(),
+                Status = "PENDING",
+                CreatedAt = Now()
+            });
+            await _db.SaveChangesAsync();
+
+            await Log("ORDER_CHANGE_REQUESTED", "SalesOrder", order.OrderNo,
+                $"{kind}: {body.Reason.Trim()}", 2);
+
+            await _push.NotifyRoleAsync(
+                "super-admin",
+                NotificationKinds.OrderCreated,
+                $"Permission asked by {CurrentUserName()}",
+                $"{CurrentUserName(false)} wants to {kind.ToLowerInvariant()} {order.OrderNo} "
+                    + $"({order.LegalName}, PKR {order.TotalAmount:N0}). Reason: {body.Reason.Trim()}",
+                url: "/dashboard",
+                severe: true);
+
+            return Ok(new { message = "Asked. The admin will see it on their dashboard." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "ask for permission to change the order");
+        }
+    }
+
+    /// <summary>Requests waiting on the admin. Shown on their dashboard.</summary>
+    [HttpGet("order-change-requests")]
+    public async Task<IActionResult> GetOrderChangeRequests([FromQuery] string status = "PENDING")
+    {
+        try
+        {
+            if (CurrentRole() != OrderWorkflow.RoleAdmin)
+                return StatusCode(403, new { message = "Only the Super Admin sees these." });
+
+            var rows = await _db.OrderChangeRequests.AsNoTracking()
+                .Where(r => r.Status == status)
+                .OrderBy(r => r.CreatedAt)
+                .Select(r => new
+                {
+                    id = r.RequestId,
+                    orderId = r.OrderId,
+                    orderNo = r.Order.OrderNo,
+                    customer = r.Order.CustomerUser.LegalName,
+                    total = r.Order.TotalAmount,
+                    orderStatus = r.Order.Status.StatusName,
+                    kind = r.Kind,
+                    reason = r.Reason,
+                    askedBy = r.RequestedByUser.FullName,
+                    askedAt = r.CreatedAt
+                })
+                .ToListAsync();
+
+            return Ok(new { count = rows.Count, items = rows });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the change requests");
+        }
+    }
+
+    /// <summary>Approve with a tick, refuse with a cross.</summary>
+    [HttpPost("order-change-requests/{requestId:int}/decide")]
+    public async Task<IActionResult> DecideOrderChange(int requestId, [FromBody] DecideChangeBody body)
+    {
+        try
+        {
+            if (CurrentRole() != OrderWorkflow.RoleAdmin)
+                return StatusCode(403, new { message = "Only the Super Admin can decide these." });
+
+            var approve = body?.Approve ?? false;
+
+            var req = await _db.OrderChangeRequests
+                .Include(r => r.Order)
+                .FirstOrDefaultAsync(r => r.RequestId == requestId);
+            if (req is null) return NotFound(new { message = "No such request." });
+            if (req.Status != "PENDING")
+                return BadRequest(new { message = $"That request has already been {req.Status.ToLowerInvariant()}." });
+
+            req.Status = approve ? "APPROVED" : "DECLINED";
+            req.DecidedByUserId = CurrentUserId();
+            req.DecidedAt = Now();
+            req.DecisionNote = body?.Note?.Trim();
+            await _db.SaveChangesAsync();
+
+            await Log(approve ? "ORDER_CHANGE_APPROVED" : "ORDER_CHANGE_DECLINED",
+                "SalesOrder", req.Order.OrderNo, $"{req.Kind}. {body?.Note?.Trim()}", 2);
+
+            await _push.NotifyAsync(
+                req.RequestedByUserId,
+                NotificationKinds.OrderCreated,
+                approve ? $"Permission granted by {CurrentUserName()}" : $"Permission refused by {CurrentUserName()}",
+                approve
+                    ? $"You can now {req.Kind.ToLowerInvariant()} {req.Order.OrderNo}. It is a one-time permission."
+                    : $"Your request to {req.Kind.ToLowerInvariant()} {req.Order.OrderNo} was refused."
+                        + (string.IsNullOrWhiteSpace(body?.Note) ? "" : $" {body!.Note!.Trim()}"),
+                url: $"/sales/orders/{req.OrderId}",
+                severe: true);
+
+            return Ok(new
+            {
+                id = requestId,
+                status = req.Status,
+                message = approve ? "Permission granted." : "Request refused."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "decide the change request");
+        }
+    }
+
+    /// <summary>
+    /// What this person may currently do to this order -- used by the screen to
+    /// decide between showing Edit, or showing "Ask for permission".
+    /// </summary>
+    [HttpGet("orders/{id:int}/my-permissions")]
+    public async Task<IActionResult> GetMyOrderPermissions(int id)
+    {
+        try
+        {
+            var role = CurrentRole();
+            var me = CurrentUserId();
+
+            var order = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.OrderId == id)
+                .Select(o => new { o.SalesPersonUserId, o.Status.StatusKey })
+                .FirstOrDefaultAsync();
+            if (order is null) return NotFound(new { message = $"No order with id {id}." });
+
+            var isAdmin = role == OrderWorkflow.RoleAdmin;
+            var mine = role != OrderWorkflow.RoleSales || order.SalesPersonUserId == me;
+
+            var open = await _db.OrderChangeRequests.AsNoTracking()
+                .Where(r => r.OrderId == id && r.RequestedByUserId == me
+                         && (r.Status == "PENDING" || r.Status == "APPROVED"))
+                .Select(r => new { r.Kind, r.Status })
+                .ToListAsync();
+
+            bool Granted(string k) => open.Any(r => r.Kind == k && r.Status == "APPROVED");
+            bool Asked(string k) => open.Any(r => r.Kind == k && r.Status == "PENDING");
+
+            var invoiced = await _db.SalesInvoices.AnyAsync(i => i.OrderId == id);
+
+            return Ok(new
+            {
+                isAdmin,
+                isMine = mine,
+                canEdit = isAdmin || Granted("EDIT"),
+                canDelete = (isAdmin || Granted("DELETE")) && !invoiced,
+                editRequested = Asked("EDIT"),
+                deleteRequested = Asked("DELETE"),
+                canAsk = !isAdmin && mine,
+                invoiced
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"read your permissions on order {id}");
+        }
+    }
+
     [HttpPatch("orders/{id:int}/status")]
     public async Task<IActionResult> SetOrderStatus(int id, [FromBody] StatusRequest body)
     {
@@ -686,56 +1238,75 @@ public class SalesController : ApiControllerBase
             var status = await _db.OrderStatuses.FirstOrDefaultAsync(s => s.StatusKey == body.StatusKey);
             if (status is null) return BadRequest(new { message = $"Unknown status '{body.StatusKey}'." });
 
-            var was = await _db.OrderStatuses.Where(s => s.StatusId == order.StatusId)
-                .Select(s => s.StatusName).FirstAsync();
+            var current = await _db.OrderStatuses.AsNoTracking()
+                .FirstAsync(s => s.StatusId == order.StatusId);
 
-            if (body.StatusKey == "CANCELLED" && await _db.SalesInvoices.AnyAsync(i => i.OrderId == id))
+            var role = CurrentRole();
+
+            /* A salesperson only ever works on their own orders. Checked here as
+               well as in the list query, because a list that hides a row does
+               not stop somebody calling the endpoint with its id. */
+            if (role == OrderWorkflow.RoleSales && order.SalesPersonUserId != CurrentUserId())
+                return StatusCode(403, new { message = "This is not your order." });
+
+            if (!OrderWorkflow.CanMove(role, current.StatusKey, status.StatusKey))
+                return StatusCode(403, new
+                {
+                    message = current.StatusKey == status.StatusKey
+                        ? $"{order.OrderNo} is already {current.StatusName.ToLowerInvariant()}."
+                        : $"Your role cannot move an order from {current.StatusName.ToLowerInvariant()} " +
+                          $"to {status.StatusName.ToLowerInvariant()}."
+                });
+
+            if (status.StatusKey == OrderWorkflow.Declined && string.IsNullOrWhiteSpace(body.Reason))
+                return BadRequest(new { message = "Declining an order needs a reason." });
+
+            if (body.StatusKey == OrderWorkflow.Cancelled &&
+                await _db.SalesInvoices.AnyAsync(i => i.OrderId == id))
                 return BadRequest(new
                 {
                     message = "This order has already been invoiced. Raise a sales return instead of cancelling it."
                 });
 
             order.StatusId = status.StatusId;
-            if (body.StatusKey != "CREDIT_HOLD") order.CreditHoldReason = null;
+            if (body.StatusKey != OrderWorkflow.CreditHold) order.CreditHoldReason = null;
+
+            /* Leaving SUBMITTED means the decision has been made, so the
+               six-hourly nudge has nothing left to chase. Arriving at it starts
+               that clock, with this move's own notification as the first
+               reminder -- see ConfirmReminderService. */
+            if (current.StatusKey == OrderWorkflow.Submitted) order.ConfirmRemindedAt = null;
+            if (status.StatusKey == OrderWorkflow.Submitted) order.ConfirmRemindedAt = Now();
+
             await _db.SaveChangesAsync();
 
             var detail = string.IsNullOrWhiteSpace(body.Reason)
-                ? $"{was} -> {status.StatusName}"
-                : $"{was} -> {status.StatusName}. {body.Reason.Trim()}";
+                ? $"{current.StatusName} -> {status.StatusName}"
+                : $"{current.StatusName} -> {status.StatusName}. {body.Reason.Trim()}";
 
-            await Log(body.StatusKey == "CANCELLED" ? "ORDER_CANCELLED" : "ORDER_STATUS_CHANGED",
-                "SalesOrder", order.OrderNo, detail, body.StatusKey == "CANCELLED" ? 2 : 1);
+            await Log(body.StatusKey == OrderWorkflow.Cancelled ? "ORDER_CANCELLED" : "ORDER_STATUS_CHANGED",
+                "SalesOrder", order.OrderNo, detail,
+                body.StatusKey is OrderWorkflow.Cancelled or OrderWorkflow.Declined ? 2 : 1);
 
-            /* ── A2 · A6 · A7 · A8 ────────────────────────────────────────
-               One status endpoint drives several of the mapped trigger points,
-               so the audience is chosen from the status rather than repeated
-               four times. The rep who took the order is told about their own
-               order specifically -- that is the person waiting to hear. */
-            var salesRepId = order.SalesPersonUserId;
+            /* Who hears about this step, and in what words, is also the
+               workflow's business rather than a switch statement here. */
             var custName = await _db.Parties.AsNoTracking()
                 .Where(pa => pa.UserId == order.CustomerUserId)
                 .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
 
-            var (kind, purpose, line) = status.StatusKey switch
-            {
-                "CONFIRMED"  => (NotificationKinds.OrderConfirmed,  $"Order confirmed by {CurrentUserName()}",
-                                 $"{order.OrderNo} for {custName} has been confirmed."),
-                "PACKED"     => (NotificationKinds.OrderPacked,     $"Order packed by {CurrentUserName()}",
-                                 $"{order.OrderNo} for {custName} is packed and ready to send."),
-                "DISPATCHED" => (NotificationKinds.OrderDispatched, $"Order dispatched by {CurrentUserName()}",
-                                 $"{order.OrderNo} for {custName} has left."),
-                "DELIVERED"  => (NotificationKinds.OrderDelivered,  $"Order delivered",
-                                 $"{order.OrderNo} reached {custName}."),
-                _            => ("", "", "")
-            };
+            var (kind, roles, purpose, line) = OrderWorkflow.Announcement(
+                status.StatusKey, order.OrderNo, custName, CurrentUserName());
 
             if (kind.Length > 0)
             {
                 await _push.NotifyRolesAsync(
-                    new[] { "super-admin", "order-dept" }, kind, purpose, line,
+                    roles, kind, purpose,
+                    string.IsNullOrWhiteSpace(body.Reason) ? line : $"{line} {body.Reason.Trim()}",
                     url: $"/sales/orders/{order.OrderId}",
+                    severe: status.StatusKey == OrderWorkflow.Declined,
                     exceptUserId: CurrentUserId(),
-                    alsoUserIds: salesRepId is null ? null : new[] { salesRepId.Value });
+                    alsoUserIds: order.SalesPersonUserId is null
+                        ? null : new[] { order.SalesPersonUserId.Value });
             }
 
             return Ok(new
@@ -743,6 +1314,8 @@ public class SalesController : ApiControllerBase
                 id,
                 status = status.StatusKey,
                 statusName = status.StatusName,
+                step = OrderWorkflow.Step(status.StatusKey),
+                nextForMe = OrderWorkflow.NextFor(role, status.StatusKey),
                 message = $"{order.OrderNo} is now {status.StatusName.ToLowerInvariant()}."
             });
         }
@@ -753,8 +1326,149 @@ public class SalesController : ApiControllerBase
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  CREDIT HOLDS
+    //  THE WAREHOUSE KEEPER'S QUEUE
     // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Every order the warehouse has to pick, with the items on it.
+    ///
+    /// The keeper's whole job is one step of the chain: an order the owner has
+    /// confirmed becomes stock on a trolley, and then it is on its way to the
+    /// order department. So this is deliberately not a filter on the orders
+    /// screen -- it is the queue, with the picking list already open, because
+    /// somebody standing at a shelf should not have to click into nine orders
+    /// to find out what to pull off it.
+    ///
+    /// CONFIRMED and INVOICED both qualify. Whether the invoice has been cut
+    /// yet is an office question; the goods are the same goods either way, and
+    /// making the floor wait on paperwork is how orders sit for a day.
+    /// </summary>
+    [HttpGet("warehouse/queue")]
+    [Authorize(Policy = "perm:orders.warehouse")]
+    public async Task<IActionResult> GetWarehouseQueue([FromQuery] int? locationId)
+    {
+        try
+        {
+            var ready = new[] { OrderWorkflow.Confirmed, OrderWorkflow.Invoiced };
+
+            var rows = _db.SalesOrders.AsNoTracking()
+                .Where(o => ready.Contains(o.Status.StatusKey));
+
+            if (locationId is not null)
+                rows = rows.Where(o => o.LocationId == locationId);
+
+            var items = await rows
+                .OrderBy(o => o.OrderDate).ThenBy(o => o.OrderId)
+                .Take(100)
+                .Select(o => new
+                {
+                    id = o.OrderId,
+                    orderNo = o.OrderNo,
+                    customerName = o.CustomerUser.LegalName,
+                    city = o.CustomerUser.City.CityName,
+                    locationId = o.LocationId,
+                    location = o.Location.LocationName,
+                    orderDate = o.OrderDate,
+                    deliveryDate = o.DeliveryDate,
+                    status = o.Status.StatusKey,
+                    statusName = o.Status.StatusName,
+                    total = o.TotalAmount,
+                    salesPerson = o.CreatedByUser.FullName,
+                    invoiceNo = _db.SalesInvoices
+                        .Where(i => i.OrderId == o.OrderId)
+                        .Select(i => i.InvoiceNo).FirstOrDefault(),
+                    lines = o.SalesOrderItems.OrderBy(l => l.LineNo).Select(l => new
+                    {
+                        productId = l.ProductId,
+                        name = l.Product.ProductName,
+                        sku = l.Product.Sku,
+                        packing = l.Product.Packing,
+                        qty = l.Quantity,
+                        /* What is actually on the shelf at the branch the order
+                           is being served from. A picking list without this is
+                           a list of disappointments. */
+                        onHand = _db.StockBalances
+                            .Where(b => b.ProductId == l.ProductId && b.LocationId == o.LocationId)
+                            .Select(b => (int?)b.Quantity).FirstOrDefault() ?? 0
+                    }).ToList()
+                })
+                .ToListAsync();
+
+            return Ok(new
+            {
+                count = items.Count,
+                units = items.Sum(o => o.lines.Sum(l => l.qty)),
+                /* Short is the whole point of the screen: these are the orders
+                   the keeper cannot complete without moving stock first. */
+                short_ = items.Count(o => o.lines.Any(l => l.onHand < l.qty)),
+                items
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the warehouse queue");
+        }
+    }
+
+    /// <summary>
+    /// The whole chain, and what this person may do with the order they are
+    /// looking at. The screen builds its dropdown and its one-click button from
+    /// this rather than deciding for itself what a role is allowed to do.
+    /// </summary>
+    [HttpGet("orders/{id:int}/workflow")]
+    public async Task<IActionResult> GetOrderWorkflow(int id)
+    {
+        try
+        {
+            var order = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.OrderId == id)
+                .Select(o => new { o.OrderId, o.SalesPersonUserId, o.Status.StatusKey })
+                .FirstOrDefaultAsync();
+            if (order is null) return NotFound(new { message = $"No order with id {id}." });
+
+            var role = CurrentRole();
+            var mine = role != OrderWorkflow.RoleSales || order.SalesPersonUserId == CurrentUserId();
+
+            var names = await _db.OrderStatuses.AsNoTracking()
+                .OrderBy(s => s.SortOrder)
+                .Select(s => new { s.StatusKey, s.StatusName, s.SortOrder })
+                .ToListAsync();
+
+            var allowed = mine ? OrderWorkflow.AllowedTargets(role, order.StatusKey) : new List<string>();
+
+            return Ok(new
+            {
+                current = order.StatusKey,
+                step = OrderWorkflow.Step(order.StatusKey),
+                chain = OrderWorkflow.Chain
+                    .Select((k, i) => new
+                    {
+                        step = i + 1,
+                        key = k,
+                        name = names.FirstOrDefault(n => n.StatusKey == k)?.StatusName ?? k
+                    }),
+                /* One-click. Null when there is nothing obvious to do next. */
+                next = mine ? OrderWorkflow.NextFor(role, order.StatusKey) : null,
+                nextName = mine && OrderWorkflow.NextFor(role, order.StatusKey) is string nk
+                    ? names.FirstOrDefault(n => n.StatusKey == nk)?.StatusName ?? nk
+                    : null,
+                /* Everything the dropdown may offer. Only the Super Admin gets
+                   the whole chain; everyone else gets their own one or two. */
+                allowed = allowed.Select(k => new
+                {
+                    key = k,
+                    name = names.FirstOrDefault(n => n.StatusKey == k)?.StatusName ?? k,
+                    step = OrderWorkflow.Step(k)
+                }),
+                canSetAnything = role == OrderWorkflow.RoleAdmin,
+                isMine = mine
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"read the workflow for order {id}");
+        }
+    }
 
     /// <summary>
     /// The queue of orders parked over their credit limit. Accountant and owner
@@ -939,7 +1653,7 @@ public class SalesController : ApiControllerBase
     /// Pass walkIn=true for only those, or walkIn=all for everything.
     /// </summary>
     [HttpGet("invoices")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:invoices.view")]
     public async Task<IActionResult> GetInvoices(
         [FromQuery] string? q, [FromQuery] string? status, [FromQuery] int? customerId,
         [FromQuery] string? walkIn,
@@ -951,6 +1665,10 @@ public class SalesController : ApiControllerBase
             if (pageSize is < 1 or > 200) pageSize = 50;
 
             var rows = _db.SalesInvoices.AsNoTracking().AsQueryable();
+
+            if (SalesScopeUserId() is int mine)
+                rows = rows.Where(i => i.CreatedByUserId == mine ||
+                                       (i.Order != null && i.Order.SalesPersonUserId == mine));
 
             rows = (walkIn ?? "false").ToLowerInvariant() switch
             {
@@ -1035,11 +1753,13 @@ public class SalesController : ApiControllerBase
     /// than a constant somebody typed into a component two years ago.
     /// </summary>
     [HttpGet("invoices/{id:int}")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:invoices.view")]
     public async Task<IActionResult> GetInvoice(int id)
     {
         try
         {
+            if (!await MaySeeInvoice(id)) return NotYours("invoice");
+
             var i = await _db.SalesInvoices.AsNoTracking()
                 .Where(x => x.InvoiceId == id)
                 .Select(x => new
@@ -1136,11 +1856,13 @@ public class SalesController : ApiControllerBase
     /// rebuild one that already has a link.
     /// </summary>
     [HttpPost("invoices/{id:int}/pdf")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:invoices.view")]
     public async Task<IActionResult> BuildInvoicePdf(int id, [FromQuery] bool force = false)
     {
         try
         {
+            if (!await MaySeeInvoice(id)) return NotYours("invoice");
+
             var existing = await _db.SalesInvoices.AsNoTracking()
                 .Where(i => i.InvoiceId == id)
                 .Select(i => new { i.InvoiceNo, i.PdfUrl })
@@ -1192,11 +1914,13 @@ public class SalesController : ApiControllerBase
     /// Cloudinary outage degrades to "the bill still opens".
     /// </summary>
     [HttpGet("invoices/{id:int}/download")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:invoices.view")]
     public async Task<IActionResult> DownloadBill(int id, [FromQuery] bool attachment = false)
     {
         try
         {
+            if (!await MaySeeInvoice(id)) return NotYours("invoice");
+
             var row = await _db.SalesInvoices
                 .FirstOrDefaultAsync(i => i.InvoiceId == id);
             if (row is null) return NotFound(new { message = $"No invoice with id {id}." });
@@ -1229,11 +1953,13 @@ public class SalesController : ApiControllerBase
     /// rebuilt from the row every time it is asked for.
     /// </summary>
     [HttpGet("invoices/{id:int}/pdf")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:invoices.view")]
     public async Task<IActionResult> DownloadInvoicePdf(int id)
     {
         try
         {
+            if (!await MaySeeInvoice(id)) return NotYours("invoice");
+
             var data = await BillData(id);
             if (data is null) return NotFound(new { message = $"No invoice with id {id}." });
 
@@ -1250,12 +1976,19 @@ public class SalesController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
 
     [HttpGet("returns")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:returns.sales")]
     public async Task<IActionResult> GetReturns([FromQuery] string? q, [FromQuery] string? status)
     {
         try
         {
             var rows = _db.SalesReturns.AsNoTracking().AsQueryable();
+
+            /* A rep who has been given the returns right gets the returns that
+               belong to their own orders -- not the whole company's. */
+            if (SalesScopeUserId() is int mine)
+                rows = rows.Where(r => r.CreatedByUserId == mine ||
+                                       (r.Invoice.Order != null &&
+                                        r.Invoice.Order.SalesPersonUserId == mine));
 
             if (!string.IsNullOrWhiteSpace(status))
                 rows = rows.Where(r => r.Status.StatusKey == status);
@@ -1307,11 +2040,18 @@ public class SalesController : ApiControllerBase
     }
 
     [HttpGet("returns/{id:int}")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:returns.sales")]
     public async Task<IActionResult> GetReturn(int id)
     {
         try
         {
+            if (SalesScopeUserId() is int mine &&
+                !await _db.SalesReturns.AsNoTracking().AnyAsync(x =>
+                    x.ReturnId == id &&
+                    (x.CreatedByUserId == mine ||
+                     (x.Invoice.Order != null && x.Invoice.Order.SalesPersonUserId == mine))))
+                return NotYours("return");
+
             var r = await _db.SalesReturns.AsNoTracking()
                 .Where(x => x.ReturnId == id)
                 .Select(x => new
@@ -1666,7 +2406,7 @@ public class SalesController : ApiControllerBase
     /// need what the item cost THAT DAY, and Product.CostPrice moves.
     /// </summary>
     [HttpPost("invoices")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:invoices.create")]
     public async Task<IActionResult> CreateInvoice([FromBody] InvoiceRequest body)
     {
         try
@@ -1793,11 +2533,16 @@ public class SalesController : ApiControllerBase
     /// the loss is visible, but putting them back would sell a broken item twice.
     /// </summary>
     [HttpPost("returns")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:returns.sales")]
     public async Task<IActionResult> CreateReturn([FromBody] ReturnRequest body)
     {
         try
         {
+            /* "a salesperson can only create sales returns of his created
+               order" -- so the invoice being returned against has to be one of
+               theirs before anything else is checked. */
+            if (!await MaySeeInvoice(body.InvoiceId)) return NotYours("invoice");
+
             if (body.Lines is null || body.Lines.Count == 0)
                 return BadRequest(new { message = "A return needs at least one line." });
             if (string.IsNullOrWhiteSpace(body.Reason))
@@ -2345,6 +3090,10 @@ public class SalesController : ApiControllerBase
                 x.TaxAmount,
                 x.TotalAmount,
                 preparedBy = x.CreatedByUser.FullName,
+                /* Whoever wrote the ORDER, which is not always whoever cut the
+                   invoice -- a rep takes the order and the admin bills it. A
+                   counter sale has no order, so it falls back to the till. */
+                salesman = x.Order != null ? x.Order.CreatedByUser.FullName : x.CreatedByUser.FullName,
                 paid = x.VoucherAllocations
                     .Where(v => v.Voucher.Status.StatusKey == "POSTED")
                     .Sum(v => (decimal?)v.Amount) ?? 0m,
@@ -2415,7 +3164,8 @@ public class SalesController : ApiControllerBase
             Notes: i.notes,
             Lines: i.lines.Select(l => new InvoicePdf.Line(
                 l.lineNo, l.name, l.sku, l.packing, l.qty, l.rate,
-                l.discountPercent, l.taxPercent, l.lineTotal)).ToList());
+                l.discountPercent, l.taxPercent, l.lineTotal)).ToList(),
+            Salesman: i.salesman);
     }
 
     /* ─────────────────────── the shareable bill link ───────────────────────
@@ -2563,6 +3313,9 @@ public class SalesController : ApiControllerBase
 
     public record StatusRequest(string StatusKey, string? Reason);
 
+    public record ChangeRequestBody(string Kind, string Reason);
+    public record DecideChangeBody(bool Approve, string? Note);
+
     public record InvoiceOrderRequest(int? MethodId, DateOnly? DueDate);
 
     public record OverrideRequest(string Reason, bool RaiseInvoice);
@@ -2640,7 +3393,7 @@ public class SalesController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Sales Orders",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"sales-orders-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"sales-orders-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {
@@ -2650,7 +3403,7 @@ public class SalesController : ApiControllerBase
 
     /// <summary>Every invoice on the current filter, as a spreadsheet.</summary>
     [HttpGet("invoices/export")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:invoices.view")]
     public async Task<IActionResult> ExportInvoices(
         [FromQuery] string? q, [FromQuery] string? status, [FromQuery] int? customerId,
         [FromQuery] string? walkIn)
@@ -2684,7 +3437,7 @@ public class SalesController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Sale Invoices",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"sale-invoices-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"sale-invoices-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {
@@ -2723,7 +3476,7 @@ public class SalesController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Walk-in Sales",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"walk-in-sales-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"walk-in-sales-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {
@@ -2733,7 +3486,7 @@ public class SalesController : ApiControllerBase
 
     /// <summary>Sales returns, as a spreadsheet.</summary>
     [HttpGet("returns/export")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "perm:returns.sales")]
     public async Task<IActionResult> ExportReturns([FromQuery] string? q, [FromQuery] string? status)
     {
         try
@@ -2759,7 +3512,7 @@ public class SalesController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Sales Returns",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"sales-returns-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"sales-returns-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {

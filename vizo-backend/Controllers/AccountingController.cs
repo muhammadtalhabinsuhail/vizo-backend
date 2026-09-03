@@ -1990,7 +1990,7 @@ public class AccountingController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Expenses",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"expenses-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"expenses-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {
@@ -2026,7 +2026,7 @@ public class AccountingController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Journal Entries",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"journal-entries-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"journal-entries-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {
@@ -2062,7 +2062,7 @@ public class AccountingController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Vouchers",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"vouchers-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"vouchers-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {

@@ -30,6 +30,8 @@
 using System.Security.Claims;
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
+using vizo_backend.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
@@ -73,6 +75,13 @@ builder.Services.AddScoped<vizo_backend.Services.PushNotificationService>();
    every night. */
 builder.Services.AddHostedService<vizo_backend.Services.NightlyInsightsService>();
 
+/* The bell's live channel. See Services/NotificationHub.cs. */
+builder.Services.AddSignalR();
+
+/* Chases the Super Admin every six hours about orders still sitting at
+   SUBMITTED. See Services/ConfirmReminderService.cs. */
+builder.Services.AddHostedService<vizo_backend.Services.ConfirmReminderService>();
+
 /* ─────────────────────────── Controllers ───────────────────────── */
 builder.Services.AddControllers()
     .AddJsonOptions(o =>
@@ -104,6 +113,25 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             RoleClaimType = ClaimTypes.Role,
             NameClaimType = ClaimTypes.NameIdentifier
         };
+
+        /* A WebSocket handshake cannot carry an Authorization header, so the
+           browser puts the JWT in the query string instead. Lifted out here,
+           and only for the hub paths -- a token in a query string is a token in
+           the server log, and that is a trade worth making for one endpoint
+           rather than for the whole API. */
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var token = context.Request.Query["access_token"];
+                var path = context.HttpContext.Request.Path;
+
+                if (!string.IsNullOrEmpty(token) && path.StartsWithSegments("/hubs"))
+                    context.Token = token;
+
+                return Task.CompletedTask;
+            }
+        };
     });
 
 /* ───────────────────────── Authorization ───────────────────────── */
@@ -116,13 +144,21 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("Accountant", p => p.RequireRole("accountant", "super-admin"));
     options.AddPolicy("OrderDept", p => p.RequireRole("order-dept", "super-admin"));
     options.AddPolicy("Sales", p => p.RequireRole("sales", "super-admin"));
-    options.AddPolicy("Staff", p => p.RequireRole("super-admin", "accountant", "order-dept", "sales"));
+    options.AddPolicy("Staff", p => p.RequireRole(
+        "super-admin", "accountant", "order-dept", "sales", "warehouse-keeper"));
 
     /* Purchases, Inventory, Delivery, Claims and the supplier side of Parties:
        everyone except a sales rep. Mirrors ROUTE_RULES in the front end's
        src/proxy.ts so a screen the proxy allows is a screen the API allows. */
-    options.AddPolicy("BackOffice", p => p.RequireRole("super-admin", "accountant", "order-dept"));
+    options.AddPolicy("BackOffice", p => p.RequireRole(
+        "super-admin", "accountant", "order-dept", "warehouse-keeper"));
 });
+
+/* Policies named "perm:something" are built on demand from the holder's
+   permissions instead of from a list of role names -- see
+   Services/PermissionPolicy.cs for why that had to change. */
+builder.Services.AddSingleton<IAuthorizationPolicyProvider, PermissionPolicyProvider>();
+builder.Services.AddSingleton<IAuthorizationHandler, PermissionHandler>();
 
 /* ─────────────────────────── CORS ──────────────────────────────── */
 var origins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
@@ -224,6 +260,7 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
+app.MapHub<NotificationHub>(NotificationHub.Path);
 
 app.MapGet("/", () => "AdvPOS API is running. Swagger: /swagger");
 

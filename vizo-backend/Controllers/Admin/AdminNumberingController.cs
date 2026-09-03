@@ -53,7 +53,7 @@ public class AdminNumberingController : AdminControllerBase
                fiscal calendar rather than hardcoded in the page. */
             var company = await _db.Companies.FirstOrDefaultAsync();
             var startMonth = company?.FiscalYearStartMonth ?? 1;
-            var today = DateTime.UtcNow;
+            var today = Now();
             var fiscalYear = today.Month >= startMonth ? today.Year + 1 : today.Year;
 
             return Ok(new { items = rows, yearSuffix = fiscalYear % 100 });

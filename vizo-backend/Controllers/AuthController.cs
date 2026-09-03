@@ -49,7 +49,7 @@ public class AuthController : ControllerBase
        a DateTime whose Kind is Utc for those, so every timestamp we write goes
        through this. */
     private static DateTime Now() =>
-        DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Unspecified);
+        vizo_backend.Services.BusinessClock.Now();
 
     /* ═════════════════════════════ LOGIN ═════════════════════════════ */
 

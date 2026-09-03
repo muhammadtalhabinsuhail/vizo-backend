@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
+using Microsoft.AspNetCore.SignalR;
 using WebPush;
 
 namespace vizo_backend.Services;
@@ -40,14 +41,16 @@ public class PushNotificationService
     private readonly AppDbContext _db;
     private readonly IConfiguration _cfg;
     private readonly ILogger<PushNotificationService> _logger;
+    private readonly IHubContext<NotificationHub> _hub;
     private readonly WebPushClient _client = new();
 
     public PushNotificationService(AppDbContext db, IConfiguration cfg,
-        ILogger<PushNotificationService> logger)
+        ILogger<PushNotificationService> logger, IHubContext<NotificationHub> hub)
     {
         _db = db;
         _cfg = cfg;
         _logger = logger;
+        _hub = hub;
     }
 
     /* Severity ids as they actually are in "SeverityLevel":
@@ -67,7 +70,7 @@ public class PushNotificationService
     /// here threw on every single notification, and because this class swallows
     /// its own failures it did so silently.
     /// </summary>
-    private static DateTime Now() => DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Unspecified);
+    private static DateTime Now() => BusinessClock.Now();
 
     private VapidDetails? Vapid()
     {
@@ -120,7 +123,7 @@ public class PushNotificationService
 
             if (bellOn)
             {
-                _db.Notifications.Add(new Notification
+                var row = new Notification
                 {
                     UserId = userId,
                     SeverityId = severe ? SeverityDanger : SeverityInfo,
@@ -129,8 +132,15 @@ public class PushNotificationService
                     Body = Truncate(body, 400),
                     CreatedAt = Now(),
                     IsRead = false
-                });
+                };
+                _db.Notifications.Add(row);
                 await _db.SaveChangesAsync();
+
+                /* Straight down the wire to whoever has the screen open, so the
+                   bell moves now rather than at the next page load. Sent after
+                   the save so the id is real and the browser can mark it read.
+                   See Services/NotificationHub.cs. */
+                await LiveAsync(userId, row, url);
             }
 
             if (pushOn) await PushAsync(userId, title, body, url, severe);
@@ -209,6 +219,34 @@ public class PushNotificationService
     // ══════════════════════════════════════════════════════════════════
     //  THE PUSH ITSELF
     // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Nudges one person's open tabs. Failure here is a silent nothing on
+    /// purpose -- the row is already saved, so the worst case is that the bell
+    /// updates on the next page load exactly as it used to.
+    /// </summary>
+    private async Task LiveAsync(int userId, Notification row, string? url)
+    {
+        try
+        {
+            await _hub.Clients.Group(NotificationHub.UserGroup(userId))
+                .SendAsync("notification", new
+                {
+                    id = row.NotificationId,
+                    title = row.Title,
+                    body = row.Body,
+                    icon = row.Icon,
+                    severityId = row.SeverityId,
+                    createdAt = row.CreatedAt,
+                    isRead = false,
+                    url
+                });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Live notification to user {UserId} did not go out.", userId);
+        }
+    }
 
     private async Task PushAsync(int userId, string title, string body, string? url, bool severe)
     {

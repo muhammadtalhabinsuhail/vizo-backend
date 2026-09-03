@@ -92,7 +92,7 @@ public class AdminAuditLogController : AdminControllerBase
     {
         try
         {
-            var todayStart = DateTime.SpecifyKind(DateTime.UtcNow.Date, DateTimeKind.Unspecified);
+            var todayStart = Now().Date;
             var since = todayStart.AddDays(-1);
 
             return Ok(new

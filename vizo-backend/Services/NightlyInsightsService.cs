@@ -149,7 +149,7 @@ public class NightlyInsightsService : BackgroundService
     private async Task RunAnomalyCheckAsync(
         AppDbContext db, PushNotificationService push, GeminiClient ai, CancellationToken ct)
     {
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var today = BusinessClock.Today();
         var since = today.AddDays(-90);
 
         /* Daily totals for the three things worth watching. */

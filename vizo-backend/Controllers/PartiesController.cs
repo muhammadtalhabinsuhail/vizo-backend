@@ -729,7 +729,7 @@ public class PartiesController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Parties",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"parties-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"parties-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {

@@ -790,7 +790,7 @@ public static class DocumentBuilder
                 p.ntn is null ? null : $"NTN {p.ntn}")),
             Meta: new[]
             {
-                new DocumentPdf.Fact("As At", DocumentPdf.Day(DateOnly.FromDateTime(DateTime.UtcNow))),
+                new DocumentPdf.Fact("As At", DocumentPdf.Day(vizo_backend.Services.BusinessClock.Today())),
                 new DocumentPdf.Fact("Credit Limit",
                     p.CreditLimit > 0 ? DocumentPdf.Money(p.CreditLimit) : "No limit"),
                 new DocumentPdf.Fact("Terms", p.CreditDays > 0 ? $"NET {p.CreditDays}" : "Cash"),

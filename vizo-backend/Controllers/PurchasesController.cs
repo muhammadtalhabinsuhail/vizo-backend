@@ -1323,7 +1323,7 @@ public class PurchasesController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Purchase Orders",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"purchase-orders-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"purchase-orders-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {

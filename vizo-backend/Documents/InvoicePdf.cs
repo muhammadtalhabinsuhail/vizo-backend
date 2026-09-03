@@ -17,19 +17,40 @@ namespace vizo_backend.Documents;
 public static class InvoicePdf
 {
     /* Brand palette, the same hexes the web app uses (globals.css). */
-    private const string Navy = "#031833";
-    private const string NavySoft = "#0A2042";
-    private const string Yellow = "#EDC705";
-    private const string Ink = "#0F172A";
-    private const string Muted = "#64748B";
-    private const string Faint = "#94A3B8";
-    private const string Hair = "#E2E8F0";
-    private const string ZebraFill = "#F7F9FC";
-    private const string PanelFill = "#F0F4FA";
+    /* ─────────────────────────── THE PALETTE ───────────────────────────
+
+        Cleaner and simpler than it was, without becoming a different company's
+        invoice. The brand navy and the brand yellow both stay; what changed is
+        how much of the page they cover.
+
+          - The navy was #031833, which is very nearly black. On a laser printer
+            a full-width band of it comes out as a slab of toner with the white
+            text struggling inside it. #0B2545 is unmistakably the same colour
+            family and reads as navy rather than as a blackout.
+          - The table header was a SECOND navy, almost but not quite the header
+            band's. Two nearly-identical darks on one page look like a mistake
+            rather than a decision, so the header is now one clear step lighter
+            and deliberately different.
+          - Zebra striping and the panel fill were #F7F9FC and #F0F4FA -- close
+            enough to be indistinguishable on screen and invisible in print.
+            The stripe is now the faintest of tints and the panel a definite
+            one, so each is doing a job.
+          - The yellow is unchanged but is now used only as a 2-3pt accent rule.
+            It was never meant to be a fill; it is a highlighter.               */
+
+    private const string Navy = "#0B2545";       // header band
+    private const string NavySoft = "#1B3A66";   // table header, one step lighter
+    private const string Yellow = "#EDC705";     // accent rules only
+    private const string Ink = "#111827";
+    private const string Muted = "#5B6B80";
+    private const string Faint = "#93A1B5";
+    private const string Hair = "#E6EBF1";
+    private const string ZebraFill = "#F6F8FB";
+    private const string PanelFill = "#EDF2F9";
     private const string Success = "#047857";
     private const string Danger = "#B91C1C";
     private const string White = "#FFFFFF";
-    private const string OnNavy = "#B3C5E1";
+    private const string OnNavy = "#C3D3E9";
 
     private const double Left = 42;
     private const double Right = 553.28;
@@ -37,6 +58,7 @@ public static class InvoicePdf
     /* Column right edges / left edges for the line table. */
     private const double ColNo = 52;      // centred
     private const double ColDesc = 68;
+    private const double ColPack = 300;   // right -- packing count, before qty
     private const double ColQty = 344;    // right
     private const double ColRate = 410;   // right
     private const double ColDisc = 452;   // right
@@ -62,7 +84,9 @@ public static class InvoicePdf
         decimal Subtotal, decimal Discount, decimal Tax, decimal Total,
         decimal Paid, decimal Balance,
         string? PreparedBy, string? Notes,
-        IReadOnlyList<Line> Lines);
+        IReadOnlyList<Line> Lines,
+        // whoever wrote the order this invoice came from
+        string? Salesman = null);
 
     public static byte[] Render(Data d)
     {
@@ -141,6 +165,17 @@ public static class InvoicePdf
             y -= 11;
         }
 
+        /* The rep who wrote the order, directly under the seller block. The
+           customer rings a person, not a company, and the shop needs to know
+           whose sale it was without going back to the system. */
+        if (!string.IsNullOrWhiteSpace(d.Salesman))
+        {
+            y -= 3;
+            pdf.Text(Left, y, "SALESMAN:", 7, Faint, bold: true);
+            pdf.Text(Left + 46, y, d.Salesman!, 8.6, Ink, bold: true);
+            y -= 12;
+        }
+
         /* ── document meta panel, right ── */
         var meta = new List<(string, string)>
         {
@@ -213,6 +248,7 @@ public static class InvoicePdf
         var ty = y - headHeight + 7;
         pdf.TextCenter(ColNo, ty, "#", 7.5, White, bold: true);
         pdf.Text(ColDesc, ty, "DESCRIPTION", 7.5, White, bold: true);
+        pdf.TextRight(ColPack, ty, "PACKING", 7.5, White, bold: true);
         pdf.TextRight(ColQty, ty, "QTY", 7.5, White, bold: true);
         pdf.TextRight(ColRate, ty, "RATE", 7.5, White, bold: true);
         pdf.TextRight(ColDisc, ty, "DISC%", 7.5, White, bold: true);
@@ -231,15 +267,18 @@ public static class InvoicePdf
 
             pdf.TextCenter(ColNo, rowBottom + 10, n.ToString(), 8, Faint);
 
-            var nameMax = ColQty - ColDesc - 46;
+            var nameMax = ColPack - ColDesc - 20;
             pdf.Text(ColDesc, rowBottom + 14, pdf.Ellipsis(l.Name, 8.6, nameMax), 8.6, Ink);
 
+            /* The SKU alone now. "pack of N" used to be tacked on here; it has
+               its own column, and saying it twice on one line is noise. */
+            pdf.Text(ColDesc, rowBottom + 4, pdf.Ellipsis(l.Sku ?? "", 7.2, nameMax), 7.2, Faint);
+
             /* Product.Packing is how many units are in a carton, so 0 or 1
-               means it is sold loose and there is nothing worth printing. */
-            var sub = l.Packing > 1
-                ? $"{l.Sku}   -   pack of {l.Packing}"
-                : l.Sku;
-            pdf.Text(ColDesc, rowBottom + 4, pdf.Ellipsis(sub, 7.2, nameMax), 7.2, Faint);
+               means the item is sold loose and there is no pack to count. */
+            pdf.TextRight(ColPack, rowBottom + 10,
+                l.Packing > 1 ? l.Packing.ToString("N0", Pk) : "-", 8.6,
+                l.Packing > 1 ? Ink : Faint);
 
             pdf.TextRight(ColQty, rowBottom + 10, l.Qty.ToString("N0", Pk), 8.6, Ink);
             pdf.TextRight(ColRate, rowBottom + 10, Money(l.Rate), 8.6, Ink);

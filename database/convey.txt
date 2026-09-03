@@ -1,0 +1,296 @@
+═══════════════════════════════════════════════════════════════════════════════
+ CONVEY  —  things you should know, that I did not change on my own
+═══════════════════════════════════════════════════════════════════════════════
+
+ Written 3 September 2026, after the order-workflow work.
+
+ The instruction was: change nothing except the tasks listed, and if anything
+ needs saying, say it here. So this file is everything I found, decided, or
+ touched that was not literally one of those tasks.
+
+ Read section 1 before you deploy. The rest is reference.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 1.  THINGS THAT WILL BREAK IF YOU SKIP THEM
+───────────────────────────────────────────────────────────────────────────────
+
+ 1.1  RUN THE MIGRATION
+
+      backend/database/15_order_workflow.sql
+
+      It has already been run against the live Neon database, so nothing more is
+      needed there. Any OTHER environment — a colleague's local copy, staging —
+      must run it or the whole order chain is missing. It adds:
+
+        · four order statuses  TO_ORDER_DEPT, AT_ORDER_DEPT, PACKAGING, DECLINED
+        · the role             warehouse-keeper  (RoleId 9)
+        · the permission       orders.warehouse
+        · the table            "OrderChangeRequest"
+        · the column           "SalesOrder"."ConfirmRemindedAt"
+
+      It is written to be safe to run twice.
+
+ 1.2  npm install IN THE FRONTEND
+
+      The live notification bell needs @microsoft/signalr, which is new in
+      package.json. Without `npm install` the build fails on an import it
+      cannot resolve.
+
+      It is loaded with a dynamic import() inside the effect, not at the top of
+      the file, so it lands in its own chunk instead of the shared bundle —
+      AGENTS.md rule 4. Do not "tidy" it up to a normal import.
+
+ 1.3  THERE IS NO WAREHOUSE KEEPER USER YET
+
+      The ROLE exists and everything is wired for it. Nobody holds it.
+
+      Create one in Setup → People, give them the Warehouse Keeper role, and
+      they will land on /warehouse — the picking queue — when they sign in.
+
+      Until somebody holds the role, an order sitting at CONFIRMED has nobody
+      to move it to step 5. The Super Admin can still move it by hand from the
+      Set status dropdown, so nothing is stuck; it is just manual.
+
+      The login screen still offers four demo panels. I did not add a fifth for
+      the keeper, because a panel that fills in an email address for an account
+      that does not exist is worse than no panel. Add it once the account is
+      real: src/app/login/page.tsx, the PANELS array.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 2.  A BUG I FOUND AND DID NOT TOUCH
+───────────────────────────────────────────────────────────────────────────────
+
+ 2.1  THE VAPID KEYS IN .env.example DO NOT MATCH THE SERVER
+
+      vizo-erp/.env.example       NEXT_PUBLIC_VAPID_PUBLIC_KEY=BFkgyKlQ1rBMwE-...
+      backend appsettings.json    VapidSettings:PublicKey     =BLDLEeGrO9V8jS1...
+
+      Those are two different key pairs.
+
+      .env.local is correct — it matches the server, so push works today. The
+      danger is the template: anybody who sets up a new machine by copying
+      .env.example to .env.local gets a browser that subscribes to push
+      perfectly happily, and a server that is then rejected by Google and Apple
+      on every single send. It fails silently, which is the worst way for it to
+      fail.
+
+      Left alone because a key is not mine to change, and because changing the
+      wrong one of the two would break the working setup. The fix is one line:
+      copy the public key out of appsettings.json into .env.example.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 3.  DECISIONS I MADE THAT YOU MIGHT WANT DIFFERENTLY
+───────────────────────────────────────────────────────────────────────────────
+
+ 3.1  PERMISSIONS NOW ACTUALLY OPEN PAGES
+
+      You asked that granting the Sales role the right to handle sales returns
+      should stop giving them a 403. It was not a small bug. The endpoints were
+      guarded like this:
+
+          [Authorize(Policy = "BackOffice")]
+          AddPolicy("BackOffice", p => p.RequireRole("super-admin","accountant","order-dept"));
+
+      A hard-coded list of role NAMES. The permission screen in Setup saved
+      happily and changed nothing, because nothing was ever asking about
+      permissions. It also meant the new Warehouse Keeper role could not have
+      been given anything at all — its name is on none of those lists.
+
+      So authorisation is now on the permission, not the role name:
+
+          [Authorize(Policy = "perm:returns.sales")]
+
+      built on demand from the "perm" claims already in the JWT. See
+      backend/vizo-backend/Services/PermissionPolicy.cs.
+
+      The same idea is in the front end's src/proxy.ts, where a route rule can
+      now name a `perm` alongside its roles.
+
+      WHAT THIS CHANGES FOR YOU: ticking a box in Setup → Roles now really does
+      open that screen for that role. It was decoration before. Worth a look
+      over Setup → Roles to check that what is ticked is what you meant, because
+      until today some of it had no effect.
+
+ 3.2  A SALESPERSON SEES ONLY THEIR OWN WORK — INCLUDING RETURNS
+
+      Orders, invoices and sales returns are all filtered to the signed-in rep,
+      by the order's rep or whoever created it. Checked on the list AND on the
+      detail endpoint, because a hidden row is still fetchable by id.
+
+      Accounts and the Super Admin see everything, unchanged. Measured on the
+      live data: the admin sees 34 orders and 7 returns, Zara sees 18 and 3.
+
+ 3.3  A REP CAN NO LONGER INVOICE THEIR OWN NEW ORDER
+
+      The chain you asked for is: sales writes it → the owner confirms it →
+      then it is billed. The new-order screen has a "raise the invoice too"
+      switch, which stepped straight over the confirmation.
+
+      For the Sales role that switch is now ignored, and the reply says so:
+      "Order ORD-… submitted. It can be invoiced once the owner confirms it."
+      The Super Admin and the order desk are unaffected — the counter still
+      bills on the spot.
+
+      If you would rather reps kept that shortcut, it is one line:
+      SalesController.CreateOrder, the `raiseInvoice` variable.
+
+ 3.4  "SENT TO ORDER DEPT" NOW READS "WAITING TO BE CONFIRMED"
+
+      SUBMITTED used to be labelled "Sent to Order Dept" on screen. That was
+      true when it was the next thing that happened. It is not any more: a
+      submitted order is waiting on you, and the order department does not see
+      it until the warehouse has picked it. There is now a real step called
+      "On way to Order Dept" that means what the old label claimed.
+
+ 3.5  DECLINING NEEDS A REASON; CONFIRMING DOES NOT
+
+      The cross on the dashboard opens a box asking why. The tick does not ask
+      anything. Saying yes needs no explanation; saying no does, because the rep
+      has to tell a customer something.
+
+ 3.6  DELETING AN INVOICED ORDER IS REFUSED — EVEN FOR YOU
+
+      You asked that the Super Admin be able to delete an order. They can,
+      unless it has been invoiced. Deleting one that has been billed leaves an
+      invoice pointing at nothing, and the books stop adding up. The message
+      says to raise a sales return instead, which is the right way to undo a
+      sale.
+
+      Everything else — any status, forward or backward, delete, edit — is
+      yours with no restriction.
+
+ 3.7  THE ORDER DATE IS NOT EDITABLE
+
+      The edit screen lets you change the customer, the branch, the payment
+      method, the delivery date, the notes and every line. It does not let you
+      change the date the order was placed, and the API refuses to move it.
+      Editing a quantity is correcting a mistake; moving the date an order was
+      placed is rewriting history.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 4.  THE DATE BUG — WHAT IT ACTUALLY WAS
+───────────────────────────────────────────────────────────────────────────────
+
+ An order taken on the night of 3 September was stored as 2 September.
+
+ The cause: every date in the system came from DateTime.UtcNow. Pakistan is
+ UTC+5, so between midnight and 5am our time it is still yesterday in UTC. An
+ order taken at 1am on the 3rd was, to the server, 8pm on the 2nd.
+
+ Fixed by putting the business clock in one place —
+ backend/vizo-backend/Services/BusinessClock.cs — which resolves Pakistan
+ Standard Time and falls back to a fixed UTC+5 zone if Windows and Linux
+ disagree about the name. ApiControllerBase.Now() and Today() go through it.
+
+ Seventeen other places were calling UtcNow directly and have been swept:
+ document numbering (which was stamping the wrong YEAR on 1 January), the
+ nightly insight job, the push service, the archive, the "As At" line on every
+ printed document, the audit log's "today", and ten export filenames.
+
+ NOTE: existing rows are not corrected. Anything already stored with the wrong
+ date still has it. If that matters, say so and it can be written as a one-off
+ UPDATE — but it needs a decision about which rows, because not every early-
+ morning date is wrong.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 5.  SMALL THINGS LEFT ALONE ON PURPOSE
+───────────────────────────────────────────────────────────────────────────────
+
+ 5.1  Debug console.log calls still in the code:
+
+        vizo-erp/src/app/(app)/sales/orders/[id]/page.tsx : 229   console.log(opened)
+        vizo-erp/src/app/login/page.tsx                   : 114   console.log("Login error", err)
+        .../super-admin/super-admin-dashboard.tsx         : 119   console.log("Dashboard load error:", e)
+
+      Harmless, but they print to the browser console in production. Not mine
+      to delete.
+
+ 5.2  vizo-erp/src/components/layout/top-bar.tsx has an unused `ago()` helper.
+      It lints as a warning. It was already unused before I touched the file.
+
+ 5.3  The old statuses PROCESSING (90) and PACKED (91) are still in the
+      "OrderStatus" table. Nothing in the new chain uses them, and old orders
+      still point at them, so removing them would break history. They simply do
+      not appear in any dropdown.
+
+ 5.4  Two orders were touched while testing, and both were put back:
+
+        ORD-26-0086 (id 11)  moved DRAFT → SUBMITTED → DRAFT, to prove the live
+                             notification arrives without a page reload
+        ORD-26-0159 (id 33)  saved through the new edit endpoint with its own
+                             unchanged values, to prove INV-26-8880 is rebuilt
+
+      Both appear in the activity log with a reason. No figures changed.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 6.  WHERE THE NEW THINGS LIVE
+───────────────────────────────────────────────────────────────────────────────
+
+ BACKEND
+
+   Services/OrderWorkflow.cs          the chain and who may move it — one file,
+                                      one copy of the rules
+   Services/BusinessClock.cs          Pakistan time, in one place
+   Services/PermissionPolicy.cs       "perm:xxx" authorisation
+   Services/ConfirmReminderService.cs the six-hourly nudge
+   Services/NotificationHub.cs        SignalR, for the live bell
+   Models/OrderChangeRequest.cs       a rep's application to edit or delete
+
+   SalesController                    PUT /orders/{id}          edit
+                                      DELETE /orders/{id}       delete
+                                      GET /orders/{id}/workflow chain + rights
+                                      GET /orders/{id}/my-permissions
+                                      POST /orders/{id}/change-request
+                                      GET /order-change-requests
+                                      POST /order-change-requests/{id}/decide
+                                      GET /warehouse/queue      picking list
+
+ FRONTEND
+
+   components/sales/order-workflow.tsx            the chain strip and the buttons
+   components/portals/super-admin/owner-decisions.tsx
+                                                  waiting-to-confirm + tick/cross
+   components/portals/warehouse/                  the keeper's queue and dashboard
+   app/(app)/warehouse/page.tsx                   /warehouse
+   app/(app)/sales/orders/[id]/edit/page.tsx      the edit screen
+   lib/use-live-notifications.ts                  the SignalR client
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 7.  THE INVOICE
+───────────────────────────────────────────────────────────────────────────────
+
+ Three changes, all in backend/vizo-backend/Documents/InvoicePdf.cs:
+
+   · a PACKING column, between DESCRIPTION and QTY. It shows Product.Packing —
+     how many units are in a carton — and a dash for anything sold loose. The
+     old "pack of 12" note under the product name is gone, because saying it
+     twice on one line is noise.
+
+   · SALESMAN: directly under the FROM block, naming whoever wrote the ORDER.
+     Not whoever cut the invoice — a rep takes the order and the office bills
+     it, and the customer wants the rep. A counter sale with no order falls
+     back to whoever was on the till.
+
+   · the colours. The navy was #031833, which is very nearly black; on a laser
+     printer a full-width band of it comes out as a slab of toner. It is now
+     #0B2545 — the same navy, one that reads as a colour. The table header was
+     a SECOND, almost-identical dark, which looks like a mistake rather than a
+     decision; it is now a clear step lighter. The two background tints were
+     close enough to be indistinguishable, and are now doing different jobs.
+     The yellow is unchanged but is used only as a thin accent rule, which is
+     what a highlighter is for.
+
+ An invoice REBUILDS ITSELF when its order is edited: the lines and totals are
+ rewritten and the stored PDF is thrown away so the next print is the new
+ figures. The invoice number never changes. That is the whole reason editing an
+ invoiced order is allowed at all — the alternative is a bill that quietly
+ disagrees with the order it came from.
+
+═══════════════════════════════════════════════════════════════════════════════

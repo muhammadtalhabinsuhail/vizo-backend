@@ -1319,7 +1319,7 @@ public class InventoryController : ApiControllerBase
 
             var bytes = XlsxWriter.FromPayload("Products",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);
-            return File(bytes, XlsxWriter.ContentType, $"products-{DateTime.UtcNow:yyyy-MM-dd}.xlsx");
+            return File(bytes, XlsxWriter.ContentType, $"products-{Today():yyyy-MM-dd}.xlsx");
         }
         catch (Exception ex)
         {

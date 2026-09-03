@@ -45,6 +45,12 @@ public partial class AppDbContext
     /// </summary>
     public virtual DbSet<NotificationPreference> NotificationPreferences { get; set; } = null!;
 
+    /// <summary>
+    /// A salesperson asking permission to edit or delete an order.
+    /// Created on Neon by backend/database/15_order_workflow.sql.
+    /// </summary>
+    public virtual DbSet<OrderChangeRequest> OrderChangeRequests { get; set; } = null!;
+
     partial void OnModelCreatingPartial(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<PasswordResetCode>(entity =>
@@ -124,6 +130,44 @@ public partial class AppDbContext
                 .HasForeignKey(d => d.DecidedByUserId)
                 .OnDelete(DeleteBehavior.ClientSetNull)
                 .HasConstraintName("FK_SalesReturn_DecidedBy");
+        });
+
+        modelBuilder.Entity<SalesOrder>(entity =>
+        {
+            /* Added by 15_order_workflow.sql. See Models/SalesOrder.Custom.cs. */
+            entity.Property(e => e.ConfirmRemindedAt).HasColumnType("timestamp without time zone");
+        });
+
+        modelBuilder.Entity<OrderChangeRequest>(entity =>
+        {
+            entity.HasKey(e => e.RequestId).HasName("OrderChangeRequest_pkey");
+            entity.ToTable("OrderChangeRequest");
+
+            entity.Property(e => e.Kind).HasMaxLength(10);
+            entity.Property(e => e.Reason).HasMaxLength(500);
+            entity.Property(e => e.Status).HasMaxLength(10).HasDefaultValue("PENDING");
+            entity.Property(e => e.DecisionNote).HasMaxLength(500);
+
+            /* Same trap as everywhere else in this schema: the columns are
+               "timestamp without time zone" and Npgsql will not write a
+               DateTime whose Kind is Utc into one. */
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamp without time zone");
+            entity.Property(e => e.DecidedAt).HasColumnType("timestamp without time zone");
+
+            entity.HasOne(e => e.Order).WithMany()
+                .HasForeignKey(e => e.OrderId)
+                .OnDelete(DeleteBehavior.Cascade)
+                .HasConstraintName("OrderChangeRequest_OrderId_fkey");
+
+            entity.HasOne(e => e.RequestedByUser).WithMany()
+                .HasForeignKey(e => e.RequestedByUserId)
+                .OnDelete(DeleteBehavior.Restrict)
+                .HasConstraintName("OrderChangeRequest_RequestedBy_fkey");
+
+            entity.HasOne(e => e.DecidedByUser).WithMany()
+                .HasForeignKey(e => e.DecidedByUserId)
+                .OnDelete(DeleteBehavior.Restrict)
+                .HasConstraintName("OrderChangeRequest_DecidedBy_fkey");
         });
 
         modelBuilder.Entity<PushSubscription>(entity =>

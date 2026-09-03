@@ -63,9 +63,44 @@ public abstract class ApiControllerBase : ControllerBase
 
     /* "timestamp without time zone" columns reject a Utc-kind DateTime, so every
        timestamp written goes through here. */
-    protected static DateTime Now() => DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Unspecified);
+    /*  BUSINESS TIME IS PAKISTAN TIME, NOT UTC.
 
-    protected static DateOnly Today() => DateOnly.FromDateTime(DateTime.UtcNow);
+        These used to return DateTime.UtcNow. Pakistan is UTC+5, so between
+        midnight and 5am local the UTC date is still YESTERDAY -- an order taken
+        at 1am on the 3rd was written down as the 2nd. On a sales ledger that is
+        not a rounding error: it moves a sale into the wrong day, the wrong
+        week, and at month end the wrong month.
+
+        The zone is resolved by id so the machine's own locale cannot change the
+        answer. Windows calls it "Pakistan Standard Time" and Linux calls it
+        "Asia/Karachi"; both are tried, and if a machine has neither the code
+        falls back to a fixed +5 rather than silently reverting to UTC.
+
+        The Kind stays Unspecified because every timestamp column in this schema
+        is "timestamp without time zone" and Npgsql refuses anything else.      */
+
+    private static readonly TimeZoneInfo BusinessZone = ResolveBusinessZone();
+
+    private static TimeZoneInfo ResolveBusinessZone()
+    {
+        foreach (var id in new[] { "Pakistan Standard Time", "Asia/Karachi" })
+        {
+            try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
+            catch (TimeZoneNotFoundException) { }
+            catch (InvalidTimeZoneException) { }
+        }
+
+        /* Pakistan has not observed daylight saving since 2009, so a fixed
+           offset is a correct fallback rather than an approximation. */
+        return TimeZoneInfo.CreateCustomTimeZone("PKT", TimeSpan.FromHours(5), "Pakistan Time", "PKT");
+    }
+
+    /// <summary>Now, in Pakistan time, with Kind=Unspecified for Npgsql.</summary>
+    protected static DateTime Now() => DateTime.SpecifyKind(
+        TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, BusinessZone), DateTimeKind.Unspecified);
+
+    /// <summary>Today's business date in Pakistan, which is what a ledger means by "today".</summary>
+    protected static DateOnly Today() => DateOnly.FromDateTime(Now());
 
     protected int CurrentUserId() =>
         int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var id) ? id : 0;
@@ -80,6 +115,15 @@ public abstract class ApiControllerBase : ControllerBase
     /// forty characters of a title and "Muhammad Talha bin Suhail" would eat
     /// all of them.
     /// </summary>
+    /// <summary>
+    /// The signed-in person's role key -- "super-admin", "sales",
+    /// "order-dept", "accountant", "warehouse-keeper".
+    ///
+    /// From the JWT, which already carries it. Every rule about who may do what
+    /// to an order is decided from this.
+    /// </summary>
+    protected string CurrentRole() => User.FindFirstValue(ClaimTypes.Role) ?? "";
+
     protected string CurrentUserName(bool firstNameOnly = true)
     {
         var full = User.FindFirstValue(ClaimTypes.Name);
@@ -138,13 +182,13 @@ public abstract class ApiControllerBase : ControllerBase
     protected async Task<string> NextNumber(string prefix)
     {
         var series = await _db.DocumentSeries.FirstOrDefaultAsync(s => s.Prefix == prefix);
-        if (series is null) return $"{prefix}-{DateTime.UtcNow:yyyyMMddHHmmss}";
+        if (series is null) return $"{prefix}-{Now():yyyyMMddHHmmss}";
 
         var n = series.NextNumber;
         series.NextNumber = n + 1;
         await _db.SaveChangesAsync();
 
-        var year = series.IncludeYear ? $"{DateTime.UtcNow:yy}-" : "";
+        var year = series.IncludeYear ? $"{Now():yy}-" : "";
         return $"{series.Prefix}-{year}{n.ToString().PadLeft(series.Padding, '0')}";
     }
 

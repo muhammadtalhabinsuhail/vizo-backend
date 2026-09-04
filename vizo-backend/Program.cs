@@ -162,7 +162,7 @@ builder.Services.AddSingleton<IAuthorizationHandler, PermissionHandler>();
 
 /* ─────────────────────────── CORS ──────────────────────────────── */
 var origins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
-              ?? new[] { "http://localhost:3000" };
+              ?? new[] { "http://localhost:3000", "https://advpos-frontend.vercel.app/" };
 
 builder.Services.AddCors(options =>
 {

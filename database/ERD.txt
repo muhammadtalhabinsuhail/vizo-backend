@@ -1,0 +1,505 @@
+===============================================================================
+ ADVANCE POS SYSTEM (AdvPOS) -- ENTITY RELATIONSHIP DIAGRAM (text)
+ 84 tables. PostgreSQL. No enums, no triggers, no procedures.
+===============================================================================
+
+HOW TO READ THIS
+  A ──< B      one A has many B          (B holds the foreign key)
+  A ──- B      one A has exactly one B   (B's primary key IS the foreign key)
+  A >──< B     many-to-many, resolved by the junction table named between them
+  [PK]         primary key
+  [FK]         foreign key
+  [U]          unique constraint
+  (CASCADE)    deleting the parent deletes these children
+  (SET NULL)   deleting the parent leaves the child, with the link emptied
+
+
+===============================================================================
+ 1. THE SPINE:  Role  ->  User  ->  Employee / Party
+===============================================================================
+
+This is the shape you asked for. One role table, one user table beneath it,
+and then two subtype tables because a member of staff and a shop are not the
+same kind of thing even though both are users.
+
+    Role  [PK role_id]                       7 rows
+      |   role_key, role_name, description, home_path,
+      |   is_staff_role, requires_email, is_system
+      |   [U] role_key
+      |   [U] (role_id, requires_email)  <-- target of the rule below
+      |
+      +──< User  [PK user_id]                32 rows
+      |     role_id [FK]  (CASCADE)
+      |     requires_email  -- mirrors Role, held in place by a composite FK
+      |     full_name, email [U], phone, password_hash,
+      |     primary_location_id [FK -> Location] (SET NULL),
+      |     is_active, created_at
+      |          |
+      |          +──- Employee [PK/FK user_id]      11 rows   (CASCADE)
+      |          |      employee_code [U], is_locked, joined_on, last_login_at
+      |          |
+      |          +──- Party    [PK/FK user_id]      21 rows   (CASCADE)
+      |                 party_code [U], legal_name, display_name,
+      |                 category_id [FK -> PartyCategory],
+      |                 city_id [FK -> City],
+      |                 ntn [U], strn [U], cnic [U],
+      |                 credit_limit, credit_days,
+      |                 hold_policy_id [FK -> CreditHoldPolicy],
+      |                 opening_balance, rating,
+      |                 sales_person_user_id [FK -> Employee] (SET NULL),
+      |                 default_location_id  [FK -> Location] (SET NULL)
+      |
+      +──< RolePermission >──── Permission [PK permission_id]   39 rows
+      |      [PK (role_id, permission_id)]                      93 links
+      |
+      +──< DeliveryChannel.confirmed_by_role_id
+
+
+  THE E-MAIL RULE (your example, enforced without a single trigger)
+  ---------------------------------------------------------------------------
+  Super Admin, Accountant, Order Department and Sales sign in, so their
+  address is mandatory and unique. Customers and Suppliers are opened by the
+  Super Admin off a phone call and very often have no e-mail at all.
+
+  Three constraints do it between them:
+
+    1.  Role has  [U] (role_id, requires_email)
+    2.  User has  FK (role_id, requires_email) -> Role (role_id, requires_email)
+                  ON UPDATE CASCADE
+    3.  User has  CHECK (requires_email = FALSE OR email IS NOT NULL)
+
+  A Sales user with a NULL e-mail fails the CHECK. A staff row that tries to
+  claim the customer rule by setting requires_email = FALSE fails the foreign
+  key, because no such pair exists in Role. Flip the flag on Role and the
+  CASCADE rewrites every user of that role at once, so the two can never drift.
+  UNIQUE on email still forbids two people sharing one address, and PostgreSQL
+  allows any number of NULLs in a unique column, so every party may be blank.
+
+  Verified against PostgreSQL 18 -- all four cases behave as described.
+
+
+  Other links off a user:
+    User ──< UserLocation >──── Location    (a user may work several places)
+    User ──< UserPreference                 (notification switches)
+    User ──< Notification
+    User ──< ActivityLog                    (SET NULL: the system posts too)
+
+
+===============================================================================
+ 2. COMPANY, PLACES, SETUP
+===============================================================================
+
+    Province [PK province_id]  7
+        └──< City [PK city_id]  11   [U] (city_name, province_id)
+               ├──< Company  [PK company_id]  1   (single tenant)
+               ├──< Location
+               └──< Party
+
+    LocationKind [PK kind_id]  5  (warehouse, shop, department, claim, transit)
+        └──< Location [PK location_id]  5
+               location_code [U], location_name [U], city_id [FK],
+               in_charge_user_id [FK -> User] (SET NULL),
+               is_active, is_default, exclude_from_sellable
+
+    city -> province is broken out on purpose. Holding both on Party would
+    make province depend on city rather than on the key, which is exactly the
+    transitive dependency third normal form removes.
+
+    AppSetting     [PK setting_id]  22   setting_key [U]   -- every policy switch
+    DocumentSeries [PK series_id]   13   series_key [U], prefix [U]
+    FiscalPeriod   [PK period_id]    8   [U] (period_year, period_month)
+                                          closed_by_user_id [FK] (SET NULL)
+
+
+===============================================================================
+ 3. CARRIERS AND DELIVERY ROUTES
+===============================================================================
+
+    Courier [PK courier_id]  13   courier_name [U]
+       |    cod_settlement_days, booking_charge, cod_fee_percent
+       |
+       └──< ChannelCarrier >──── DeliveryChannel [PK channel_id]  4
+              [PK (channel_id, courier_id)]     channel_key [U]
+                                                confirmed_by_role_id [FK -> Role]
+                                                remind_after_days, remind_every_hours
+                                                requires_bilty
+
+    The frontend keeps carriers as an array on the channel. An array is not
+    first normal form, so ChannelCarrier holds one row per pair.
+
+
+===============================================================================
+ 4. CATALOGUE AND STOCK ON HAND
+===============================================================================
+
+    Category [PK category_id]  14
+       └──< Category.parent_category_id      (self-referencing tree)
+       └──< Product
+
+    Brand [PK brand_id]  6    brand_code [U], brand_name [U]
+       └──< Product
+
+    Product [PK product_id]  33
+       |  sku [U], product_name, category_id [FK], brand_id [FK],
+       |  packing, min_qty, max_qty,
+       |  opening_cost, cost_price, sale_price, tax_rate_percent,
+       |  hide_stock, is_active
+       |
+       ├──< ProductBarcode [PK barcode_id]  35   barcode [U]
+       |       policy allows several barcodes per item, so they cannot be a column
+       |
+       └──< StockBalance  [PK (product_id, location_id)]  104
+               quantity  -- may go negative: the live catalogue carries known
+                            discrepancies that must stay visible until counted
+
+    StockBalance is the shelf figure. StockMovement (section 7) is how it
+    got there.
+
+
+===============================================================================
+ 5. ACCOUNTING -- ONE SOURCE OF TRUTH
+===============================================================================
+
+    AccountGroup [PK group_id]  5      (Assets, Capital, Expenses,
+       |                                 Liabilities, Revenue)
+       └──< AccountType [PK account_type_id]  14
+              |  type_name [U], code_prefix [U], code_length,
+              |  is_debit_normal, is_system
+              |
+              └──< Account [PK account_id]  52
+                     account_code [U], account_name,
+                     parent_account_id [FK -> Account]   (self-referencing tree)
+                     is_group, opening_balance, currency_code
+
+    Account carries an opening_balance AND NOTHING ELSE. There is no stored
+    running balance, because a stored balance is a second truth that drifts
+    the first time somebody edits an entry.
+
+    JournalEntryType [PK]  7    PostingStatus [PK]  6    FiscalPeriod [PK]  8
+            \                        |                        /
+             \                       |                       /
+              +─────────────> JournalEntry [PK entry_id]  35
+                                |  entry_no [U], entry_date, entry_type_id [FK],
+                                |  period_id [FK], location_id [FK],
+                                |  reference_no, narration, status_id [FK],
+                                |  created_by_user_id [FK], posted_by_user_id [FK]
+                                |
+                                └──< JournalEntryLine [PK line_id]  106
+                                       [U] (entry_id, line_no)
+                                       account_id [FK -> Account]
+                                       party_user_id [FK -> Party] (SET NULL)
+                                       debit_amount, credit_amount
+                                       CHECK: a line is a debit OR a credit,
+                                              never both and never neither
+
+    EVERYTHING FINANCIAL IS A QUERY OVER THOSE TWO TABLES
+    ---------------------------------------------------------------------------
+      Ledger         WHERE account_id = ?           ORDER BY entry_date
+      Trial balance  SUM(debit), SUM(credit)        GROUP BY account_id
+      Manual entry   a JournalEntry of type JOURNAL, keyed on the screen
+      Statement      WHERE party_user_id = ?
+      P&L / Balance  the same sums rolled up  Account -> AccountType -> AccountGroup
+
+    Verified on the seed: 35 entries, 106 lines, every entry balances, and the
+    trial balance comes out 5,323,575.00 debit against 5,323,575.00 credit.
+
+    The documents that MOVE money all hang off the same ledger:
+
+    VoucherType [PK]  7
+       └──< Voucher [PK voucher_id]  15
+              |  voucher_no [U], voucher_date, location_id [FK],
+              |  party_user_id [FK -> Party] (SET NULL),
+              |  cash_bank_account_id [FK -> Account]  -- NULL only on a JV,
+              |                                           which touches no drawer
+              |  amount, method_id [FK], status_id [FK],
+              |  entry_id [FK -> JournalEntry] (SET NULL)
+              |
+              └──< VoucherAllocation [PK allocation_id]  13
+                     sales_invoice_id    [FK -> SalesInvoice]
+                     purchase_invoice_id [FK -> PurchaseInvoice]
+                     amount
+                     CHECK: exactly one of the two, never both
+
+    THIS is what "paid" means. No invoice stores a paid or balance column:
+
+        SELECT SUM(amount) FROM "VoucherAllocation" WHERE sales_invoice_id = ?
+
+    Expense [PK expense_id]  6
+       expense_account_id [FK -> Account], paid_from_account_id [FK -> Account],
+       method_id [FK], status_id [FK], entry_id [FK] (SET NULL)
+       CHECK: the two accounts must differ
+
+    Collection [PK collection_id]  8      -- money a rep took in the field
+       |  receipt_no [U], customer_user_id [FK -> Party],
+       |  collected_by_user_id [FK -> Employee], amount, method_id [FK],
+       |  cheque_date, status_id [FK -> CollectionStatus],
+       |  confirmed_on, confirmed_by_user_id [FK] (SET NULL),
+       |  voucher_id [FK -> Voucher] (SET NULL)
+       |
+       └──< CollectionAllocation [PK allocation_id]  7
+              order_id [FK -> SalesOrder], amount
+
+       The rep's entry does NOT move the customer's ledger. It waits for
+       Accounts to confirm, and only then becomes a Voucher and an entry.
+       voucher_id is NULL until that happens. Without that gap a rep could sit
+       on cash for a week and the books would still look settled.
+
+    BankReconciliation [PK reconciliation_id]  5   [U] (account_id, statement_date)
+       └──< BankStatementLine [PK statement_line_id]  10
+              matched_line_id [FK -> JournalEntryLine] (SET NULL)
+              NULL means still unreconciled
+
+
+===============================================================================
+ 6. SALES   Order -> packing -> dispatch -> Invoice -> Return
+===============================================================================
+
+    OrderStatus [PK]  11        PaymentMethod [PK]  8
+          \                       /
+           SalesOrder [PK order_id]  17
+             |  order_no [U], customer_user_id [FK -> Party],
+             |  location_id [FK], sales_person_user_id [FK -> Employee] (SET NULL),
+             |  order_date, delivery_date, status_id [FK], method_id [FK],
+             |  subtotal, discount_amount, tax_amount, total_amount,
+             |  credit_hold_reason        -- why the owner had to look at it
+             |
+             ├──< SalesOrderItem [PK order_item_id]  55
+             |      [U] (order_id, line_no)  [U] (order_id, product_id)
+             |      product_id [FK], quantity, unit_price,
+             |      discount_percent, tax_percent, line_total
+             |
+             ├──- SalesInvoice.order_id [U]   (at most one invoice per order)
+             ├──< CollectionAllocation
+             └──< Delivery
+
+    SalesInvoice [PK invoice_id]  12
+      |  invoice_no [U], order_id [FK, U, NULLABLE],
+      |    NULL = a counter sale: somebody walks in, buys, leaves, and no
+      |           order ever existed
+      |  customer_user_id [FK], location_id [FK], invoice_date, due_date,
+      |  subtotal, discount_amount, tax_amount, total_amount,
+      |  status_id [FK -> InvoiceStatus], method_id [FK],
+      |  entry_id [FK -> JournalEntry] (SET NULL)
+      |  CHECK: due_date >= invoice_date
+      |
+      ├──< SalesInvoiceItem [PK invoice_item_id]  40
+      |      unit_price AND unit_cost -- the cost is frozen at the moment of
+      |      sale, because today's cost price is not what this piece cost
+      |
+      ├──< VoucherAllocation
+      ├──< SalesReturn
+      └──- Delivery.invoice_id (SET NULL)
+
+    SalesReturn [PK return_id]  5
+      |  return_no [U], invoice_id [FK], refund_method_id [FK -> PaymentMethod],
+      |  status_id [FK -> ReturnStatus]
+      └──< SalesReturnItem [PK return_item_id]  5
+             condition_id [FK -> ReturnCondition],
+             restock_location_id [FK -> Location] (SET NULL)
+             a resalable piece goes back on a shelf; a damaged one has no
+             restock location and heads for claim stock instead
+
+    DOCUMENT ARITHMETIC (verified on every row of the seed)
+        subtotal = SUM(line_total) of its items, to the paisa
+        subtotal + tax_amount - discount_amount = total_amount
+
+
+===============================================================================
+ 7. PURCHASES AND STOCK MOVEMENT
+===============================================================================
+
+    PurchaseOrderStatus [PK]  7
+       └──< PurchaseOrder [PK po_id]  7   po_no [U]
+              |  supplier_user_id [FK -> Party], location_id [FK],
+              |  created_by_user_id [FK -> Employee],
+              |  approved_by_user_id [FK -> Employee] (SET NULL)
+              ├──< PurchaseOrderItem  22   [U] (po_id, line_no), [U] (po_id, product_id)
+              ├──< GoodsReceipt.po_id (SET NULL)
+              └──< PurchaseInvoice.po_id (SET NULL)
+
+    GoodsReceipt [PK grn_id]  5   grn_no [U]
+       |  po_id [FK, NULLABLE] -- goods sometimes arrive against a phone call
+       |  delivery_note_no, vehicle_no, total_value,
+       |  status_id [FK -> PostingStatus], entry_id [FK] (SET NULL)
+       └──< GoodsReceiptItem  15
+              qty_received, qty_damaged, unit_cost, batch_no, expiry_date
+              CHECK: qty_damaged <= qty_received
+
+    PurchaseInvoice [PK pi_id]  5   invoice_no [U]
+       |  supplier_invoice_no  -- [U] (supplier_user_id, supplier_invoice_no)
+       |                          two different suppliers both numbering an
+       |                          invoice "INV-001" is completely normal
+       |  wht_amount   -- withholding tax deducted at source
+       ├──< PurchaseInvoiceItem  15
+       ├──< PurchaseReturn  5 ──< PurchaseReturnItem  10
+       └──< VoucherAllocation
+
+    TransferStatus [PK]  6
+       └──< StockTransfer [PK transfer_id]  6   transfer_no [U]
+              |  from_location_id [FK], to_location_id [FK]
+              |  CHECK: from <> to
+              └──< StockTransferItem  12
+
+    AdjustmentReason [PK]  6
+       └──< StockAdjustment [PK adjustment_id]  5   adjustment_no [U]
+              └──< StockAdjustmentItem  9
+                     current_qty, new_qty   CHECK: they must differ
+                     both sides kept so a correction reads back years later
+
+    MovementType [PK]  7
+       └──< StockMovement [PK movement_id]  12          *** HISTORY ***
+              product_id [FK], location_id [FK], moved_at,
+              reference_no, quantity (signed), balance_after, user_id [FK]
+
+              Which WAY a piece moved is the sign on quantity. There is no
+              direction column on MovementType, because that would be a second
+              copy of the same fact -- and a stock correction goes either way.
+
+
+===============================================================================
+ 8. DELIVERY, CLAIMS, FIELD WORK
+===============================================================================
+
+    DeliveryStatus [PK]  8   NOT_DISPATCHED, BOOKED, AWAITING, IN_TRANSIT,
+       |                     OUT_FOR_DELIVERY, DELIVERED, FAILED,
+       |                     RETURNED_TO_SENDER
+       └──< Delivery [PK delivery_id]  11   delivery_no [U]
+              order_id [FK -> SalesOrder] (CASCADE)
+              invoice_id [FK -> SalesInvoice] (SET NULL)
+              channel_id [FK], courier_id [FK] (SET NULL),
+              tracking_no, booked_date, expected_date, delivered_date,
+              parcels, weight_kg, cod_amount, is_cod_settled,
+              booking_charge, reminders_sent,
+              confirmed_by_user_id [FK -> Employee] (SET NULL)
+
+       Everything about how the goods left and whether they arrived lives on
+       ONE row. SalesOrder never repeats a carrier or a tracking number. No
+       Delivery row means the order has not been dispatched.
+
+       AWAITING and IN_TRANSIT are the two states the business added on top of
+       the courier's own: "we sent it and nobody has confirmed" against
+       "somebody checked, it is still moving". The gap between those two is
+       precisely what this system was built to see.
+
+    ClaimStage [PK] 6   ClaimReason [PK] 7   ClaimOutcome [PK] 3
+          \                    |                   /
+           Claim [PK claim_id]  12    claim_no [U]
+             customer_user_id [FK -> Party], received_by_user_id [FK -> Employee],
+             product_id [FK], quantity, unit_cost,
+             original_order_no  -- FREE TEXT, and almost always NULL
+             supplier_user_id [FK -> Party] (SET NULL),
+             sent_on, settled_on, supplier_note, reminders_sent
+             CHECK: settled_on requires sent_on; sent_on requires a supplier
+
+       A claim is recorded against the ITEM, never against an order. A
+       shopkeeper brings back one dead battery months later and has no idea
+       which invoice it came on, and does not care. That is why there is no
+       foreign key to an order here -- only an optional scrap of text.
+
+    VisitOutcome [PK]  4
+       └──< CustomerVisit [PK visit_id]  7
+              customer_user_id [FK], sales_person_user_id [FK -> Employee],
+              visited_at, notes, latitude, longitude
+
+
+===============================================================================
+ 9. NOTIFICATIONS AND HISTORY
+===============================================================================
+
+    SeverityLevel [PK]  5
+       ├──< Notification  [PK notification_id]  6
+       └──< ActivityLog   [PK log_id]  10               *** HISTORY ***
+              user_id [FK] (SET NULL -- the system posts, and a failed
+                            sign-in has nobody to blame)
+              action_name, entity_type, entity_reference, detail,
+              ip_address, location_id [FK] (SET NULL), logged_at
+
+    BackupType [PK] 3   BackupStatus [PK] 3
+              \             /
+           BackupHistory [PK backup_id]  5              *** HISTORY ***
+              started_at, size_mb, destination, duration_seconds,
+              checksum_hash, triggered_by_user_id [FK] (SET NULL)
+
+    REMINDERS ARE NOT STORED, AND THAT IS DELIBERATE.
+    A claim that has sat too long produces a reminder because of its dates.
+    Settle it and the reminder disappears on its own. Storing them would mean
+    rows to tick off and rows going stale.
+
+
+===============================================================================
+ 10. DELETE BEHAVIOUR -- nothing ever blocks
+===============================================================================
+
+    Every foreign key is ON UPDATE CASCADE. On delete there are two rules:
+
+    ON DELETE CASCADE  where the child is owned by the parent and is
+                       meaningless without it:
+                         SalesOrder      -> SalesOrderItem, Delivery,
+                                            CollectionAllocation, SalesInvoice
+                         SalesInvoice    -> SalesInvoiceItem, SalesReturn,
+                                            VoucherAllocation
+                         JournalEntry    -> JournalEntryLine
+                         User            -> Employee, Party, and everything
+                                            hanging off them
+                         Product         -> ProductBarcode, StockBalance
+                         Category/Account-> their own children (self-reference)
+
+    ON DELETE SET NULL where the reference is optional and the child stands
+                       on its own without it:
+                         Location -> User.primary_location_id
+                         Location -> ActivityLog.location_id
+                         Employee -> Party.sales_person_user_id
+                         Employee -> Delivery.confirmed_by_user_id
+                         JournalEntry -> Voucher.entry_id, Expense.entry_id
+                         PurchaseOrder -> GoodsReceipt.po_id
+
+    Verified: deleting order 1 removed its 3 items, its delivery, its
+    collection allocation and its invoice, and nothing raised an error.
+    Deleting customer 12 removed the party row, their orders, their claims and
+    their collections. Deleting a location left all 32 users standing with the
+    link emptied.
+
+    A WORD OF WARNING, because it follows from what you asked for:
+    with CASCADE everywhere, DELETE on master data is destructive by design.
+    Deactivate instead of deleting -- Product, Party, Location, Courier,
+    Category, Brand and Account all carry is_active for exactly that reason.
+
+
+===============================================================================
+ 11. WHAT IS DELIBERATELY NOT HERE
+===============================================================================
+
+    STATUS HISTORY.  Every document carries its CURRENT status as a foreign
+    key to a status table -- SalesOrder.status_id, Claim.stage_id,
+    Delivery.status_id and so on. What it does not carry is the trail of how
+    it got there: who marked ORD-26-0142 dispatched, and when.
+
+    That is answered separately, in 04_status_history.sql, which is not part
+    of the schema above and does not need to be loaded.
+
+    Nothing else from the frontend is missing. Reminders are derived rather
+    than stored, for the reason given in section 9.
+
+
+===============================================================================
+ ROW COUNTS -- 84 tables, 1,242 rows
+===============================================================================
+
+  Five or more records sit in every master and transactional table.
+
+  Eleven tables hold fewer, and every one of them is a reference list whose
+  complete real value set is smaller than five. Padding them would put a lie
+  in the reference data -- there is no fourth thing a field collection can be:
+
+    Company               1   single tenant
+    BackupStatus          3   Success, Failed, Running
+    BackupType            3   Full, Incremental, Manual
+    ClaimOutcome          3   Replaced on the spot, Credit given, Waiting
+    CollectionStatus      3   Awaiting, Confirmed, Bounced
+    CreditHoldPolicy      3   None, Warn, Block
+    DeliveryChannel       4   own team, online courier, cargo, freight
+    ReturnCondition       4   Resalable, Damaged, Expired, Missing
+    ReturnStatus          4   Draft, Approved, Posted, Rejected
+    VisitOutcome          4   Order placed, No order, Followup, Payment collected
+
+===============================================================================

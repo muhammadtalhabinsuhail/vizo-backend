@@ -191,6 +191,11 @@ public class PartiesController : ApiControllerBase
                     cityId = x.CityId,
                     city = x.City.CityName,
                     province = x.City.Province.ProvinceName,
+                    /* "PK" or "CN". Which of the two sets of tax numbers this
+                       party actually has -- read from its own city, the same
+                       route CheckTax takes on the way in. The detail screen
+                       labels the three fields from it. */
+                    country = x.City.Province.Country.Trim(),
                     addressLine = x.AddressLine,
                     categoryId = x.CategoryId,
                     category = x.Category.CategoryKey,
@@ -226,7 +231,7 @@ public class PartiesController : ApiControllerBase
             {
                 p.id, p.partyCode, p.type, p.legalName, p.displayName,
                 initials = Initials(p.displayName),
-                p.phone, p.altPhone, p.email, p.cityId, p.city, p.province, p.addressLine,
+                p.phone, p.altPhone, p.email, p.cityId, p.city, p.province, p.country, p.addressLine,
                 p.categoryId, p.category, p.categoryName, p.industry,
                 p.ntn, p.strn, p.cnic,
                 p.creditLimit, p.creditDays, p.holdPolicyId, p.creditHoldPolicy,

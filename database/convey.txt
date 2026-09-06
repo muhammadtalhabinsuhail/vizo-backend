@@ -228,11 +228,15 @@
  Once the country is chosen, only that country's cities are offered. The
  customer path is untouched and still lists every city, exactly as before.
 
- ONE THING LEFT AS IT WAS. The party DETAIL page (/parties/[id]) still labels
- the three fields NTN, STRN and CNIC for everybody, so a Chinese supplier's page
- reads "NTN 91440300MA5EDK8T5H". The value is right; the word above it is
- Pakistani. You said not to touch anything else, so I have not -- it is the same
- one-line lookup the form now uses, whenever you want it.
+ THE PROFILE FOLLOWS TOO. /parties/[id] labels the same three rows from the
+ same place, so a Chinese supplier's page reads USCC / VAT No. / ID Card and a
+ Pakistani one still reads NTN / STRN / CNIC.
+
+ The words themselves now live in ONE file -- vizo-erp/src/lib/party-tax.ts --
+ and both screens read from it. They were briefly held separately, which is
+ exactly how a supplier ended up being SAVED as a Social Credit Code and
+ DISPLAYED as an "NTN": one screen was taught and the other was not. One copy
+ of the words, and that cannot happen again.
 
  A NOTE ON THE PHONE RULE. The Chinese pattern accepts a mainland mobile
  (1[3-9] then nine digits) or a landline with its area code. It is deliberately
@@ -366,9 +370,12 @@
                              unchanged values, to prove INV-26-8880 rebuilds
         Two products         TEST-NOTIF-01 and TEST-WH-01, created to prove the
                              "added by <name>" notification, then deleted
-        One party            "Shenzhen Huaqiang Electronics Co., Ltd", saved
-                             through the form to prove a Chinese supplier goes
-                             in and comes back out intact, then deleted
+        Two parties          "Shenzhen Huaqiang Electronics Co., Ltd", saved
+                             twice -- once through the form to prove a Chinese
+                             supplier goes in and comes back out intact, and
+                             once to check the profile labels it USCC / VAT No.
+                             / ID Card. Both deleted; make a real one when you
+                             have a real supplier.
 
       Every status change is in the activity log with a reason. No figures
       changed and no products remain.

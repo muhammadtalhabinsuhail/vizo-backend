@@ -426,7 +426,17 @@ public class PartiesController : ApiControllerBase
                     .ToListAsync(),
                 cities = await _db.Cities.AsNoTracking()
                     .OrderBy(c => c.CityName)
-                    .Select(c => new { id = c.CityId, name = c.CityName, province = c.Province.ProvinceName })
+                    .Select(c => new
+                    {
+                        id = c.CityId,
+                        name = c.CityName,
+                        province = c.Province.ProvinceName,
+                        /* "PK" or "CN". The new-party form uses this to show the
+                           right cities once the admin has said where the
+                           supplier is, and the same value decides which set of
+                           tax numbers is asked for. */
+                        country = c.Province.Country.Trim()
+                    })
                     .ToListAsync(),
                 holdPolicies = await _db.CreditHoldPolicies.AsNoTracking()
                     .OrderBy(h => h.PolicyId)
@@ -669,6 +679,76 @@ public class PartiesController : ApiControllerBase
         _ => RoleCustomer
     };
 
+    /* ───────────────────── THE TWO SETS OF TAX NUMBERS ─────────────────────
+
+       A Pakistani party has an NTN, an STRN and a CNIC. A Chinese one has none
+       of those: it has a Unified Social Credit Code, a VAT registration and a
+       Resident ID card, and all three look nothing like ours.
+
+       Which set applies is NOT asked for on the request. It is read from the
+       party's own city, through its province -- see 17_party_country.sql. A
+       supplier in Guangdong is Chinese; there is no second field to disagree
+       with that, and no way to send a Karachi address flagged as Chinese.
+
+       The three database columns are shared. An 18-character Social Credit Code
+       lives in "Ntn" and the screen labels it USCC. Renaming the columns would
+       mean touching every report and export that reads them, to gain nothing a
+       label does not already give. */
+
+    private static readonly System.Text.RegularExpressions.Regex PkNtn =
+        new(@"^\d{7}-\d$", System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex PkStrn =
+        new(@"^\d{2}-\d{2}-\d{4}-\d{3}-\d{2}$", System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex PkCnic =
+        new(@"^\d{5}-\d{7}-\d$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /* The Social Credit Code and the VAT number are drawn from a restricted
+       alphabet: digits plus the capitals EXCEPT I, O, S, V and Z, which were
+       left out precisely because they are misread as 1, 0, 5, U and 2. */
+    private const string CnAlphabet = "0-9A-HJ-NP-RTUW-Y";
+
+    private static readonly System.Text.RegularExpressions.Regex CnUscc =
+        new($"^[{CnAlphabet}]{{18}}$", System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex CnVat =
+        new($"^[{CnAlphabet}]{{15}}$|^[{CnAlphabet}]{{18}}$", System.Text.RegularExpressions.RegexOptions.Compiled);
+    /* Seventeen digits and a check character, which is a digit or an X. */
+    private static readonly System.Text.RegularExpressions.Regex CnIdCard =
+        new(@"^\d{17}[\dX]$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static string? CheckTax(string country, PartyRequest b)
+    {
+        string N(string? v) => (v ?? "").Trim();
+        var ntn = N(b.Ntn);
+        var strn = N(b.Strn);
+        var cnic = N(b.Cnic);
+
+        if (country == "CN")
+        {
+            var uscc = ntn.ToUpperInvariant();
+            var vat = strn.ToUpperInvariant();
+            var id = cnic.ToUpperInvariant();
+
+            if (uscc.Length > 0 && !CnUscc.IsMatch(uscc))
+                return "The Unified Social Credit Code is 18 characters, digits and capitals "
+                     + "(no I, O, S, V or Z) -- for example 91440300MA5EDK8T5H.";
+            if (vat.Length > 0 && !CnVat.IsMatch(vat))
+                return "The VAT taxpayer number is 15 or 18 characters, digits and capitals "
+                     + "(no I, O, S, V or Z).";
+            if (id.Length > 0 && !CnIdCard.IsMatch(id))
+                return "A Resident ID card number is 17 digits and a check character "
+                     + "(a digit or X) -- for example 440301199001011234.";
+            return null;
+        }
+
+        if (ntn.Length > 0 && !PkNtn.IsMatch(ntn))
+            return "NTN must look like 1234567-8.";
+        if (strn.Length > 0 && !PkStrn.IsMatch(strn))
+            return "STRN must look like 32-77-8901-234-56.";
+        if (cnic.Length > 0 && !PkCnic.IsMatch(cnic))
+            return "CNIC must look like 00000-0000000-0.";
+        return null;
+    }
+
     private async Task<string?> ValidateParty(PartyRequest b, int? existingId)
     {
         if (string.IsNullOrWhiteSpace(b.LegalName)) return "Legal name is required.";
@@ -690,10 +770,46 @@ public class PartiesController : ApiControllerBase
 
         if (!await _db.PartyCategories.AnyAsync(c => c.CategoryId == b.CategoryId))
             return "Pick a valid category.";
-        if (!await _db.Cities.AnyAsync(c => c.CityId == b.CityId))
-            return "Pick a valid city.";
+        var country = await _db.Cities.AsNoTracking()
+            .Where(c => c.CityId == b.CityId)
+            .Select(c => c.Province.Country)
+            .FirstOrDefaultAsync();
+        if (country is null) return "Pick a valid city.";
+
         if (!await _db.CreditHoldPolicies.AnyAsync(h => h.PolicyId == b.HoldPolicyId))
             return "Pick a valid credit-hold policy.";
+
+        /* Checked here as well as on the form, because a shape the browser
+           happens to enforce is not a shape the database is protected by. */
+        var badTax = CheckTax(country.Trim().ToUpperInvariant(), b);
+        if (badTax is not null) return badTax;
+
+        /* All three tax numbers are UNIQUE in the schema, and until now nothing
+           said so before the insert -- a number already on another account came
+           back as a raw 500 with a constraint name in it. The party code and the
+           e-mail have always been checked properly; these three were simply
+           missed. Same treatment, same wording. */
+        foreach (var (value, what) in new[]
+                 {
+                     ((b.Ntn ?? "").Trim(),  country == "CN" ? "Social Credit Code" : "NTN"),
+                     ((b.Strn ?? "").Trim(), country == "CN" ? "VAT number" : "STRN"),
+                     ((b.Cnic ?? "").Trim(), country == "CN" ? "ID card number" : "CNIC"),
+                 })
+        {
+            if (value.Length == 0) continue;
+
+            var taken = what switch
+            {
+                "NTN" or "Social Credit Code" => await _db.Parties.AnyAsync(
+                    p => p.Ntn == value && (existingId == null || p.UserId != existingId)),
+                "STRN" or "VAT number" => await _db.Parties.AnyAsync(
+                    p => p.Strn == value && (existingId == null || p.UserId != existingId)),
+                _ => await _db.Parties.AnyAsync(
+                    p => p.Cnic == value && (existingId == null || p.UserId != existingId)),
+            };
+
+            if (taken) return $"{what} {value} is already on another account.";
+        }
 
         return null;
     }

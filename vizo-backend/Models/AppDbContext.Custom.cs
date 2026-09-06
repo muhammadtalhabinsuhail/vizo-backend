@@ -147,6 +147,18 @@ public partial class AppDbContext
             entity.Property(e => e.Url).HasColumnName("Url").HasMaxLength(300);
         });
 
+        /* "Province"."Country" -- added in 17_party_country.sql, so that a
+           supplier in Guangdong is known to be Chinese without anybody having
+           to say so on the party row. Declared here rather than in the
+           scaffolded context, which is regenerated and would lose it. */
+        modelBuilder.Entity<Province>(entity =>
+        {
+            entity.Property(e => e.Country)
+                  .HasColumnName("Country")
+                  .HasColumnType("character(2)")
+                  .HasDefaultValue("PK");
+        });
+
         modelBuilder.Entity<OrderChangeRequest>(entity =>
         {
             entity.HasKey(e => e.RequestId).HasName("OrderChangeRequest_pkey");

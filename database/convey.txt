@@ -2,9 +2,9 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
- Last written 3 September 2026, after the notification-routing and warehouse
- work. Rewritten in full each time, so this is the current state of everything
- worth saying — not a log.
+ Last written 6 September 2026, after the Chinese-party work. Rewritten in
+ full each time, so this is the current state of everything worth saying — not
+ a log.
 
  Read section 1 before you deploy. The rest is reference.
 
@@ -17,10 +17,11 @@
 
       backend/database/15_order_workflow.sql
       backend/database/16_warehouse_and_notification_links.sql
+      backend/database/17_party_country.sql
 
-      Both have already been run against the live Neon database. Any OTHER
-      environment — a colleague's local copy, staging — must run them or the
-      order chain and the clickable bell are simply missing.
+      All three have already been run against the live Neon database. Any OTHER
+      environment — a colleague's local copy, staging — must run them, or the
+      order chain, the clickable bell and Chinese suppliers are simply missing.
 
       15 adds four order statuses, the warehouse-keeper role, the
       orders.warehouse permission, "OrderChangeRequest", and
@@ -30,7 +31,10 @@
       steps), the "Notification"."Url" column, and invoices.view for the
       warehouse keeper.
 
-      Both are written to be safe to run twice.
+      17 adds "Province"."Country" -- 'PK' or 'CN' -- and marks the 34 Chinese
+      provinces that were already sitting in that table.
+
+      All three are written to be safe to run twice.
 
  1.2  npm install IN THE FRONTEND
 
@@ -108,6 +112,32 @@
       refuse a delivered order threw a NullReferenceException on every single
       edit. Fixed by including the navigation.
 
+ 3.4  YOU COULD NOT SAVE A PARTY WITHOUT PICKING A SALES REP
+
+      Found while testing the Chinese form, and nothing to do with it:
+      /parties/new could not save AT ALL unless a sales rep was chosen.
+
+      The payload said `d.salesPersonUserId === "" ? null : Number(...)`, but
+      that field is z.coerce.number(), and coercing "" gives 0, never "". So
+      leaving Sales Rep on "-- None --" sent 0, 0 is not an employee id, and the
+      insert died on fk_party_salesperson with a raw 500.
+
+      Now reads "greater than zero, or null". Nothing else about that field
+      changed. Worth knowing how long it has been like that -- if suppliers have
+      been going in some other way, this is why.
+
+ 3.5  A DUPLICATE TAX NUMBER CAME BACK AS A 500
+
+      "Ntn", "Strn" and "Cnic" are all UNIQUE in the schema, and nothing said so
+      before the insert -- re-using one answered with a constraint name inside a
+      stack trace. The party code and the e-mail have always been checked
+      properly; these three were simply missed. They now say
+
+        NTN 1234567-8 is already on another account.
+
+      and, for a Chinese party, "Social Credit Code ... is already on another
+      account."
+
 
 ───────────────────────────────────────────────────────────────────────────────
  4.  WHAT THE NOTIFICATIONS DO NOW
@@ -159,6 +189,55 @@
 
       The rep is added by user id, not by role, so it is the person who wrote
       that order rather than every salesperson in the company.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 4A.  PAKISTANI AND CHINESE PARTIES
+───────────────────────────────────────────────────────────────────────────────
+
+ /parties/new asks, for a supplier or a customer-and-supplier, whether the
+ party is Pakistani or Chinese. A plain customer is not asked -- it is a shop in
+ Pakistan.
+
+ Choosing Chinese changes three things: every example placeholder on the form,
+ the phone format, and the three tax fields.
+
+     NTN   1234567-8            ->  USCC     91440300MA5EDK8T5H
+     STRN  32-77-8901-234-56    ->  VAT No.  440300123456789
+     CNIC  00000-0000000-0      ->  ID Card  440301199001011234
+
+ The placeholders are in English letters on purpose. A placeholder exists to
+ show somebody the shape of the thing they are about to type, and nobody at
+ this company reads Chinese characters -- so they are real Chinese companies,
+ addresses and numbers, written the way they appear on an export invoice.
+
+ THE SAME THREE DATABASE COLUMNS hold both sets. An 18-character Social Credit
+ Code lives in "Ntn" and the screen labels it USCC. Renaming the columns would
+ mean touching every report and export that reads them, to gain nothing a label
+ does not already give. All three were already wide enough, and none of them
+ has a CHECK constraint -- the database has always been willing to store these.
+ What refused them was the form.
+
+ THE CITY IS THE ANSWER, NOT THE BUTTON. A party's country is read from its
+ city, through the province, on the screen and on the server alike. That is why
+ there is no "Country" column on "Party": the province already knows, and two
+ answers to one question is one answer too many. In practice it means picking
+ Guangzhou makes a party Chinese whether or not anybody pressed anything, which
+ is what keeps the form and the API agreeing about which numbers to demand.
+
+ Once the country is chosen, only that country's cities are offered. The
+ customer path is untouched and still lists every city, exactly as before.
+
+ ONE THING LEFT AS IT WAS. The party DETAIL page (/parties/[id]) still labels
+ the three fields NTN, STRN and CNIC for everybody, so a Chinese supplier's page
+ reads "NTN 91440300MA5EDK8T5H". The value is right; the word above it is
+ Pakistani. You said not to touch anything else, so I have not -- it is the same
+ one-line lookup the form now uses, whenever you want it.
+
+ A NOTE ON THE PHONE RULE. The Chinese pattern accepts a mainland mobile
+ (1[3-9] then nine digits) or a landline with its area code. It is deliberately
+ permissive, and a Pakistani mobile happens to fit the landline shape. Being too
+ strict there would block real numbers, which is the worse failure of the two.
 
 
 ───────────────────────────────────────────────────────────────────────────────
@@ -287,6 +366,9 @@
                              unchanged values, to prove INV-26-8880 rebuilds
         Two products         TEST-NOTIF-01 and TEST-WH-01, created to prove the
                              "added by <name>" notification, then deleted
+        One party            "Shenzhen Huaqiang Electronics Co., Ltd", saved
+                             through the form to prove a Chinese supplier goes
+                             in and comes back out intact, then deleted
 
       Every status change is in the activity log with a reason. No figures
       changed and no products remain.
@@ -322,6 +404,10 @@
    components/portals/warehouse/                  the keeper's queue
    app/(app)/warehouse/page.tsx                   /warehouse
    app/(app)/sales/orders/[id]/edit/page.tsx      the edit screen
+   app/(app)/parties/new/page.tsx                 the COPY table that holds
+                                                  everything differing between
+                                                  a Pakistani and a Chinese
+                                                  party
    lib/use-live-notifications.ts                  the SignalR client
 
 

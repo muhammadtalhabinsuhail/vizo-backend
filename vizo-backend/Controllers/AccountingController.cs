@@ -285,13 +285,12 @@ public class AccountingController : ApiControllerBase
             return Fail(ex, "load journal entries");
         }
     }
-     
+
     [HttpGet("journal-entries/{id:int}")]
     public async Task<IActionResult> GetJournalEntry(int id)
     {
         try
         {
-            
             var e = await _db.JournalEntries.AsNoTracking()
                 .Where(x => x.EntryId == id)
                 .Select(x => new

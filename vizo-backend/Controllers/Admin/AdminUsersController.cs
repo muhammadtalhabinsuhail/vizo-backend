@@ -190,7 +190,7 @@ public class AdminUsersController : AdminControllerBase
             if (problem is not null) return BadRequest(new { message = problem });
 
             var role = await _db.Roles.FirstAsync(r => r.RoleId == body.RoleId);
-           
+
             var user = new User
             {
                 RoleId = role.RoleId,

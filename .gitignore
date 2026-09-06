@@ -2,18 +2,7 @@
 bin/
 obj/
 *.user
-
-<<<<<<< HEAD
 .vs/
-# ─────────────────────────── Secrets ───────────────────────────
-#
-# This repository is PUBLIC. Nothing with a real credential in it may be
-# committed. appsettings.json stays tracked ON PURPOSE -- it documents the
-# shape of the config and every secret value in it is blank. Real values live
-# in User Secrets (local) or environment variables (production); see SETUP.md.
-#
-# The entries below are the files people reach for when they are in a hurry.
-=======
+
 # Local overrides only. appsettings.json itself IS committed, with its values.
->>>>>>> c7360e7a69cafd175af6fc6f524250d2eeed078d
 appsettings.Development.json

@@ -228,15 +228,39 @@
  Once the country is chosen, only that country's cities are offered. The
  customer path is untouched and still lists every city, exactly as before.
 
- THE PROFILE FOLLOWS TOO. /parties/[id] labels the same three rows from the
- same place, so a Chinese supplier's page reads USCC / VAT No. / ID Card and a
- Pakistani one still reads NTN / STRN / CNIC.
+ ALL THREE PARTY SCREENS AGREE. The new form, the profile and the edit form
+ label the same three rows from the same place, so a Chinese party reads
+ USCC / VAT No. / ID Card everywhere and a Pakistani one reads
+ NTN / STRN / CNIC everywhere.
 
- The words themselves now live in ONE file -- vizo-erp/src/lib/party-tax.ts --
- and both screens read from it. They were briefly held separately, which is
- exactly how a supplier ended up being SAVED as a Social Credit Code and
- DISPLAYED as an "NTN": one screen was taught and the other was not. One copy
- of the words, and that cannot happen again.
+ The words, the placeholders and the number shapes all live in ONE file --
+ vizo-erp/src/lib/party-tax.ts -- and every screen reads from it. They were
+ briefly held separately, which is exactly how a supplier ended up being SAVED
+ as a Social Credit Code and DISPLAYED as an "NTN": one screen was taught and
+ the other was not. One copy, and that cannot happen again.
+
+ THERE WAS NO EDIT SCREEN AT ALL. This is worth saying plainly, because you
+ asked me to change the labels on one. PUT /parties/{id} has existed since the
+ controller was written, fully validated, and NOTHING in the front end ever
+ called it -- there was no route, no button and no link anywhere. A customer
+ whose phone number changed had to be corrected in the database or left wrong.
+
+ So /parties/[id]/edit is new, and there is now an Edit button on the profile
+ beside Statement, gated on customers.manage. Two things it deliberately will
+ not change:
+
+   THE ACCOUNT CODE, because it is already printed on invoices. The API keeps
+   the existing one when the form sends null.
+
+   CUSTOMER vs SUPPLIER, because that swaps the role behind the party and the
+   side of the ledger they sit on, with orders and invoices already hanging off
+   both. That is a decision, not a correction, and it does not belong on a form
+   whose other fields are phone numbers and addresses. Say the word if you want
+   it, but it needs thinking about rather than a dropdown.
+
+ The opening balance and the rating are carried through untouched -- they are
+ history and they are set elsewhere. Verified by saving a party with no changes
+ and checking all of it came back identical.
 
  A NOTE ON THE PHONE RULE. The Chinese pattern accepts a mainland mobile
  (1[3-9] then nine digits) or a landline with its area code. It is deliberately
@@ -370,12 +394,18 @@
                              unchanged values, to prove INV-26-8880 rebuilds
         Two products         TEST-NOTIF-01 and TEST-WH-01, created to prove the
                              "added by <name>" notification, then deleted
-        Two parties          "Shenzhen Huaqiang Electronics Co., Ltd", saved
-                             twice -- once through the form to prove a Chinese
-                             supplier goes in and comes back out intact, and
-                             once to check the profile labels it USCC / VAT No.
-                             / ID Card. Both deleted; make a real one when you
-                             have a real supplier.
+        Three parties        Two "Shenzhen Huaqiang Electronics Co., Ltd" and
+                             one "Guangzhou Baiyun Trading Co., Ltd", to prove
+                             a Chinese supplier goes in through the form, shows
+                             the right labels on the profile, and edits without
+                             losing anything. All deleted; make a real one when
+                             you have a real supplier.
+
+        One real party       Star Communications (VZ-C-0010) was saved through
+                             the new edit form with NO changes, to prove the
+                             opening balance, rating, limits and rep survive a
+                             round trip. They did, byte for byte. It appears in
+                             the activity log as an edit.
 
       Every status change is in the activity log with a reason. No figures
       changed and no products remain.

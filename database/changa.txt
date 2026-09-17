@@ -1,0 +1,204 @@
+═══════════════════════════════════════════════════════════════════════════════
+ CHANGA  —  what YOU have to change, by hand, outside the code
+═══════════════════════════════════════════════════════════════════════════════
+
+ Written 17 September 2026, with the sales-return / invoice-PDF / warehouse work.
+
+ Nothing in this file is optional if you want that work to run. Everything in
+ it is a setting, a migration or a click — there is no code left to write.
+
+ Read section 1 before you deploy anything. Four things; the first is already
+ done on Neon and the other three are yours. Ten minutes in all.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 1.  DO THESE FOUR, IN THIS ORDER
+───────────────────────────────────────────────────────────────────────────────
+
+ 1.1  THE MIGRATION IS ALREADY RUN — on Neon only
+
+      backend/database/18_sales_scope_returns_and_places.sql
+
+      RUN AND VERIFIED on the live Neon database on 17 September, because you
+      said to run it in full. ANY OTHER ENVIRONMENT — a colleague's local copy,
+      a staging database — still needs it, or the API will 500 on every invoice
+      and party screen. It is safe to run twice.
+
+      What it did that people will SEE the next morning:
+
+        · it renames LOC-01 "Warehouse" to "Karachi Warehouse" and LOC-02
+          "Order Department" to "Karachi Order Department"
+        · it adds "Lahore Warehouse" (LOC-06) and "Lahore Order Department"
+          (LOC-07)
+
+      Rename them, deactivate them or add Faisalabad beside them from
+      Administration → Locations. Nothing in the code knows any location's id
+      or name.
+
+      DEPLOY ORDER STILL MATTERS ELSEWHERE. The migration adds two columns the
+      new code selects on every invoice and every party query —
+      "SalesInvoice"."PdfDeliverable" and "Party"."CreatedByUserId". Wherever
+      it has not been run yet, run it BEFORE the new API goes up.
+
+      It also did three things you cannot see but will feel:
+
+        · grants invoices.view, invoices.create and returns.sales to the Sales
+          role. THIS IS THE FIX for "Could not load invoices and refund
+          methods" and for a salesman who could not print his own bill.
+        · records who opened each customer account (back-filled from the
+          assigned rep, which is the closest true answer that exists).
+        · fills in the primary location of any warehouse or order-desk account
+          that already has exactly one.
+
+
+ 1.2  EVERYBODY SIGNS OUT AND BACK IN — the same day
+
+      Permissions travel INSIDE the JWT, as "perm" claims, and a token lasts
+      eight hours (Jwt:ExpiryMinutes = 480). A salesperson holding a token
+      issued before the migration still carries the old five permissions, and
+      will go on being refused the invoice screen until it expires.
+
+      Signing out and back in fixes it immediately. Doing nothing fixes it by
+      tomorrow morning. There is no server-side way to force it short of
+      rotating Jwt:Key, which would sign everybody out including you.
+
+
+ 1.3  SET THE WEBSITE ADDRESS ON THE API HOST
+
+      New setting, because every notification now carries a real link instead
+      of a bare path like "/sales/orders/42":
+
+          App__WebBaseUrl = https://advpos-frontend.vercel.app
+
+      Set it as an ENVIRONMENT VARIABLE wherever the API runs (Railway →
+      Variables). The double underscore is ASP.NET's own convention for
+      nesting; it overrides the value committed in appsettings.json, which is
+      already set to the same thing as a fallback.
+
+      Change this one line and every notification, every push and every link in
+      the bell follows it. That was the point of asking for it.
+
+      WHY IT MATTERS: a Web Push payload is opened by the service worker with
+      clients.openWindow(). A bare path there resolves against the worker's own
+      scope rather than against your site — it happens to work while the app is
+      the only thing on that origin and stops working the day it is not. And
+      when somebody forwards a notification to a colleague, a path is not a
+      link at all.
+
+      In-app it still behaves as it always did: the bell turns a link back into
+      a path when it points at the site you are already on, so clicking one
+      does not reload the whole application.
+
+
+ 1.4  ADD THE VERCEL ORIGIN TO CORS — probably already done, check anyway
+
+      appsettings.json now lists it:
+
+          "Cors": { "AllowedOrigins": [ ..., "https://advpos-frontend.vercel.app" ] }
+
+      It was NOT there before: the list was localhost:3000, localhost:3000 over
+      https, and www.vizo.com.pk. If the live frontend has been working, then
+      something on the host is already overriding this — check for a
+      Cors__AllowedOrigins__3 variable and make sure the two do not disagree.
+
+      A missing origin fails the browser's pre-flight before any of our code
+      runs, which looks exactly like a broken API and is not one.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 2.  THINGS TO CHECK ONCE, AFTER DEPLOYING
+───────────────────────────────────────────────────────────────────────────────
+
+ 2.1  THE SIX STRANDED ORDERS ARE INVOICED — check the numbers suit you
+
+      Done on your say-so, through the real endpoint rather than by hand, so
+      the numbering, the lines, the PDF, the activity log and the notifications
+      all went the normal way:
+
+          ORD-26-0140  ->  INV-26-8888   dated 10 Aug
+          ORD-26-0141  ->  INV-26-8889   dated 13 Aug
+          ORD-26-0143  ->  INV-26-8890   dated 14 Aug
+          ORD-26-0168  ->  INV-26-8891   dated 15 Sep
+          ORD-26-0170  ->  INV-26-8892   dated 16 Sep
+          ORD-26-0171  ->  INV-26-8893   dated 16 Sep
+
+      THE DATES ARE BETTER THAN I WARNED YOU. I said they would carry today's
+      date; they do not. An invoice raised against an order is dated from the
+      ORDER, so these read as the days the orders were actually taken. Only the
+      numbers came off today's series. All six PDFs are on Cloudinary.
+
+      THE SERIES MOVED from INV-26-8888 to INV-26-8894. If your accountant
+      expects invoice numbers to run in date order, these six do not — they
+      are the highest numbers in the book and among the oldest dates. That is
+      unavoidable once a number is issued late, and it is the only thing about
+      this worth a second look.
+
+      Raising them briefly rewound five order statuses. They are back, each
+      with an ORDER_STATUS_RESTORED row in the activity log, and the line that
+      caused it is fixed. Full account in convey.txt §7A.
+
+      The list should stay empty from now on. The query to check is at the foot
+      of migration 18, and the "Raise invoice" button now appears on any order
+      that has no invoice rather than only on a confirmed one.
+
+ 2.2  TEN INVOICES HAVE NO STORED PDF
+
+      Of 38 sale invoices, 10 have no PdfUrl at all. Nothing is broken — the
+      API renders a bill from the database whenever one is asked for, so Print
+      works on all of them. They simply have no archived copy.
+
+      Opening each one archives it. Or press "Rebuild" on the invoice screen.
+      No hurry.
+
+ 2.3  PDF DELIVERY IS ON, AND THE APP NOW NOTICES
+
+      Cloudinary blocks PDF delivery by default on accounts created since 2023.
+      convey.txt has said for weeks that both of this project's accounts were
+      in that state. CHECKED TODAY, and it is no longer true:
+
+          HEAD .../advpos/documents/invoices/INV-26-8887_u7qavn.pdf → 200 OK
+
+      Somebody has ticked the box. Good — that is the better link to hand out.
+
+      The app used to ignore the question entirely and always open the
+      Cloudinary URL, which is why Print showed an error page during the months
+      the answer was no. It now stores the answer per invoice and uses it. The
+      first time each old bill is opened it spends one HEAD request finding out
+      and writes it down; after that it goes straight to Cloudinary.
+
+      If you ever untick it, nothing breaks — the API serves the bytes itself.
+
+      Six invoices are already flagged deliverable: the six raised above, plus
+      one re-checked while testing. The other 32 flip the first time somebody
+      opens them.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 3.  SETTINGS SUMMARY — every knob this work added or touched
+───────────────────────────────────────────────────────────────────────────────
+
+  SETTING                        WHERE                    VALUE
+  ─────────────────────────────  ───────────────────────  ──────────────────────
+  App:WebBaseUrl                 appsettings.json         https://advpos-frontend.vercel.app
+  App__WebBaseUrl                API host env var         same — overrides above
+  Cors:AllowedOrigins[3]         appsettings.json         https://advpos-frontend.vercel.app
+
+  Nothing was removed. Nothing else in appsettings.json changed. No frontend
+  environment variable changed — vizo-erp/.env.local is untouched and still
+  needs only NEXT_PUBLIC_API_BASE_URL and the VAPID public key.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 4.  STILL UNFIXED, FROM AN OLDER CONVEY — one line, your call
+───────────────────────────────────────────────────────────────────────────────
+
+  vizo-erp/.env.example carries a VAPID public key that does NOT match the
+  server's. .env.local is correct, so push works today; the danger is that
+  anybody setting up a new machine by copying the template gets a browser that
+  subscribes happily and a server that then rejects every send — silently.
+
+  The fix is to copy VapidSettings:PublicKey out of appsettings.json into
+  .env.example. Still not done, because a key is not mine to change and
+  changing the wrong one of the two breaks the setup that works.
+
+═══════════════════════════════════════════════════════════════════════════════

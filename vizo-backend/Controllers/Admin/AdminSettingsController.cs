@@ -167,10 +167,33 @@ public class AdminSettingsController : AdminControllerBase
             return Ok(new
             {
                 roles = await _db.Roles.OrderBy(r => r.RoleId)
-                    .Select(r => new { id = r.RoleId, key = r.RoleKey, name = r.RoleName, description = r.Description, permissionCount = r.Permissions.Count })
+                    /* isStaff, so the new-user form can leave out Customer,
+                       Supplier and Customer & Supplier. Those three are party
+                       roles -- a shop that buys from us -- and offering them on
+                       a staff form produces an account with an employee code
+                       and no party behind it. */
+                    .Select(r => new { id = r.RoleId, key = r.RoleKey, name = r.RoleName, description = r.Description, isStaff = r.IsStaffRole, permissionCount = r.Permissions.Count })
                     .ToListAsync(),
+                /* KIND AND CITY COME WITH THE LIST NOW.
+
+                   The new-user form has to be able to offer "which warehouse"
+                   and offer only warehouses -- a keeper attached to the Claim
+                   Stock shelf, or to the order department, is an account that
+                   will quietly see the wrong queue for months. The form cannot
+                   make that distinction from an id, a code and a name, so it
+                   was not making it at all. */
                 locations = await _db.Locations.Where(l => l.IsActive).OrderBy(l => l.LocationId)
-                    .Select(l => new { id = l.LocationId, code = l.LocationCode, name = l.LocationName })
+                    .Select(l => new
+                    {
+                        id = l.LocationId,
+                        code = l.LocationCode,
+                        name = l.LocationName,
+                        kindId = l.KindId,
+                        kind = l.Kind.KindKey,
+                        kindLabel = l.Kind.KindName,
+                        cityId = l.CityId,
+                        city = l.City.CityName
+                    })
                     .ToListAsync(),
                 locationKinds = await _db.LocationKinds.OrderBy(k => k.KindId)
                     .Select(k => new { id = k.KindId, key = k.KindKey, name = k.KindName })

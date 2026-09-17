@@ -426,6 +426,84 @@ public class AdminUsersController : AdminControllerBase
         if (await _db.Employees.AnyAsync(e => e.EmployeeCode.ToUpper() == code && e.UserId != existingId))
             return "Another account already uses that employee code.";
 
+        return await ValidatePlace(b);
+    }
+
+    /* ══════════════════════════════════════════════════════════════════
+       WHICH WAREHOUSE. WHICH ORDER DESK.
+       ══════════════════════════════════════════════════════════════════
+
+       "if warehouse account of muhammadzain will be created then it will be
+        asked which warehouse -- either Lahore-Warehouse or Karachi-Warehouse"
+
+       Two roles are tied to a PLACE rather than to the company as a whole:
+
+         warehouse-keeper  picks stock off a particular shelf, in a particular
+                           city. "The warehouse" stopped being a meaningful
+                           phrase the moment there were two.
+         order-dept        packs and dispatches out of a particular order desk,
+                           which is the desk in the same city as that warehouse.
+
+       Neither had any such tie. /admin/users would create a keeper with no
+       location, or three, or with the Claim Stock shelf -- and the queue then
+       showed them every order in the company, which is exactly the report that
+       came back.
+
+       EXACTLY ONE, AND OF THE RIGHT KIND. Not "at least one": a keeper who
+       belongs to two warehouses is a keeper whose queue is ambiguous, and the
+       first thing anybody would ask on seeing it is which of the two the stock
+       is actually on. If somebody genuinely covers both cities, make them two
+       accounts or give them a back-office role -- that is a decision about how
+       the business is run, and it should not be arrived at by ticking a second
+       box on a form.
+
+       Every other role keeps the old behaviour: as many locations as the owner
+       wants to grant, because an accountant reading ledgers is not standing
+       anywhere in particular.
+
+       The KINDS come from "LocationKind" -- 1 warehouse, 3 department -- and
+       the owner creates as many of each as there are cities at
+       /admin/locations. Nothing here knows any location's id.
+       ══════════════════════════════════════════════════════════════════ */
+
+    /// <summary>The location kind each place-bound role must be attached to.</summary>
+    private static readonly IReadOnlyDictionary<string, (string KindKey, string Noun)> PlaceBoundRoles =
+        new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["warehouse-keeper"] = ("warehouse", "warehouse"),
+            ["order-dept"] = ("department", "order department"),
+        };
+
+    private async Task<string?> ValidatePlace(UserRequest b)
+    {
+        var roleKey = await _db.Roles.Where(r => r.RoleId == b.RoleId)
+            .Select(r => r.RoleKey).FirstOrDefaultAsync();
+
+        if (roleKey is null || !PlaceBoundRoles.TryGetValue(roleKey, out var rule)) return null;
+
+        var picked = b.LocationIds ?? new List<int>();
+
+        if (picked.Count == 0)
+            return $"Choose which {rule.Noun} this account belongs to.";
+
+        if (picked.Count > 1)
+            return $"A {rule.Noun} account belongs to exactly one {rule.Noun}. " +
+                   $"Pick the one they work at -- {picked.Count} were selected.";
+
+        var place = await _db.Locations.AsNoTracking()
+            .Where(l => l.LocationId == picked[0])
+            .Select(l => new { l.LocationName, l.IsActive, kind = l.Kind.KindKey, city = l.City.CityName })
+            .FirstOrDefaultAsync();
+
+        if (place is null) return $"Pick a valid {rule.Noun}.";
+
+        if (!place.IsActive)
+            return $"{place.LocationName} is not in use any more. Pick an active {rule.Noun}.";
+
+        if (!string.Equals(place.kind, rule.KindKey, StringComparison.OrdinalIgnoreCase))
+            return $"{place.LocationName} is not a {rule.Noun}. " +
+                   $"Pick one of the {rule.Noun}s set up under Administration -> Locations.";
+
         return null;
     }
 

@@ -86,8 +86,14 @@ public static class PdfStore
     /// HEAD the URL we are about to hand out. A failure here is not an error --
     /// the asset is stored either way -- it only decides which link the app
     /// gives a customer.
+    ///
+    /// PUBLIC, because the answer can CHANGE without anything being uploaded:
+    /// ticking "allow PDF" in the Cloudinary console turns every existing
+    /// 401 into a 200. A document stored while delivery was blocked would
+    /// otherwise stay flagged undeliverable for ever, and go on being served
+    /// the long way round for no reason. See SalesController.EnsureBill.
     /// </summary>
-    private static async Task<bool> CanBeDelivered(string url)
+    public static async Task<bool> CanBeDelivered(string url)
     {
         try
         {

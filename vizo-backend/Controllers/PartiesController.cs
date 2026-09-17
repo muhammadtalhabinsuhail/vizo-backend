@@ -46,6 +46,19 @@ public class PartiesController : ApiControllerBase
     private const int RoleSupplier = 6;
     private const int RoleBoth = 7;
 
+    /// <summary>
+    /// The user id a salesperson's party list must be narrowed to, or null when
+    /// the caller is entitled to the whole book.
+    ///
+    /// About the ROLE, not a permission, for the same reason
+    /// SalesController.SalesScopeUserId is: granting Sales the right to manage
+    /// customers lets them open and edit accounts, it does not make them the
+    /// back office. Accounts, the order desk, the warehouse and the owner all
+    /// see everything -- you cannot chase a receivable through a keyhole.
+    /// </summary>
+    private int? MyPartiesOnly() =>
+        CurrentRole() == Services.OrderWorkflow.RoleSales ? CurrentUserId() : null;
+
     // ══════════════════════════════════════════════════════════════════
     //  LIST
     // ══════════════════════════════════════════════════════════════════
@@ -67,6 +80,26 @@ public class PartiesController : ApiControllerBase
             if (pageSize is < 1 or > 200) pageSize = 50;
 
             var rows = _db.Parties.AsNoTracking().AsQueryable();
+
+            /* A REP ADMINISTERS THEIR OWN ACCOUNTS, AND SELLS TO ANYBODY.
+
+               Two different questions, and conflating them is how this ends up
+               either useless or wrong:
+
+                 THIS list is the Customers screen -- the place a rep goes to
+                 edit a phone number or read a statement. It is theirs: the
+                 accounts they opened, plus any the owner has since assigned to
+                 them.
+
+                 The PICKER on the order form is a different list, served by
+                 GET /sales/lookups, and it is deliberately NOT filtered. The
+                 brief is explicit -- "issued still he can see all customers" --
+                 because a rep covering for a colleague still has to be able to
+                 take the order.
+
+               Everyone else sees the whole book. */
+            if (MyPartiesOnly() is int me)
+                rows = rows.Where(p => p.CreatedByUserId == me || p.SalesPersonUserId == me);
 
             rows = type?.ToLowerInvariant() switch
             {
@@ -549,7 +582,12 @@ public class PartiesController : ApiControllerBase
                 SalesPersonUserId = body.SalesPersonUserId,
                 DefaultLocationId = body.DefaultLocationId,
                 Rating = string.IsNullOrWhiteSpace(body.Rating) ? 'C' : body.Rating.Trim()[0],
-                Notes = body.Notes
+                Notes = body.Notes,
+                /* Written once, here, and never touched again -- UpdateParty
+                   does not carry it. A rep's customer list is built on this,
+                   and a fact that can be edited is not a fact you can build a
+                   list on. See Models/Party.Custom.cs. */
+                CreatedByUserId = CurrentUserId()
             });
             await _db.SaveChangesAsync();
             await tx.CommitAsync();

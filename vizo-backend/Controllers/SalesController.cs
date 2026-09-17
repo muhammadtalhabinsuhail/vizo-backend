@@ -198,6 +198,29 @@ public class SalesController : ApiControllerBase
         CurrentRole() == OrderWorkflow.RoleSales ? CurrentUserId() : null;
 
     /// <summary>
+    /// The one place a warehouse keeper or an order-desk clerk works at, or
+    /// null for everybody else.
+    ///
+    /// "User"."PrimaryLocationId" has existed since the first schema and was
+    /// never read for anything. It is now the answer to "which warehouse" --
+    /// written when the account is created and enforced there, so a keeper
+    /// always has exactly one. Null for an account that predates the rule,
+    /// which reads as "show them everything" rather than as "show them
+    /// nothing": an empty queue is indistinguishable from no work.
+    /// </summary>
+    private async Task<int?> MyPlaceId()
+    {
+        var role = CurrentRole();
+        if (role != OrderWorkflow.RoleWarehouse && role != OrderWorkflow.RoleOrderDept)
+            return null;
+
+        return await _db.Users.AsNoTracking()
+            .Where(u => u.UserId == CurrentUserId())
+            .Select(u => u.PrimaryLocationId)
+            .FirstOrDefaultAsync();
+    }
+
+    /// <summary>
     /// May the caller open this invoice? Used by the endpoints that take an id
     /// straight off the URL -- a list that hides a row does not stop somebody
     /// asking for that row by number.
@@ -265,6 +288,7 @@ public class SalesController : ApiControllerBase
                     invoiceId = x.SalesInvoice != null ? (int?)x.SalesInvoice.InvoiceId : null,
                     invoiceNo = x.SalesInvoice != null ? x.SalesInvoice.InvoiceNo : null,
                     invoicePdfUrl = x.SalesInvoice != null ? x.SalesInvoice.PdfUrl : null,
+                    invoiceDeliverable = x.SalesInvoice != null && x.SalesInvoice.PdfDeliverable,
 
                     paidAmount = x.CollectionAllocations
                         .Where(a => a.Collection.Status.StatusKey == "CONFIRMED")
@@ -336,6 +360,9 @@ public class SalesController : ApiControllerBase
                 /* The link the WhatsApp share should send. Derived, not stored,
                    so it is always right for the host answering this request. */
                 invoiceShareUrl = o.invoiceNo == null ? null : ShareLink(o.invoiceNo),
+                /* And the one Print bill should open, which is the same thing
+                   until the day Cloudinary is allowed to serve a PDF. */
+                invoiceViewUrl = BillViewUrl(o.invoiceNo, o.invoicePdfUrl, o.invoiceDeliverable),
                 o.paidAmount,
                 balance = o.total - o.paidAmount,
                 paymentStatus = o.paidAmount <= 0 ? "UNPAID"
@@ -532,6 +559,7 @@ public class SalesController : ApiControllerBase
                 invoiceNo = invoice?.InvoiceNo,
                 invoicePdfUrl = bill?.PdfUrl,
                 invoiceShareUrl = bill?.ShareUrl,
+                invoiceViewUrl = bill?.ShareUrl,
                 message = overLimit
                     ? $"Order {order.OrderNo} saved on credit hold -- it needs the owner's approval."
                     : invoice is not null
@@ -688,9 +716,41 @@ public class SalesController : ApiControllerBase
             });
         }
 
+        /* ── THE STATUS MOVES FORWARD ONLY ──────────────────────────────────
+
+           This used to set INVOICED unconditionally, and it was harmless for
+           exactly as long as the only way to reach it was the "Raise invoice"
+           button on a CONFIRMED order -- there is nowhere to go but forward
+           from there.
+
+           It stopped being harmless the moment that button was offered on an
+           order further down the chain, which it now is: an order that shipped
+           without an invoice has to be able to get one, and billing a
+           DISPATCHED order must not quietly announce that it is no longer
+           dispatched. Found the hard way -- five live orders were rewound from
+           Dispatched and Delivered back to Invoiced before this line was
+           written, and had to be put back.
+
+           So: an order BEFORE step 4 moves up to it. An order already at or
+           past step 4 keeps where it is. An order off the chain entirely
+           (cancelled, declined, on hold) is not moved either -- the callers
+           refuse to bill those anyway, and a status this method cannot place
+           is not one it should be guessing about. */
         var invoiced = await _db.OrderStatuses.FirstOrDefaultAsync(s => s.StatusKey == "INVOICED");
         var live = await _db.SalesOrders.FirstAsync(o => o.OrderId == order.OrderId);
-        if (invoiced is not null) live.StatusId = invoiced.StatusId;
+
+        if (invoiced is not null)
+        {
+            var currentKey = await _db.OrderStatuses.AsNoTracking()
+                .Where(s => s.StatusId == live.StatusId)
+                .Select(s => s.StatusKey).FirstAsync();
+
+            var here = OrderWorkflow.Step(currentKey);
+            var billed = OrderWorkflow.Step(OrderWorkflow.Invoiced);
+
+            if (here is not null && billed is not null && here < billed)
+                live.StatusId = invoiced.StatusId;
+        }
 
         await _db.SaveChangesAsync();
         await tx.CommitAsync();
@@ -712,10 +772,30 @@ public class SalesController : ApiControllerBase
             var order = await _db.SalesOrders.AsNoTracking().FirstOrDefaultAsync(o => o.OrderId == id);
             if (order is null) return NotFound(new { message = $"No order with id {id}." });
 
+            /* ONE ORDER, ONE INVOICE. Asking again does not mint a second
+               bill -- the number is already on paper the customer is holding.
+               It used to answer 400, which read as a failure and left the
+               screen with nothing; a rep who pressed Invoice twice was simply
+               told off and still could not print. Now the existing bill is
+               made sure of and handed straight back, which is what the person
+               pressing the button actually wanted both times. */
             var existing = await _db.SalesInvoices.AsNoTracking()
                 .FirstOrDefaultAsync(i => i.OrderId == id);
             if (existing is not null)
-                return BadRequest(new { message = $"Order {order.OrderNo} is already invoiced as {existing.InvoiceNo}." });
+            {
+                var ready = await EnsureBill(existing.InvoiceId);
+                return Ok(new
+                {
+                    invoiceId = existing.InvoiceId,
+                    invoiceNo = existing.InvoiceNo,
+                    invoicePdfUrl = ready?.PdfUrl ?? existing.PdfUrl,
+                    invoiceViewUrl = ready?.ShareUrl
+                        ?? BillViewUrl(existing.InvoiceNo, existing.PdfUrl, existing.PdfDeliverable),
+                    alreadyInvoiced = true,
+                    message = $"Order {order.OrderNo} is already invoiced as {existing.InvoiceNo}. " +
+                              "Its bill is ready to print -- raise a sales return if goods are coming back."
+                });
+            }
 
             var statusKey = await _db.OrderStatuses.Where(s => s.StatusId == order.StatusId)
                 .Select(s => s.StatusKey).FirstAsync();
@@ -758,6 +838,8 @@ public class SalesController : ApiControllerBase
                 invoiceNo = inv.InvoiceNo,
                 invoicePdfUrl = bill?.PdfUrl,
                 invoiceShareUrl = bill?.ShareUrl,
+                invoiceViewUrl = bill?.ShareUrl,
+                alreadyInvoiced = false,
                 message = $"Invoice {inv.InvoiceNo} raised against {order.OrderNo}."
             });
         }
@@ -1282,6 +1364,72 @@ public class SalesController : ApiControllerBase
                     message = "This order has already been invoiced. Raise a sales return instead of cancelling it."
                 });
 
+            /* ─────────── MOVING TO "INVOICED" MUST PRODUCE AN INVOICE ───────────
+
+               It did not. This action only ever wrote a status id, so pressing
+               the Invoiced step -- which is how both the owner and the rep
+               actually bill an order, the chain being the thing on screen --
+               left an order that SAID it was invoiced with no "SalesInvoice"
+               row, no number, no PDF and nothing to print. The separate "Raise
+               invoice" button did all of that, and it only appears while the
+               order is still CONFIRMED, so taking the obvious route skipped it
+               for good.
+
+               Now the two routes do the same thing, because they call the same
+               method. And it is idempotent: an order that already carries an
+               invoice does NOT get a second one -- the number is printed on
+               paper the customer is holding, and a second bill for the same
+               goods is how one sale gets paid for twice. It only makes sure the
+               document exists.                                               */
+            SalesInvoice? billedInvoice = null;
+            var alreadyInvoiced = false;
+
+            if (status.StatusKey == OrderWorkflow.Invoiced)
+            {
+                billedInvoice = await _db.SalesInvoices
+                    .FirstOrDefaultAsync(i => i.OrderId == id);
+
+                alreadyInvoiced = billedInvoice is not null;
+
+                if (billedInvoice is null)
+                {
+                    /* The same three states POST /orders/{id}/invoice refuses.
+                       The Super Admin may set any status, and that is the point
+                       of the role -- but "any status" is about where the order
+                       sits, not about minting a bill for goods that were
+                       cancelled. Moving a cancelled order to Invoiced is almost
+                       always a misclick; if it is not, put it back on the chain
+                       first and the invoice follows. */
+                    if (current.StatusKey is "CANCELLED" or "CREDIT_HOLD")
+                        return BadRequest(new
+                        {
+                            message = $"{order.OrderNo} is {current.StatusName.ToLowerInvariant()}. " +
+                                      "Put it back on the chain before billing it."
+                        });
+
+                    var billLines = await _db.SalesOrderItems.AsNoTracking()
+                        .Where(i => i.OrderId == id).OrderBy(i => i.LineNo)
+                        .Select(i => new OrderLineRequest(
+                            i.ProductId, i.Quantity, i.UnitPrice, i.DiscountPercent, i.TaxPercent))
+                        .ToListAsync();
+
+                    if (billLines.Count == 0)
+                        return BadRequest(new
+                        {
+                            message = $"{order.OrderNo} has no lines, so there is nothing to invoice."
+                        });
+
+                    /* RaiseInvoiceForOrder sets the order to INVOICED itself
+                       and commits its own transaction, so the status write
+                       below is left to the paths that are not billing. */
+                    billedInvoice = await RaiseInvoiceForOrder(order, billLines, order.MethodId, null);
+
+                    await Log("INVOICE_CREATED", "SalesInvoice", billedInvoice.InvoiceNo,
+                        $"raised against {order.OrderNo}, {billedInvoice.TotalAmount:N0}", 2);
+                    await Log("ORDER_INVOICED", "SalesOrder", order.OrderNo, billedInvoice.InvoiceNo, 1);
+                }
+            }
+
             order.StatusId = status.StatusId;
             if (body.StatusKey != OrderWorkflow.CreditHold) order.CreditHoldReason = null;
 
@@ -1323,6 +1471,17 @@ public class SalesController : ApiControllerBase
                         ? null : new[] { order.SalesPersonUserId.Value });
             }
 
+            /* The bill itself, rendered and pushed to Cloudinary. AFTER the
+               status write and the notifications, and swallowing its own
+               failure, because by this point the invoice row exists and the
+               order has moved -- refusing the whole request because a document
+               store was briefly unreachable would tell the operator the billing
+               did not happen. One button rebuilds the PDF; the invoice number
+               cannot be un-issued. */
+            Bill? bill = null;
+            if (billedInvoice is not null)
+                bill = await EnsureBill(billedInvoice.InvoiceId);
+
             return Ok(new
             {
                 id,
@@ -1330,7 +1489,17 @@ public class SalesController : ApiControllerBase
                 statusName = status.StatusName,
                 step = OrderWorkflow.Step(status.StatusKey),
                 nextForMe = OrderWorkflow.NextFor(role, status.StatusKey),
-                message = $"{order.OrderNo} is now {status.StatusName.ToLowerInvariant()}."
+                invoiceId = billedInvoice?.InvoiceId,
+                invoiceNo = billedInvoice?.InvoiceNo,
+                invoicePdfUrl = bill?.PdfUrl,
+                /* What Print should open -- see BillViewUrl. */
+                invoiceViewUrl = bill?.ShareUrl,
+                alreadyInvoiced,
+                message = billedInvoice is null
+                    ? $"{order.OrderNo} is now {status.StatusName.ToLowerInvariant()}."
+                    : alreadyInvoiced
+                        ? $"{order.OrderNo} was already invoiced as {billedInvoice.InvoiceNo}. The bill is ready to print."
+                        : $"{order.OrderNo} invoiced as {billedInvoice.InvoiceNo}. The bill is ready to print."
             });
         }
         catch (Exception ex)
@@ -1372,8 +1541,21 @@ public class SalesController : ApiControllerBase
             var rows = _db.SalesOrders.AsNoTracking()
                 .Where(o => ready.Contains(o.Status.StatusKey));
 
-            if (locationId is not null)
-                rows = rows.Where(o => o.LocationId == locationId);
+            /* THE KEEPER'S OWN WAREHOUSE, unless they asked for another.
+
+               There is one warehouse per city now, and a keeper belongs to
+               exactly one of them -- see AdminUsersController.ValidatePlace.
+               Without this the Karachi keeper opened the queue and saw Lahore's
+               orders sitting in it, which is not just noise: they would pick
+               stock that is four hundred miles away and mark it sent.
+
+               An explicit locationId still wins, so the owner can look at any
+               warehouse's queue from the same screen. Falls back to showing
+               everything when the account has no place set, which is what an
+               admin looking at this page should see. */
+            var mine = locationId ?? await MyPlaceId();
+            if (mine is not null)
+                rows = rows.Where(o => o.LocationId == mine);
 
             var items = await rows
                 .OrderBy(o => o.OrderDate).ThenBy(o => o.OrderId)
@@ -1743,6 +1925,7 @@ public class SalesController : ApiControllerBase
                     statusName = i.Status.StatusName,
                     paymentMethod = i.Method.MethodKey,
                     pdfUrl = i.PdfUrl,
+                    pdfDeliverable = i.PdfDeliverable,
                     itemCount = i.SalesInvoiceItems.Count,
                     paid = i.VoucherAllocations
                         .Where(v => v.Voucher.Status.StatusKey == "POSTED")
@@ -1758,7 +1941,9 @@ public class SalesController : ApiControllerBase
                 i.location, i.invoiceDate, i.dueDate,
                 i.subtotal, i.discount, i.tax, i.total,
                 i.status, i.statusName, i.paymentMethod,
-                i.pdfUrl, shareUrl = ShareLink(i.invoiceNo), i.itemCount,
+                i.pdfUrl, shareUrl = ShareLink(i.invoiceNo),
+                viewUrl = BillViewUrl(i.invoiceNo, i.pdfUrl, i.pdfDeliverable),
+                i.itemCount,
                 i.paid, balance = i.total - i.paid
             });
 
@@ -1817,6 +2002,7 @@ public class SalesController : ApiControllerBase
                     paymentMethodName = x.Method.MethodName,
                     createdBy = x.CreatedByUser.FullName,
                     pdfUrl = x.PdfUrl,
+                    pdfDeliverable = x.PdfDeliverable,
                     notes = x.Order != null ? x.Order.Notes : null,
                     paid = x.VoucherAllocations
                         .Where(v => v.Voucher.Status.StatusKey == "POSTED")
@@ -1859,7 +2045,9 @@ public class SalesController : ApiControllerBase
                 i.isWalkIn, i.locationId, i.location, i.invoiceDate, i.dueDate,
                 i.subtotal, i.discount, i.tax, i.total,
                 i.status, i.statusName, i.methodId, i.paymentMethod, i.paymentMethodName,
-                i.createdBy, i.pdfUrl, shareUrl = ShareLink(i.invoiceNo), i.notes,
+                i.createdBy, i.pdfUrl, shareUrl = ShareLink(i.invoiceNo),
+                viewUrl = BillViewUrl(i.invoiceNo, i.pdfUrl, i.pdfDeliverable),
+                i.notes,
                 i.paid, balance = i.total - i.paid,
                 i.lines,
                 company = await LetterHead()
@@ -1889,7 +2077,7 @@ public class SalesController : ApiControllerBase
 
             var existing = await _db.SalesInvoices.AsNoTracking()
                 .Where(i => i.InvoiceId == id)
-                .Select(i => new { i.InvoiceNo, i.PdfUrl })
+                .Select(i => new { i.InvoiceNo, i.PdfUrl, i.PdfDeliverable })
                 .FirstOrDefaultAsync();
 
             if (existing is null) return NotFound(new { message = $"No invoice with id {id}." });
@@ -1902,6 +2090,9 @@ public class SalesController : ApiControllerBase
                 {
                     pdfUrl = existing.PdfUrl,
                     shareUrl = ShareLink(existing.InvoiceNo),
+                    /* What the Print button should actually open. Returning
+                       only pdfUrl is what put a Cloudinary 401 on screen. */
+                    viewUrl = BillViewUrl(existing.InvoiceNo, existing.PdfUrl, existing.PdfDeliverable),
                     rebuilt = false,
                     message = "The bill was already saved."
                 });
@@ -1913,6 +2104,7 @@ public class SalesController : ApiControllerBase
             {
                 pdfUrl = bill.PdfUrl,
                 shareUrl = bill.ShareUrl,
+                viewUrl = bill.ShareUrl,
                 rebuilt = true,
                 message = $"Bill for {existing.InvoiceNo} saved."
             });
@@ -1952,11 +2144,19 @@ public class SalesController : ApiControllerBase
             if (string.IsNullOrWhiteSpace(row.PdfUrl))
                 await TryBuildBill(id);
 
-            var url = await _db.SalesInvoices.AsNoTracking()
-                .Where(i => i.InvoiceId == id).Select(i => i.PdfUrl).FirstAsync();
+            var stored = await _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.InvoiceId == id)
+                .Select(i => new { i.PdfUrl, i.PdfDeliverable })
+                .FirstAsync();
 
-            if (!string.IsNullOrWhiteSpace(url))
-                return Redirect(CloudinaryUrl.AsAttachment(url!, attachment));
+            /* DELIVERABILITY IS CHECKED NOW. It used to redirect to the stored
+               URL whenever there was one, which sent the caller to a Cloudinary
+               401 on both of this project's accounts -- the upload succeeds and
+               the delivery is refused, so a stored URL proved nothing. When
+               Cloudinary will not serve it we fall through and render the bytes
+               here instead. */
+            if (stored.PdfDeliverable && !string.IsNullOrWhiteSpace(stored.PdfUrl))
+                return Redirect(CloudinaryUrl.AsAttachment(stored.PdfUrl!, attachment));
 
             var data = await BillData(id);
             if (data is null) return NotFound(new { message = $"No invoice with id {id}." });
@@ -2044,17 +2244,46 @@ public class SalesController : ApiControllerBase
                     resalableQty = r.SalesReturnItems
                         .Where(l => l.Condition.IsResalable).Sum(l => (int?)l.Quantity) ?? 0,
                     damagedQty = r.SalesReturnItems
-                        .Where(l => !l.Condition.IsResalable).Sum(l => (int?)l.Quantity) ?? 0
+                        .Where(l => !l.Condition.IsResalable).Sum(l => (int?)l.Quantity) ?? 0,
+                    createdBy = r.CreatedByUser.FullName,
+                    salesPerson = r.Invoice.Order != null && r.Invoice.Order.SalesPersonUser != null
+                        ? r.Invoice.Order.SalesPersonUser.User.FullName
+                        : r.CreatedByUser.FullName,
+                    orderId = r.Invoice.OrderId,
+                    orderNo = r.Invoice.Order != null ? r.Invoice.Order.OrderNo : null
                 })
                 .ToListAsync();
 
-            return Ok(items.Select(r => new
+            /* THE CREDIT NOTES, in one query after the fact rather than a
+               correlated sub-select per row.
+
+               "DocumentFile"."DocKey" is a string -- it has to be, because a
+               report keys off a fingerprint of its parameters rather than off
+               any row's id -- so matching it inside the query above would mean
+               ReturnId.ToString() in an expression tree. Npgsql will usually
+               translate that, and "usually" is not a word worth building a
+               screen on. */
+            var keys = items.Select(r => r.id.ToString()).ToList();
+            var notes = await _db.DocumentFiles.AsNoTracking()
+                .Where(f => f.DocKind == "sales-return" && keys.Contains(f.DocKey))
+                .Select(f => new { f.DocKey, f.PdfUrl, f.IsDeliverable })
+                .ToDictionaryAsync(f => f.DocKey);
+
+            return Ok(items.Select(r =>
             {
-                r.id, r.returnNo, r.invoiceId, r.invoiceNo, r.customerId, r.customerName,
-                customerInitials = Initials(r.customerName),
-                r.location, r.returnDate, r.reason, r.refundMethod,
-                r.status, r.statusName, r.itemCount, r.totalAmount,
-                r.resalableQty, r.damagedQty
+                notes.TryGetValue(r.id.ToString(), out var note);
+                return new
+                {
+                    r.id, r.returnNo, r.invoiceId, r.invoiceNo, r.orderId, r.orderNo,
+                    r.customerId, r.customerName,
+                    customerInitials = Initials(r.customerName),
+                    r.location, r.returnDate, r.reason, r.refundMethod,
+                    r.status, r.statusName, r.itemCount, r.totalAmount,
+                    r.resalableQty, r.damagedQty, r.createdBy, r.salesPerson,
+                    pdfUrl = note?.PdfUrl,
+                    /* The return's own credit note -- see ReturnNoteUrl. */
+                    viewUrl = ReturnNoteUrl(r.id, note?.PdfUrl, note?.IsDeliverable ?? false)
+                };
             }));
         }
         catch (Exception ex)
@@ -2086,6 +2315,20 @@ public class SalesController : ApiControllerBase
                     invoiceNo = x.Invoice.InvoiceNo,
                     invoiceDate = x.Invoice.InvoiceDate,
                     invoiceTotal = x.Invoice.TotalAmount,
+                    invoicePdfUrl = x.Invoice.PdfUrl,
+                    invoiceDeliverable = x.Invoice.PdfDeliverable,
+                    /* The order the goods were sold on, so the screen can say
+                       WHICH order was returned against and link to it. A return
+                       is always against an invoice; an invoice is not always
+                       against an order (a counter sale is not), so this is
+                       nullable and the screen says "counter sale" for null. */
+                    orderId = x.Invoice.OrderId,
+                    orderNo = x.Invoice.Order != null ? x.Invoice.Order.OrderNo : null,
+                    orderDate = x.Invoice.Order != null ? (DateOnly?)x.Invoice.Order.OrderDate : null,
+                    orderTotal = x.Invoice.Order != null ? (decimal?)x.Invoice.Order.TotalAmount : null,
+                    salesPerson = x.Invoice.Order != null && x.Invoice.Order.SalesPersonUser != null
+                        ? x.Invoice.Order.SalesPersonUser.User.FullName
+                        : null,
                     customerId = x.CustomerUserId,
                     customerName = x.CustomerUser.LegalName,
                     customerPhone = x.CustomerUser.User.Phone,
@@ -2127,6 +2370,10 @@ public class SalesController : ApiControllerBase
 
             if (r is null) return NotFound(new { message = $"No return with id {id}." });
 
+            /* The credit note, looked up separately -- see GetReturns for why
+               "DocKey" is not matched inside the query above. */
+            var note = await DocumentArchive.FindAsync(_db, "sales-return", id.ToString());
+
             var activity = await _db.ActivityLogs.AsNoTracking()
                 .Where(a => a.EntityReference == r.returnNo)
                 .OrderBy(a => a.LoggedAt)
@@ -2144,6 +2391,7 @@ public class SalesController : ApiControllerBase
             return Ok(new
             {
                 r.id, r.returnNo, r.invoiceId, r.invoiceNo, r.invoiceDate, r.invoiceTotal,
+                r.orderId, r.orderNo, r.orderDate, r.orderTotal, r.salesPerson,
                 r.customerId, r.customerName, r.customerPhone,
                 customerInitials = Initials(r.customerName),
                 r.locationId, r.location, r.returnDate, r.reason,
@@ -2153,6 +2401,16 @@ public class SalesController : ApiControllerBase
                 totalAmount = r.lines.Sum(l => l.qty * l.rate),
                 resalableQty = r.lines.Where(l => l.isResalable).Sum(l => l.qty),
                 damagedQty = r.lines.Where(l => !l.isResalable).Sum(l => l.qty),
+                /* How much of the original bill has come back, so the screen can
+                   say "3 of the 12 items on INV-26-8871" rather than leaving the
+                   reader to work it out. */
+                invoiceItemCount = await _db.SalesInvoiceItems
+                    .Where(l => l.InvoiceId == r.invoiceId).SumAsync(l => (int?)l.Quantity) ?? 0,
+                /* The two documents this screen can print: the return's own
+                   credit note, and the bill it came off. */
+                pdfUrl = note?.PdfUrl,
+                viewUrl = ReturnNoteUrl(r.id, note?.PdfUrl, note?.IsDeliverable ?? false),
+                invoiceViewUrl = BillViewUrl(r.invoiceNo, r.invoicePdfUrl, r.invoiceDeliverable),
                 r.lines,
                 activity
             });
@@ -2691,14 +2949,27 @@ public class SalesController : ApiControllerBase
             await Log("SALES_RETURN_CREATED", "SalesReturn", ret.ReturnNo,
                 $"{body.Lines.Count} lines, {refund:N0} against {inv.InvoiceNo}. {body.Reason.Trim()}", 2);
 
-            /* -- B6 -- the order department hears about it too: if it is
-               approved, stock is coming back to a shelf they look after. */
+            /* THE RETURN NOTE. A credit note of its own, NOT a second invoice:
+               the order keeps the one bill it was billed on, and what comes
+               back is a different event with its own number. Archived the
+               moment the return exists, so Print has a stored document to hand
+               out rather than rendering something nobody kept. Failure is
+               swallowed -- the stock has already moved. */
+            var note = await DocumentArchive.TryStoreForAsync(
+                _db, _cfg, _logger, "sales-return", ret.ReturnId, CurrentUserId());
+
+            /* -- B6 -- the owner is the audience that matters here: a sales
+               return is money going back out and stock coming back in, and the
+               brief asks for it by name. Accounts raise the credit note and the
+               order desk looks after the shelf it lands on, so both hear it
+               too. Every copy now says who it was addressed to -- see
+               PushNotificationService.AddressedTo. */
             await _push.NotifyRolesAsync(
                 new[] { "super-admin", "accountant", "order-dept" },
                 NotificationKinds.ReturnRequested,
-                $"Return requested by {CurrentUserName()}",
+                $"Sales return raised by {CurrentUserName()}",
                 $"{ret.ReturnNo} -- {body.Lines.Count} " +
-                $"{(body.Lines.Count == 1 ? "line" : "lines")}, PKR {refund:N0} against {inv.InvoiceNo}. Needs a decision.",
+                $"{(body.Lines.Count == 1 ? "line" : "lines")}, PKR {refund:N0} returned against {inv.InvoiceNo}. Needs a decision.",
                 url: $"/sales/returns/{ret.ReturnId}",
                 exceptUserId: CurrentUserId());
 
@@ -2707,7 +2978,11 @@ public class SalesController : ApiControllerBase
                 id = ret.ReturnId,
                 returnNo = ret.ReturnNo,
                 totalAmount = refund,
-                message = $"Return {ret.ReturnNo} saved as a draft. It needs approving before the refund goes out."
+                invoiceNo = inv.InvoiceNo,
+                pdfUrl = note?.PdfUrl,
+                viewUrl = ReturnNoteUrl(ret.ReturnId, note?.PdfUrl, note?.Deliverable ?? false),
+                message = $"Return {ret.ReturnNo} saved as a draft, with its return note. " +
+                          "It needs approving before the refund goes out."
             });
         }
         catch (Exception ex)
@@ -2931,6 +3206,9 @@ public class SalesController : ApiControllerBase
                 subtotal, discount, tax, total,
                 pdfUrl = bill?.PdfUrl,
                 shareUrl = bill?.ShareUrl,
+                /* What the till's Print button should open. Same as shareUrl
+                   until Cloudinary is allowed to serve a PDF. */
+                viewUrl = bill?.ShareUrl,
                 message = onCredit
                     ? $"Sale completed. Invoice {inv.InvoiceNo}, {total:N0} on account."
                     : $"Sale completed. Invoice {inv.InvoiceNo}, {total:N0} paid by {method.MethodName}."
@@ -3000,6 +3278,7 @@ public class SalesController : ApiControllerBase
                     tax = i.TaxAmount,
                     total = i.TotalAmount,
                     pdfUrl = i.PdfUrl,
+                    pdfDeliverable = i.PdfDeliverable,
                     soldBy = i.CreatedByUser.FullName
                 })
                 .ToListAsync();
@@ -3017,7 +3296,9 @@ public class SalesController : ApiControllerBase
                     i.invoiceDate, i.location, i.paymentMethod, i.paymentMethodName,
                     i.status, i.statusName, i.itemCount, i.units,
                     i.subtotal, i.discount, i.tax, i.total,
-                    i.pdfUrl, shareUrl = ShareLink(i.invoiceNo), i.soldBy
+                    i.pdfUrl, shareUrl = ShareLink(i.invoiceNo),
+                    viewUrl = BillViewUrl(i.invoiceNo, i.pdfUrl, i.pdfDeliverable),
+                    i.soldBy
                 })
             });
         }
@@ -3226,6 +3507,95 @@ public class SalesController : ApiControllerBase
         $"{Request.Scheme}://{Request.Host}/api/sales/bill/{Uri.EscapeDataString(invoiceNo)}?k={BillKey(invoiceNo)}";
 
     /// <summary>
+    /// THE LINK A PRINT BUTTON SHOULD OPEN. Cloudinary when Cloudinary will
+    /// serve it; this API's own signed bill link when it will not.
+    ///
+    /// Every screen used to open <c>PdfUrl</c> directly, because window.open
+    /// sends no Authorization header and an API route would answer 401. The
+    /// trouble is that the Cloudinary URL answers 401 as well -- PDF delivery
+    /// is off by default on accounts created since 2023 -- so "Print bill"
+    /// opened an error page for the owner, the warehouse and the order desk
+    /// alike. It was not a permissions bug and it was not the renderer; the
+    /// link itself was dead.
+    ///
+    /// One call, one answer, so no screen has to know any of that. The day
+    /// somebody ticks the box in the Cloudinary console this starts returning
+    /// the Cloudinary URL again on its own.
+    /// </summary>
+    private string? BillViewUrl(string? invoiceNo, string? pdfUrl, bool deliverable)
+    {
+        if (deliverable && !string.IsNullOrWhiteSpace(pdfUrl)) return pdfUrl;
+        return string.IsNullOrWhiteSpace(invoiceNo) ? null : ShareLink(invoiceNo!);
+    }
+
+    /// <summary>
+    /// THE LINK A RETURN NOTE'S PRINT BUTTON SHOULD OPEN. Same reasoning as
+    /// <see cref="BillViewUrl"/>: Cloudinary when Cloudinary will serve it,
+    /// this API's own signed document link when it will not.
+    ///
+    /// The signed link renders from the database, so it works even for a return
+    /// whose note was never archived -- a Cloudinary outage at the moment the
+    /// return was raised must not leave the document permanently unprintable.
+    /// </summary>
+    private string ReturnNoteUrl(int returnId, string? pdfUrl, bool deliverable)
+    {
+        if (deliverable && !string.IsNullOrWhiteSpace(pdfUrl)) return pdfUrl!;
+        return DocumentLinks.Share(Request.Scheme, Request.Host.ToString(),
+            _cfg["Jwt:Key"], "sales-return", returnId.ToString());
+    }
+
+    /// <summary>
+    /// The bill for an order, built and stored if it has never been. Returns
+    /// null when the invoice does not exist or the store could not be reached.
+    ///
+    /// Idempotent on purpose -- this is what "the invoice already exists, just
+    /// let me see it" calls, and it must not mint a second document.
+    /// </summary>
+    private async Task<Bill?> EnsureBill(int invoiceId, bool force = false)
+    {
+        var row = await _db.SalesInvoices.AsNoTracking()
+            .Where(i => i.InvoiceId == invoiceId)
+            .Select(i => new { i.InvoiceNo, i.PdfUrl, i.PdfDeliverable })
+            .FirstOrDefaultAsync();
+
+        if (row is null) return null;
+
+        if (!force && !string.IsNullOrWhiteSpace(row.PdfUrl))
+        {
+            var deliverable = row.PdfDeliverable;
+
+            /* ONE RE-CHECK, AND THEN NEVER AGAIN.
+
+               Whether Cloudinary will serve a PDF is an account SETTING, not a
+               property of the file: ticking "allow PDF" in the console turns
+               every 401 it has ever returned into a 200, with nothing
+               re-uploaded. A bill stored while delivery was switched off would
+               otherwise be flagged undeliverable for the rest of its life and
+               go on being served the long way round for no reason.
+
+               So a false flag is worth one HEAD request -- the same one
+               PdfStore makes at upload -- and the answer is written down, so
+               this costs one round trip per bill ever rather than one per
+               view. A true flag is never re-checked; the file is there. */
+            if (!deliverable)
+            {
+                deliverable = await Documents.PdfStore.CanBeDelivered(row.PdfUrl!);
+                if (deliverable)
+                {
+                    var live = await _db.SalesInvoices.FirstAsync(i => i.InvoiceId == invoiceId);
+                    live.PdfDeliverable = true;
+                    await _db.SaveChangesAsync();
+                }
+            }
+
+            return new Bill(row.PdfUrl!,
+                BillViewUrl(row.InvoiceNo, row.PdfUrl, deliverable) ?? row.PdfUrl!);
+        }
+
+        return await TryBuildBill(invoiceId);
+    }
+
+    /// <summary>
     /// The bill, to anybody holding the link. Deliberately anonymous: this is
     /// what a customer taps in WhatsApp, and they have no account here.
     ///
@@ -3276,6 +3646,11 @@ public class SalesController : ApiControllerBase
         var row = await _db.SalesInvoices.FirstAsync(i => i.InvoiceId == invoiceId);
         row.PdfUrl = stored.Url;
         row.PdfPublicId = stored.PublicId;
+        /* KEPT this time. The check was always made and always thrown away, so
+           every screen went on offering a Cloudinary link it had been told
+           would answer 401 -- which is precisely why nobody could open a bill.
+           See Models/SalesInvoice.Custom.cs. */
+        row.PdfDeliverable = stored.Deliverable;
         await _db.SaveChangesAsync();
 
         if (!stored.Deliverable)

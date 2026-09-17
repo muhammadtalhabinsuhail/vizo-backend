@@ -31,6 +31,11 @@ public static class DocumentBuilder
             ["purchase-invoice"] = "purchase-invoices",
             ["goods-receipt"] = "goods-receipts",
             ["purchase-return"] = "purchase-returns",
+            /* The credit note for goods coming BACK from a customer. The sale
+               invoice keeps its own renderer because it is the one a customer
+               is handed; a return note is an ordinary internal document and
+               goes through the same path as every other one. */
+            ["sales-return"] = "sales-returns",
             ["stock-adjustment"] = "stock-adjustments",
             ["stock-transfer"] = "stock-transfers",
             ["voucher"] = "vouchers",
@@ -57,6 +62,7 @@ public static class DocumentBuilder
         "purchase-invoice" => await PurchaseInvoice(db, id),
         "goods-receipt" => await GoodsReceipt(db, id),
         "purchase-return" => await PurchaseReturn(db, id),
+        "sales-return" => await SalesReturn(db, id),
         "stock-adjustment" => await StockAdjustment(db, id),
         "stock-transfer" => await StockTransfer(db, id),
         "voucher" => await Voucher(db, id),
@@ -341,6 +347,119 @@ public static class DocumentBuilder
             },
             Notes: $"Reason: {r.Reason}",
             Footnote: "Please issue a credit note against this return.",
+            PreparedBy: r.createdBy);
+    }
+
+    /* ───────────────────────────── sales ───────────────────────────── */
+
+    /// <summary>
+    /// The sales-return credit note.
+    ///
+    /// WHY A RETURN GETS ITS OWN DOCUMENT AND NOT A SECOND INVOICE. An order
+    /// that has been billed keeps the one invoice it was billed on -- that
+    /// number is printed on paper the customer is holding, and issuing another
+    /// for the same goods is how one sale gets paid for twice. What comes back
+    /// is a different event with a different number (SR-...), and it needs a
+    /// piece of paper of its own saying what was returned, in what condition,
+    /// and what is being credited for it.
+    ///
+    /// CONDITION IS ON THE FACE OF IT, per line, because it is the whole
+    /// argument: a resalable unit goes back on the shelf and is worth its price
+    /// again, a damaged one is a loss somebody has to absorb. A note that only
+    /// listed quantities would be settling that argument by omission.
+    /// </summary>
+    private static async Task<DocumentPdf.Data?> SalesReturn(AppDbContext db, int id)
+    {
+        var r = await db.SalesReturns.AsNoTracking()
+            .Where(x => x.ReturnId == id)
+            .Select(x => new
+            {
+                x.ReturnNo, x.ReturnDate, x.Reason,
+                status = x.Status.StatusName,
+                location = x.Location.LocationName,
+                invoiceNo = x.Invoice.InvoiceNo,
+                invoiceDate = x.Invoice.InvoiceDate,
+                orderNo = x.Invoice.Order != null ? x.Invoice.Order.OrderNo : null,
+                refundMethod = x.RefundMethod.MethodName,
+                customer = x.CustomerUser.LegalName,
+                customerCode = x.CustomerUser.PartyCode,
+                customerAddress = x.CustomerUser.AddressLine,
+                customerCity = x.CustomerUser.City.CityName,
+                customerPhone = x.CustomerUser.User.Phone,
+                customerNtn = x.CustomerUser.Ntn,
+                createdBy = x.CreatedByUser.FullName,
+                /* Whoever wrote the ORDER the goods were sold on, which is the
+                   name the customer knows -- same reasoning as the SALESMAN
+                   line on the invoice itself. */
+                salesman = x.Invoice.Order != null && x.Invoice.Order.SalesPersonUser != null
+                    ? x.Invoice.Order.SalesPersonUser.User.FullName
+                    : x.CreatedByUser.FullName,
+                lines = x.SalesReturnItems.OrderBy(l => l.LineNo).Select(l => new
+                {
+                    l.LineNo,
+                    name = l.Product.ProductName,
+                    sku = l.Product.Sku,
+                    qty = l.Quantity,
+                    rate = l.UnitPrice,
+                    condition = l.Condition.ConditionName,
+                    resalable = l.Condition.IsResalable,
+                    back = l.RestockLocation != null ? l.RestockLocation.LocationName : null
+                }).ToList()
+            })
+            .FirstOrDefaultAsync();
+
+        if (r is null) return null;
+        var c = await LetterHead(db);
+
+        var credit = r.lines.Sum(l => l.qty * l.rate);
+        var resalable = r.lines.Where(l => l.resalable).Sum(l => l.qty);
+        var damaged = r.lines.Where(l => !l.resalable).Sum(l => l.qty);
+
+        return new DocumentPdf.Data(
+            Company: c,
+            Title: "Sales Return",
+            DocNo: r.ReturnNo,
+            StatusName: r.status,
+            Counterparty: new DocumentPdf.Party("Returned By", r.customer, Lines(
+                r.customerCode, r.customerAddress, r.customerCity,
+                r.customerPhone is null ? null : $"Phone {r.customerPhone}",
+                r.customerNtn is null ? null : $"NTN {r.customerNtn}")),
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("Return Date", DocumentPdf.Day(r.ReturnDate)),
+                new DocumentPdf.Fact("Against Invoice", r.invoiceNo),
+                new DocumentPdf.Fact("Invoice Date", DocumentPdf.Day(r.invoiceDate)),
+                new DocumentPdf.Fact("Order", r.orderNo ?? "Counter sale"),
+                new DocumentPdf.Fact("Taken Back To", r.location),
+                new DocumentPdf.Fact("Refund By", r.refundMethod),
+                new DocumentPdf.Fact("Salesman", r.salesman),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("#", 0.5, DocumentPdf.Align.Centre),
+                new DocumentPdf.Col("Description", 4.2),
+                new DocumentPdf.Col("Condition", 1.6),
+                new DocumentPdf.Col("Qty", 1.0, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Rate", 1.5, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Credit", 1.7, DocumentPdf.Align.Right),
+            },
+            Rows: r.lines.Select(l => new DocumentPdf.Row(
+                new[]
+                {
+                    l.LineNo.ToString(), l.name, l.condition, DocumentPdf.Qty(l.qty),
+                    DocumentPdf.Money(l.rate), DocumentPdf.Money(l.qty * l.rate)
+                },
+                Sub: l.back is null ? l.sku : $"{l.sku} -- back to {l.back}")).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Units returned", DocumentPdf.Qty(r.lines.Sum(l => l.qty))),
+                new DocumentPdf.Total("Back on the shelf", DocumentPdf.Qty(resalable)),
+                new DocumentPdf.Total("Written off", DocumentPdf.Qty(damaged)),
+                new DocumentPdf.Total("Credit Due", DocumentPdf.Money(credit, c.CurrencySymbol), Emphasis: true),
+            },
+            Notes: $"Reason: {r.Reason}",
+            Footnote: "This is a return note, not a sale invoice. " +
+                      "The original invoice stands and is not re-issued.",
             PreparedBy: r.createdBy);
     }
 

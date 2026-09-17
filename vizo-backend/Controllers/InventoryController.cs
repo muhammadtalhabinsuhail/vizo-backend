@@ -596,13 +596,28 @@ public class InventoryController : ApiControllerBase
 
     [HttpGet("stock-levels")]
     public async Task<IActionResult> GetStockLevels(
-        [FromQuery] int? locationId, [FromQuery] string? q, [FromQuery] string? status)
+        [FromQuery] int? locationId, [FromQuery] int? cityId,
+        [FromQuery] string? q, [FromQuery] string? status)
     {
         try
         {
             var rows = _db.StockBalances.AsNoTracking().AsQueryable();
 
             if (locationId is not null) rows = rows.Where(s => s.LocationId == locationId);
+
+            /* STOCK IN HAND, BY CITY.
+
+               A city is where the business actually keeps things: Karachi has a
+               warehouse and an order department, Lahore has its own pair, and
+               "how much do we hold in Lahore" is the warehouse and the desk
+               added together. Filtering by one location cannot answer it --
+               half the stock is on the other shelf -- and the screen was
+               therefore only ever able to show one warehouse or the whole
+               company with nothing in between.
+
+               Passing neither gives the whole system, which is the other half
+               of what was asked for: everything, combined. */
+            if (cityId is not null) rows = rows.Where(s => s.Location.CityId == cityId);
             if (!string.IsNullOrWhiteSpace(q))
             {
                 var term = q.Trim().ToLower();
@@ -624,6 +639,9 @@ public class InventoryController : ApiControllerBase
                     locationId = s.LocationId,
                     locationCode = s.Location.LocationCode,
                     locationName = s.Location.LocationName,
+                    locationKind = s.Location.Kind.KindKey,
+                    cityId = s.Location.CityId,
+                    cityName = s.Location.City.CityName,
                     qty = s.Quantity
                 })
                 .ToListAsync();
@@ -631,7 +649,8 @@ public class InventoryController : ApiControllerBase
             var shaped = items.Select(s => new
             {
                 s.productId, s.sku, s.name, s.packing, s.minQty, s.maxQty, s.costPrice,
-                s.locationId, s.locationCode, s.locationName, s.qty,
+                s.locationId, s.locationCode, s.locationName, s.locationKind,
+                s.cityId, s.cityName, s.qty,
                 packets = s.packing > 0 ? s.qty / s.packing : 0,
                 loose = s.packing > 0 ? s.qty % s.packing : s.qty,
                 value = s.qty * s.costPrice,
@@ -647,6 +666,29 @@ public class InventoryController : ApiControllerBase
             {
                 totalValue = shaped.Sum(s => s.value),
                 totalUnits = shaped.Sum(s => s.qty),
+                /* What the filter is currently looking at, so the screen can
+                   label its own figures honestly rather than always saying
+                   "total" whether or not a city is selected. */
+                scope = cityId is not null ? "city" : locationId is not null ? "location" : "all",
+                cityId,
+                locationId,
+                /* Each city's own total, so the dropdown can show what it is
+                   about to switch to and the owner can compare two towns
+                   without changing the filter twice. Always the whole company,
+                   never the current filter -- a breakdown that moves when you
+                   pick one of its own rows is a breakdown nobody can read. */
+                byCity = await _db.StockBalances.AsNoTracking()
+                    .GroupBy(b => new { b.Location.CityId, b.Location.City.CityName })
+                    .Select(g => new
+                    {
+                        cityId = g.Key.CityId,
+                        city = g.Key.CityName,
+                        units = g.Sum(x => x.Quantity),
+                        value = g.Sum(x => x.Quantity * x.Product.CostPrice),
+                        locations = g.Select(x => x.LocationId).Distinct().Count()
+                    })
+                    .OrderBy(c => c.city)
+                    .ToListAsync(),
                 items = shaped
             });
         }
@@ -896,7 +938,37 @@ public class InventoryController : ApiControllerBase
                     .ToListAsync(),
                 locations = await _db.Locations.AsNoTracking()
                     .Where(l => l.IsActive).OrderBy(l => l.LocationName)
-                    .Select(l => new { id = l.LocationId, code = l.LocationCode, name = l.LocationName })
+                    .Select(l => new
+                    {
+                        id = l.LocationId,
+                        code = l.LocationCode,
+                        name = l.LocationName,
+                        /* Which town the shelf is in, and what sort of shelf it
+                           is. Stock in hand is asked about by CITY -- Karachi
+                           has one warehouse and one order desk, Lahore has its
+                           own pair -- and without these the screen could only
+                           offer a flat list of every location in the company
+                           with no way to add up a city's. */
+                        kind = l.Kind.KindKey,
+                        kindLabel = l.Kind.KindName,
+                        cityId = l.CityId,
+                        city = l.City.CityName,
+                        /* Claim and in-transit shelves hold stock that is not
+                           for sale. Counted, but the screen can say so. */
+                        isSellable = !l.ExcludeFromSellable
+                    })
+                    .ToListAsync(),
+
+                /* Only the cities that actually have somewhere to keep stock.
+                   The "City" table carries every town in Pakistan and 300-odd
+                   Chinese ones for the supplier forms; offering all of them in
+                   a stock filter would bury the two that matter. */
+                stockCities = await _db.Locations.AsNoTracking()
+                    .Where(l => l.IsActive)
+                    .Select(l => new { l.CityId, city = l.City.CityName })
+                    .Distinct()
+                    .OrderBy(c => c.city)
+                    .Select(c => new { id = c.CityId, name = c.city })
                     .ToListAsync(),
                 adjustmentReasons = await _db.AdjustmentReasons.AsNoTracking()
                     .Select(r => new { id = r.ReasonId, key = r.ReasonKey, name = r.ReasonName })

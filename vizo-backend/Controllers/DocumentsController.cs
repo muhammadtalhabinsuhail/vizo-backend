@@ -250,10 +250,7 @@ public class DocumentsController : ApiControllerBase
     {
         try
         {
-            var expected = DocumentKey(kind, key);
-            if (string.IsNullOrEmpty(k) ||
-                !CryptographicOperations.FixedTimeEquals(
-                    Encoding.UTF8.GetBytes(k), Encoding.UTF8.GetBytes(expected)))
+            if (!DocumentLinks.Matches(k, DocumentKey(kind, key)))
                 return NotFound(new { message = "That link is not valid." });
 
             if (!Kinds.ContainsKey(kind) || !int.TryParse(key, out var id))
@@ -277,17 +274,15 @@ public class DocumentsController : ApiControllerBase
     /// document identity under the JWT signing secret. Unguessable, needs no
     /// column, and rotating that secret revokes every link at once.
     /// </summary>
-    private string DocumentKey(string kind, string key)
-    {
-        var secret = _cfg["Jwt:Key"] ?? "advpos";
-        using var mac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
-        var hash = mac.ComputeHash(Encoding.UTF8.GetBytes($"doc:{kind}:{key}"));
-        return Convert.ToBase64String(hash)
-            .Replace('+', '-').Replace('/', '_').TrimEnd('=')[..22];
-    }
+    /* The scheme itself lives in Documents/DocumentLinks.cs, because
+       SalesController hands out the same link for a sales return's credit note
+       and one signing scheme written down twice is one that gets changed in
+       only one of the two places. */
+    private string DocumentKey(string kind, string key) =>
+        DocumentLinks.Key(_cfg["Jwt:Key"], kind, key);
 
     private string ShareLink(string kind, string key) =>
-        $"{Request.Scheme}://{Request.Host}/api/documents/open/{kind}/{Uri.EscapeDataString(key)}?k={DocumentKey(kind, key)}";
+        DocumentLinks.Share(Request.Scheme, Request.Host.ToString(), _cfg["Jwt:Key"], kind, key);
 
     private object Shape(DocumentFile f, bool rebuilt, string? message) => new
     {

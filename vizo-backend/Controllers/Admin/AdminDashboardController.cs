@@ -110,6 +110,55 @@ public class AdminDashboardController : AdminControllerBase
                 .Select(c => c.Amount)
                 .ToListAsync();
 
+            /* ─────────────────────── SALES RETURNS ───────────────────────
+
+               Goods coming back is the one number on this screen that is
+               always bad news, and until now the owner had no sight of it at
+               all: a return raised by a rep wrote a notification and then
+               vanished into a screen nobody opens unless they already know
+               something is wrong.
+
+               Three figures, because they answer three different questions:
+                 waiting -- returns nobody has decided yet. This is the one that
+                            is the owner's to act on, and it is what the tile
+                            counts in red.
+                 count   -- how many have been raised at all.
+                 value   -- what is being credited back, which is the number
+                            that shows up in the month's takings.
+
+               REJECTED is excluded from the value on purpose: a refused return
+               credits nothing and its stock was taken back off the shelf, so
+               counting it would overstate the damage. It is still counted in
+               `count`, because it happened.                                  */
+            var returnRows = await _db.SalesReturns
+                .Select(r => new
+                {
+                    status = r.Status.StatusKey,
+                    amount = r.SalesReturnItems.Sum(l => (decimal?)(l.Quantity * l.UnitPrice)) ?? 0m,
+                    units = r.SalesReturnItems.Sum(l => (int?)l.Quantity) ?? 0
+                })
+                .ToListAsync();
+
+            var recentReturns = await _db.SalesReturns
+                .OrderByDescending(r => r.ReturnDate).ThenByDescending(r => r.ReturnId)
+                .Take(5)
+                .Select(r => new
+                {
+                    id = r.ReturnId,
+                    returnNo = r.ReturnNo,
+                    invoiceNo = r.Invoice.InvoiceNo,
+                    orderNo = r.Invoice.Order != null ? r.Invoice.Order.OrderNo : null,
+                    customerName = r.CustomerUser.LegalName,
+                    raisedBy = r.CreatedByUser.FullName,
+                    returnDate = r.ReturnDate,
+                    status = r.Status.StatusKey,
+                    statusName = r.Status.StatusName,
+                    itemCount = r.SalesReturnItems.Count,
+                    units = r.SalesReturnItems.Sum(l => (int?)l.Quantity) ?? 0,
+                    amount = r.SalesReturnItems.Sum(l => (decimal?)(l.Quantity * l.UnitPrice)) ?? 0m
+                })
+                .ToListAsync();
+
             var deadStock = await _db.StockBalances
                 .Where(s => s.Quantity > 0 && !s.Location.ExcludeFromSellable)
                 .Where(s => !_db.SalesInvoiceItems.Any(ii => ii.ProductId == s.ProductId))
@@ -154,6 +203,19 @@ public class AdminDashboardController : AdminControllerBase
                     o.salesPerson, o.total, o.creditHoldReason, o.creditLimit
                 }),
                 claimsStuck = new { count = claims.Count, value = claimValue },
+                salesReturns = new
+                {
+                    count = returnRows.Count,
+                    waiting = returnRows.Count(r => r.status == "DRAFT"),
+                    value = returnRows.Where(r => r.status != "REJECTED").Sum(r => r.amount),
+                    units = returnRows.Where(r => r.status != "REJECTED").Sum(r => r.units),
+                    recent = recentReturns.Select(r => new
+                    {
+                        r.id, r.returnNo, r.invoiceNo, r.orderNo, r.customerName, r.raisedBy,
+                        customerInitials = Initials(r.customerName),
+                        r.returnDate, r.status, r.statusName, r.itemCount, r.units, r.amount
+                    })
+                },
                 deadStockValue = deadStock,
                 awaitingCollections = new { count = awaiting.Count, value = awaiting.Sum() },
                 activity,

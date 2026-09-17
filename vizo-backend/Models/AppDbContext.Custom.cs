@@ -1,4 +1,4 @@
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
 
 namespace vizo_backend.Models;
 
@@ -235,6 +235,27 @@ public partial class AppDbContext
                 .HasForeignKey(e => e.UserId)
                 .OnDelete(DeleteBehavior.Cascade)
                 .HasConstraintName("NotificationPreference_UserId_fkey");
+        });
+
+        modelBuilder.Entity<SalesInvoice>(entity =>
+        {
+            /* Whether Cloudinary will actually SERVE the stored bill. Defaults
+               to false because that is the truth for every row uploaded before
+               the flag existed -- PDF delivery is switched off on the account
+               they went to. See Models/SalesInvoice.Custom.cs and
+               database/18_sales_scope_returns_and_places.sql. */
+            entity.Property(e => e.PdfDeliverable).HasDefaultValue(false);
+        });
+
+        modelBuilder.Entity<Party>(entity =>
+        {
+            /* Who opened the account, as opposed to which rep it is assigned
+               to. SetNull rather than Cascade: deactivating the person who
+               typed a customer in must not take the customer with them. */
+            entity.HasOne(e => e.CreatedByUser).WithMany()
+                .HasForeignKey(e => e.CreatedByUserId)
+                .OnDelete(DeleteBehavior.SetNull)
+                .HasConstraintName("fk_party_created_by");
         });
 
         modelBuilder.Entity<JournalEntry>(entity =>

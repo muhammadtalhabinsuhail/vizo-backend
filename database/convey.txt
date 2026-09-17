@@ -2,413 +2,479 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
- Last written 6 September 2026, after the Chinese-party work. Rewritten in
- full each time, so this is the current state of everything worth saying — not
- a log.
+ Last written 17 September 2026, after the sales-return, invoice-PDF, warehouse
+ and notification work. Rewritten in full each time, so this is the current
+ state of everything worth saying — not a log.
 
- Read section 1 before you deploy. The rest is reference.
-
-
-───────────────────────────────────────────────────────────────────────────────
- 1.  THINGS THAT WILL BREAK IF YOU SKIP THEM
-───────────────────────────────────────────────────────────────────────────────
-
- 1.1  RUN THE MIGRATIONS
-
-      backend/database/15_order_workflow.sql
-      backend/database/16_warehouse_and_notification_links.sql
-      backend/database/17_party_country.sql
-
-      All three have already been run against the live Neon database. Any OTHER
-      environment — a colleague's local copy, staging — must run them, or the
-      order chain, the clickable bell and Chinese suppliers are simply missing.
-
-      15 adds four order statuses, the warehouse-keeper role, the
-      orders.warehouse permission, "OrderChangeRequest", and
-      "SalesOrder"."ConfirmRemindedAt".
-
-      16 adds the "Seen by Warehouse" status (and renumbers the chain to ten
-      steps), the "Notification"."Url" column, and invoices.view for the
-      warehouse keeper.
-
-      17 adds "Province"."Country" -- 'PK' or 'CN' -- and marks the 34 Chinese
-      provinces that were already sitting in that table.
-
-      All three are written to be safe to run twice.
-
- 1.2  npm install IN THE FRONTEND
-
-      The live bell needs @microsoft/signalr, which is in package.json. Without
-      `npm install` the build fails on an import it cannot resolve.
-
-      It is loaded with a dynamic import() inside the effect, not at the top of
-      the file, so it lands in its own chunk rather than the shared bundle —
-      AGENTS.md rule 4. Do not "tidy" it into a normal import.
-
- 1.3  YOUR LOGIN FIX IS NOT IN THIS REPOSITORY
-
-      You said you had fixed the login screen by hand so the warehouse keeper
-      could sign in. There is no such change in the working tree — src/app/
-      login/page.tsx still lists four panels (Sales, Order Department,
-      Accountant, Super Admin) and no warehouse one, and git reports no local
-      edits to it.
-
-      So either it was made in a different copy of the project, or it has been
-      lost. Nothing here has overwritten it — there was nothing to overwrite —
-      but please check before you pull, because a pull WILL overwrite an
-      uncommitted change if one turns up later.
-
-      For what it is worth, the panels are only a convenience that fills in an
-      e-mail address. Typing the address by hand signs the keeper in just the
-      same. The account is real: UserId 41, Talha,
-      muhammadtalhabinsuhail@gmail.com, role warehouse-keeper, active.
-
-      I did not add a fifth panel myself because you said not to touch that
-      code. It is four lines in the PANELS array whenever you want it.
+ WHAT MUST BE DONE BY HAND now lives in its own file: changa.txt, beside this
+ one. Read that first and this second.
 
 
 ───────────────────────────────────────────────────────────────────────────────
- 2.  A BUG I FOUND AND DID NOT TOUCH
+ 1.  THE THREE FAULTS BEHIND WHAT YOU REPORTED, AND WHAT EACH ONE ACTUALLY WAS
 ───────────────────────────────────────────────────────────────────────────────
 
- 2.1  THE VAPID KEYS IN .env.example DO NOT MATCH THE SERVER
-
-      vizo-erp/.env.example       NEXT_PUBLIC_VAPID_PUBLIC_KEY=BFkgyKlQ1rBMwE-...
-      backend appsettings.json    VapidSettings:PublicKey     =BLDLEeGrO9V8jS1...
-
-      Two different key pairs.
-
-      .env.local is correct — it matches the server, so push works today. The
-      danger is the template: anybody setting up a new machine by copying
-      .env.example to .env.local gets a browser that subscribes to push quite
-      happily and a server that is then rejected on every send. It fails
-      silently, which is the worst way for it to fail.
-
-      Left alone because a key is not mine to change and changing the wrong one
-      of the two would break the working setup. The fix is one line: copy the
-      public key out of appsettings.json into .env.example.
+ You reported four symptoms. They came from three faults, and none of the three
+ was where the symptom pointed. Worth writing down, because two of them had
+ been there since the order workflow shipped on 3 September.
 
 
-───────────────────────────────────────────────────────────────────────────────
- 3.  BUGS I DID FIX, THAT YOU DID NOT ASK ABOUT
-───────────────────────────────────────────────────────────────────────────────
+ 1.1  "CLICKING INVOICED DOES NOT PRODUCE AN INVOICE"
 
- 3.1  NOTIFICATION BODIES OVER 300 CHARACTERS WERE BEING THROWN AWAY
+      It never did. PATCH /sales/orders/{id}/status wrote a status id and
+      nothing else. There is a separate POST /orders/{id}/invoice that does the
+      real work — cuts the invoice, numbers it, renders the bill, pushes it to
+      Cloudinary — and the chain strip on the order screen never called it.
 
-      The bell truncated the body to 400 characters. The column is
-      VARCHAR(300). A long notification therefore threw on the way in — and
-      because PushNotificationService swallows its own failures, it did so
-      without a word: no bell row, no push, no log line. Now truncated to 300.
+      So pressing step 4 of the chain, which is the obvious way to bill an
+      order and the one thing on screen, left an order that SAID "Invoiced"
+      with no "SalesInvoice" row behind it. Nothing to print, for anybody:
+      not the rep, not the warehouse, not the order desk, not you.
 
- 3.2  AN ERROR MESSAGE WITH A WINDOWS PATH IN IT
+      COUNTED AGAINST THE LIVE DATABASE. Six orders are in that state and three
+      of them have already been delivered to customers:
 
-      NotificationController said it could not "load C:/Program Files/Git/api/
-      notification". A Git Bash path expansion had been baked into the source
-      at some point. It now says "load your notifications".
+          ORD-26-0140 Dispatched      ORD-26-0168 Dispatched
+          ORD-26-0141 Dispatched      ORD-26-0170 Invoiced
+          ORD-26-0143 To Order Dept   ORD-26-0171 Delivered
 
- 3.3  EDITING AN ORDER CRASHED INSTEAD OF REFUSING
+      The two routes now call the same method, so it cannot happen again. All
+      six have been invoiced, on your say-so, through the real endpoint —
+      see 7A for the numbers they were given and for the mistake I made doing
+      it.
 
-      UpdateOrder read order.Status without including it, so the check meant to
-      refuse a delivered order threw a NullReferenceException on every single
-      edit. Fixed by including the navigation.
-
- 3.4  YOU COULD NOT SAVE A PARTY WITHOUT PICKING A SALES REP
-
-      Found while testing the Chinese form, and nothing to do with it:
-      /parties/new could not save AT ALL unless a sales rep was chosen.
-
-      The payload said `d.salesPersonUserId === "" ? null : Number(...)`, but
-      that field is z.coerce.number(), and coercing "" gives 0, never "". So
-      leaving Sales Rep on "-- None --" sent 0, 0 is not an employee id, and the
-      insert died on fk_party_salesperson with a raw 500.
-
-      Now reads "greater than zero, or null". Nothing else about that field
-      changed. Worth knowing how long it has been like that -- if suppliers have
-      been going in some other way, this is why.
-
- 3.5  A DUPLICATE TAX NUMBER CAME BACK AS A 500
-
-      "Ntn", "Strn" and "Cnic" are all UNIQUE in the schema, and nothing said so
-      before the insert -- re-using one answered with a constraint name inside a
-      stack trace. The party code and the e-mail have always been checked
-      properly; these three were simply missed. They now say
-
-        NTN 1234567-8 is already on another account.
-
-      and, for a Chinese party, "Social Credit Code ... is already on another
-      account."
+      It is idempotent. An order that already has an invoice does not get a
+      second one; the step just makes sure the PDF exists. That is the other
+      half of what you asked for, and it is enforced in the API rather than in
+      the screen, so it holds however the endpoint is reached.
 
 
-───────────────────────────────────────────────────────────────────────────────
- 4.  WHAT THE NOTIFICATIONS DO NOW
-───────────────────────────────────────────────────────────────────────────────
+ 1.2  "SALES RETURN SAYS Could not load invoices and refund methods"
 
- 4.1  EVERY ONE OF THEM GOES SOMEWHERE
+      The Sales role did not hold invoices.view. Checked against the live
+      database before changing anything — it held exactly five permissions:
 
-      The link always existed — all fifty-odd call sites passed one — but it
-      was only ever handed to Web Push. A notification read in the bell was a
-      dead end: it told you an order had been confirmed and left you to go and
-      find it.
+          customers.manage, customers.view, orders.create, orders.view,
+          reports.view, returns.sales
 
-      "Notification"."Url" now stores it, the API returns it, and a row in the
-      bell is a real anchor. Middle-click and "open in new tab" work.
+      returns.sales was there. invoices.view was not.
 
-      ROWS WRITTEN BEFORE THIS HAVE NO LINK and are not clickable. Nothing is
-      broken; they simply predate the column. New ones all have one.
+      The new-return screen loads the invoice list and the refund methods in
+      one Promise.all. The invoice half answered 403, the whole call rejected,
+      and the catch printed a sentence naming both halves and identifying
+      neither. Sales returns were never broken. A rep was simply not allowed to
+      look up the invoice they were returning against — and for the same
+      reason could not open or print any bill, which is the other symptom you
+      described.
 
- 4.2  WHO GETS TOLD WHAT
+      Two changes, and they are independent on purpose:
 
-      Every action taken by anybody other than the Super Admin now reaches the
-      Super Admin's bell, named, with the thing it is about and a link to it:
+        · migration 18 grants invoices.view, invoices.create and returns.sales
+          to the Sales role.
+        · the screen now settles the two calls separately and says which one
+          failed, in the API's own words. If this ever happens again you will
+          be told what actually went wrong.
 
-        VIZO — New item added by Talha
-        VIZO Warehouse Test Charger (TEST-WH-01) is now in the catalogue.
-        -> /inventory/products/38
+      PERMISSIONS ARE IN THE TOKEN. Everybody has to sign out and back in, or
+      wait eight hours. See changa.txt §1.2.
 
-      Newly covered, where there was nothing before: adding or editing a
-      product; adding, renaming or deleting a category or brand; opening,
-      editing or closing a customer/supplier account; writing, editing or
-      deleting a journal entry; editing or deleting a voucher; editing or
-      deleting an expense; reopening a closed period.
 
-      Deliberately NOT covered, because the noise would cost more than the
-      information: marking a notification read, uploading a file, archiving a
-      PDF, asking the reports screen a question, and everything under /admin
-      that only the Super Admin can do anyway — telling them about their own
-      clicks helps nobody.
+ 1.3  "NOBODY CAN SEE THE INVOICE AS A PDF"
 
- 4.3  THE ORDER CHAIN, AND WHO HEARS EACH STEP
+      Two separate things, and only one of them was the one everybody assumed.
 
-        4 Invoiced           -> Admin, Accounts
-        5 Seen by Warehouse  -> Admin, and the rep whose order it is
-        6 On way to Order Dept -> Admin, ORDER DEPARTMENT, and the rep
-        7 Received at Order Dept -> Admin, Warehouse
-        8 Packaging          -> Admin, and the rep
-        9 Dispatched         -> Admin, the rep, Accounts
-       10 Delivered          -> Admin, Accounts
+      The FIRST is 1.1 above: six orders had no invoice at all.
 
-      The rep is added by user id, not by role, so it is the person who wrote
-      that order rather than every salesperson in the company.
+      The SECOND is a link that could be dead and nothing checking. Every bill
+      is pushed to Cloudinary and the returned URL written to
+      "SalesInvoice"."PdfUrl", and the screen opens that URL directly, because
+      window.open cannot send an Authorization header. Cloudinary blocks PDF
+      delivery by default on accounts created since 2023: the upload succeeds,
+      an ordinary-looking secure_url comes back, and every request to it
+      answers 401.
+
+      PdfStore has always HEADed the URL after uploading and reported the
+      answer. For a sale invoice that answer was used to choose the WhatsApp
+      link and then thrown away — there was nowhere to keep it. So during the
+      whole period the account was refusing PDFs, every Print button in the
+      application opened Cloudinary's error page and the app had been told and
+      had forgotten.
+
+      CHECKED TODAY, AND IT IS SERVING. HEAD on a real stored bill answers 200.
+      Somebody has ticked the box since convey.txt last said otherwise. Good —
+      that is the better link. But the app now stores the answer per invoice
+      instead of assuming either way, and re-checks a false one exactly once,
+      so ticking or unticking that box never again silently breaks Print.
+
+      TEN OF THE 38 INVOICES still have no stored PDF. Nothing is broken — a
+      bill is rendered from the database whenever one is asked for — and the
+      first time each is opened it archives itself. See changa.txt §2.2.
 
 
 ───────────────────────────────────────────────────────────────────────────────
- 4A.  PAKISTANI AND CHINESE PARTIES
+ 2.  WHAT A SALESPERSON SEES NOW, EXACTLY
 ───────────────────────────────────────────────────────────────────────────────
 
- /parties/new asks, for a supplier or a customer-and-supplier, whether the
- party is Pakistani or Chinese. A plain customer is not asked -- it is a shop in
- Pakistan.
+ HIS OWN: orders he raised, invoices against them, returns against those, and
+ the customer accounts HE OPENED or has since been assigned.
 
- Choosing Chinese changes three things: every example placeholder on the form,
- the phone format, and the three tax fields.
+ EVERYBODY'S: the customer PICKER on the order form. Deliberately — you said
+ "issued still he can see all customers", and a rep covering for a colleague
+ still has to be able to take the order. Administering an account and selling
+ to one are different questions and they now have different answers.
 
-     NTN   1234567-8            ->  USCC     91440300MA5EDK8T5H
-     STRN  32-77-8901-234-56    ->  VAT No.  440300123456789
-     CNIC  00000-0000000-0      ->  ID Card  440301199001011234
+ THE CREATOR IS A NEW FACT. "Party" carried only SalesPersonUserId, which is
+ the rep the relationship is ASSIGNED to: often empty, and freely reassigned
+ when a territory moves. Using it to answer "whose customers are these" would
+ mean a rep loses their own account the day you hand it to somebody else. So
+ there is now a separate "CreatedByUserId", written once and never edited.
 
- The placeholders are in English letters on purpose. A placeholder exists to
- show somebody the shape of the thing they are about to type, and nobody at
- this company reads Chinese characters -- so they are real Chinese companies,
- addresses and numbers, written the way they appear on an export invoice.
+ EXISTING ROWS were back-filled from the assigned rep, which is the closest
+ true answer that exists — nothing recorded the creator before today. Parties
+ with no rep are NULL and show only to the back office. That is correct: nobody
+ can claim them. If some of them ought to belong to a particular rep, set the
+ Sales Rep field on each and they will appear.
 
- THE SAME THREE DATABASE COLUMNS hold both sets. An 18-character Social Credit
- Code lives in "Ntn" and the screen labels it USCC. Renaming the columns would
- mean touching every report and export that reads them, to gain nothing a label
- does not already give. All three were already wide enough, and none of them
- has a CHECK constraint -- the database has always been willing to store these.
- What refused them was the form.
-
- THE CITY IS THE ANSWER, NOT THE BUTTON. A party's country is read from its
- city, through the province, on the screen and on the server alike. That is why
- there is no "Country" column on "Party": the province already knows, and two
- answers to one question is one answer too many. In practice it means picking
- Guangzhou makes a party Chinese whether or not anybody pressed anything, which
- is what keeps the form and the API agreeing about which numbers to demand.
-
- Once the country is chosen, only that country's cities are offered. The
- customer path is untouched and still lists every city, exactly as before.
-
- ALL THREE PARTY SCREENS AGREE. The new form, the profile and the edit form
- label the same three rows from the same place, so a Chinese party reads
- USCC / VAT No. / ID Card everywhere and a Pakistani one reads
- NTN / STRN / CNIC everywhere.
-
- The words, the placeholders and the number shapes all live in ONE file --
- vizo-erp/src/lib/party-tax.ts -- and every screen reads from it. They were
- briefly held separately, which is exactly how a supplier ended up being SAVED
- as a Social Credit Code and DISPLAYED as an "NTN": one screen was taught and
- the other was not. One copy, and that cannot happen again.
-
- THERE WAS NO EDIT SCREEN AT ALL. This is worth saying plainly, because you
- asked me to change the labels on one. PUT /parties/{id} has existed since the
- controller was written, fully validated, and NOTHING in the front end ever
- called it -- there was no route, no button and no link anywhere. A customer
- whose phone number changed had to be corrected in the database or left wrong.
-
- So /parties/[id]/edit is new, and there is now an Edit button on the profile
- beside Statement, gated on customers.manage. Two things it deliberately will
- not change:
-
-   THE ACCOUNT CODE, because it is already printed on invoices. The API keeps
-   the existing one when the form sends null.
-
-   CUSTOMER vs SUPPLIER, because that swaps the role behind the party and the
-   side of the ledger they sit on, with orders and invoices already hanging off
-   both. That is a decision, not a correction, and it does not belong on a form
-   whose other fields are phone numbers and addresses. Say the word if you want
-   it, but it needs thinking about rather than a dropdown.
-
- The opening balance and the rating are carried through untouched -- they are
- history and they are set elsewhere. Verified by saving a party with no changes
- and checking all of it came back identical.
-
- A NOTE ON THE PHONE RULE. The Chinese pattern accepts a mainland mobile
- (1[3-9] then nine digits) or a landline with its area code. It is deliberately
- permissive, and a Pakistani mobile happens to fit the landline shape. Being too
- strict there would block real numbers, which is the worse failure of the two.
+ The scoping is on the ROLE, not on a permission. Giving Sales the right to
+ handle returns opens the returns screen to them; it does not turn them into
+ the accounts department. Accounts, the order desk, the warehouse and you all
+ see everything — you cannot reconcile a ledger through a keyhole.
 
 
 ───────────────────────────────────────────────────────────────────────────────
- 5.  THE WAREHOUSE KEEPER, EXACTLY
+ 3.  THE SALES RETURN, END TO END
 ───────────────────────────────────────────────────────────────────────────────
 
- CAN:  see every order in the system, open any invoice, print a bill, and make
-       two moves — and only these two, only on an INVOICED order:
+ A rep raises it against one of their own invoices. The API refuses an invoice
+ that is not theirs, refuses a product that is not on it, and refuses more
+ units than were sold less whatever has already come back.
 
-         Invoiced -> Seen by Warehouse -> On way to Order Dept
+ IT GETS A DOCUMENT OF ITS OWN — a return note, not a second invoice. That is
+ the distinction you drew and it is the right one: the order keeps the single
+ bill it was billed on, because that number is printed on paper the customer is
+ holding and a second bill for the same goods is how one sale gets paid for
+ twice. What comes back is a different event with its own number (SR-…) and its
+ own piece of paper.
 
- CANNOT: raise an order, edit one, delete one, cancel one, ask permission to do
-       any of those, or move an order to any other status. There is no "Ask for
-       permission" button for this role — editing is not part of the job, so a
-       button that asks for it is asking for something that will never be
-       granted.
+ The note carries the invoice AND the order it came off, every line with its
+ CONDITION, where each resalable unit went back to, and the credit due. The
+ condition is on the face of it because it is the whole argument: a resalable
+ unit is worth its price again, a damaged one is a loss somebody absorbs.
 
- Verified against the live API rather than assumed. On an invoiced order the
- keeper is offered exactly one action; on a draft, a dispatched or a delivered
- order, none at all. POST, PUT and DELETE on an order all answer 403, as does
- trying to skip from Invoiced to Delivered.
+ It is archived to Cloudinary the moment the return is saved, in the same store
+ and through the same renderer as every other document. Returns raised BEFORE
+ today have no archived copy; their Print button renders from the database, so
+ it works, and archives nothing.
 
- The "Set status" dropdown is hidden for this role, because its only entry
- would repeat the button beside it.
+ YOU ARE TOLD BY NAME. The notification goes to you, to Accounts and to the
+ order desk (stock is coming back to a shelf they look after). Every copy now
+ ends with who it was addressed to — see section 5.
 
- NOTE: the keeper CAN add items to the catalogue today, because the whole
- inventory controller is open to the back office rather than gated item by
- item. Your example assumed that, so I left it. If you would rather they could
- not, untick it in Setup → Roles once the catalogue endpoints are
- permission-gated — say the word and that is a small change.
+ ON YOUR DASHBOARD it is a column of its own, in red, and a link. Count of
+ returns, how many are waiting on a decision, units back, value credited, and
+ the five most recent with the ORDER number rather than just the invoice —
+ because the question you asked is which orders had goods come back. Clicking
+ through goes to the list; clicking a row goes to the return, where the order,
+ the bill, how many of the sold units came back, both PDFs and the whole
+ activity trail are on one screen.
 
 
 ───────────────────────────────────────────────────────────────────────────────
- 6.  DECISIONS YOU MIGHT WANT DIFFERENTLY
+ 4.  WHICH WAREHOUSE, WHICH ORDER DESK
 ───────────────────────────────────────────────────────────────────────────────
 
- 6.1  THE WAREHOUSE STARTS AT INVOICED, NOT AT CONFIRMED
+ NO NEW TABLE. The schema has modelled this since the first day and neither
+ side was ever read:
 
-      It used to pick up a CONFIRMED order. It no longer does, because you
-      asked for the two new steps to open "after the status Invoiced", and
-      because picking stock against an order the office has not billed is how
-      goods leave with no invoice behind them.
+     "User"."PrimaryLocationId"   the one place this person works at
+     "UserLocation"               every place they may work out of
 
-      If you want the floor to be able to start before the paperwork, it is one
-      line in Services/OrderWorkflow.cs — the Moves table.
+ What was missing was the rule. /admin/users would create a warehouse keeper
+ with no location, or three, or attached to the Claim Stock shelf — and the
+ picking queue then showed them every order in the company.
 
- 6.2  PERMISSIONS NOW REALLY OPEN PAGES
+ Now: a keeper or an order-desk clerk gets EXACTLY ONE location, and it must be
+ of the right kind — a warehouse for the keeper, a department for the desk. The
+ form asks "which warehouse" and offers only warehouses; the API enforces the
+ same rule, because a form is a convenience and not a guarantee.
 
-      Endpoints used to be guarded by hard-coded lists of ROLE NAMES, so
-      ticking a box in Setup → Roles saved happily and changed nothing.
-      Authorisation is now on the permission itself. Worth a look over
-      Setup → Roles to check that what is ticked is what you meant, because
-      until recently some of it had no effect.
+ NOT "at least one". A keeper who belongs to two warehouses has an ambiguous
+ queue, and the first thing anybody would ask on seeing it is which of the two
+ the stock is actually on. If somebody genuinely covers both cities, give them
+ two accounts or a back-office role — that is a decision about how the business
+ is run, not a second tick-box.
 
- 6.3  A SALESPERSON SEES ONLY THEIR OWN WORK
+ The warehouse queue is filtered to the keeper's own warehouse. You can still
+ look at any warehouse's queue by passing a location. An account with no place
+ set sees everything, which is what an admin looking at that page should see.
 
-      Orders, invoices and returns are filtered to the signed-in rep, on the
-      list AND on the detail endpoint. Accounts, the order desk, the warehouse
-      and the owner see everything.
+ THE SEED ONLY EVER HAD KARACHI, with two locations named "Warehouse" and
+ "Order Department" — true when there was one city and confusing the moment
+ there are two. Migration 18 renames them to "Karachi …" and adds the Lahore
+ pair, so the dropdown has something to show. They are ordinary rows: rename
+ them, deactivate them, add Faisalabad beside them. Nothing in the code knows
+ any location's id or name. If you would rather set them up yourself, delete
+ section 4 of migration 18 before running it.
 
- 6.4  A REP CANNOT INVOICE THEIR OWN NEW ORDER
+ Every other role keeps the old behaviour — as many locations as you want to
+ grant. An accountant reading ledgers is not standing anywhere in particular.
 
-      The "raise the invoice too" switch on the new-order screen is ignored for
-      the Sales role, because it stepped straight over your confirmation. The
-      reply says so. One line in CreateOrder if you disagree.
 
- 6.5  DELETING AN INVOICED ORDER IS REFUSED — EVEN FOR YOU
+───────────────────────────────────────────────────────────────────────────────
+ 5.  STOCK IN HAND, BY CITY
+───────────────────────────────────────────────────────────────────────────────
 
-      It would leave an invoice pointing at nothing. Raise a sales return
-      instead. Everything else — any status, either direction, edit, delete —
-      is yours without restriction.
+ /inventory/stock-levels now has a picker at the top: "Whole system — every
+ city combined", then one entry per city with its units.
 
- 6.6  THE ORDER DATE IS NOT EDITABLE
+ THE CITY IS THE UNIT, not the shelf. Karachi has a warehouse and an order
+ department; Lahore has its own pair. "How much do we hold in Lahore" means
+ both of them added together, and a per-location view cannot answer it — half
+ the stock is on the other shelf. The screen could previously only show every
+ location side by side, which answers a different question and gets less
+ readable with every city added.
+
+ Inside a city the per-location columns stay, because it still matters whether
+ something is on the warehouse shelf or already at the order desk. There are
+ simply fewer of them, and only that city's.
+
+ A row of city chips under the figures shows every city's units and value
+ whatever the filter is set to — a breakdown that moves when you pick one of
+ its own rows is a breakdown nobody can read, and comparing two towns is most
+ of why anybody opens this screen.
+
+ THE FILTER IS SERVER-SIDE. There are 957 items across five locations today and
+ there will be more of both; pulling every balance and hiding most of them in
+ the browser is the shape that stops working quietly.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 6.  NOTIFICATIONS: WHO IT IS FOR, AND A LINK THAT IS A LINK
+───────────────────────────────────────────────────────────────────────────────
+
+ 6.1  EVERY ONE NOW SAYS WHO IT WAS SENT TO
+
+      "For Muhammad Zain (Warehouse Keeper)." on the end of the body, with the
+      full name and the role in words.
+
+      The same event goes to four or five people at once and the wording never
+      said which copy you were holding. A keeper reading "Order invoiced" could
+      not tell whether it had been addressed to them, to the order desk or to
+      you. Read from the database, not from the token — the token belongs to
+      whoever pressed the button, and this line is about whoever is reading it.
+
+      The body is trimmed first if it would not otherwise fit. The column is
+      300 characters and a row that overflows is a row that is thrown away
+      silently, which is how long notifications used to disappear.
+
+ 6.2  THE LINK CARRIES THE REAL ADDRESS
+
+      https://advpos-frontend.vercel.app/sales/orders/42, not /sales/orders/42.
+
+      It comes from configuration — App:WebBaseUrl, overridable per environment
+      with the App__WebBaseUrl variable — so you change one line and every
+      notification, push and bell row follows. See changa.txt §1.3.
+
+      Why it matters: a Web Push payload is opened by the service worker with
+      clients.openWindow(), and a bare path resolves against the worker's scope
+      rather than against your site. It happens to work while the app is the
+      only thing on that origin. And a path pasted into WhatsApp is not a link.
+
+      IN-APP NOTHING GOT SLOWER. The bell turns an absolute link back into a
+      path when it points at the site you are already on, so clicking one is
+      still a client-side navigation and not a full page load. A link pointing
+      somewhere else — production's bell read on a local build — is left alone
+      and opens as an ordinary link, which in that case is what it is.
+
+      ROWS WRITTEN BEFORE TODAY still hold bare paths. They work exactly as
+      they did.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 7.  DECISIONS YOU MIGHT WANT DIFFERENTLY
+───────────────────────────────────────────────────────────────────────────────
+
+ 7.1  A REP CAN NOW BILL A CONFIRMED ORDER
+
+      Granting invoices.create was necessary — the workflow has always allowed
+      Sales to move Confirmed → Invoiced, the endpoint just asked for a
+      permission nobody held. It is AFTER your confirmation, so it does not
+      step over any decision of yours.
+
+      What has NOT changed: the "raise the invoice too" switch on the new-order
+      screen is still ignored for a rep, because that one DID step over your
+      confirmation. One line in CreateOrder if you disagree.
+
+ 7.2  A CANCELLED OR HELD ORDER CANNOT BE BILLED, EVEN BY YOU
+
+      You may set any status in any direction — that is the point of the role
+      and it is unchanged. But moving a cancelled order to Invoiced is almost
+      always a misclick, and it would mint a real invoice number against goods
+      that were cancelled. Put it back on the chain first and the invoice
+      follows.
+
+ 7.3  THE STAFF FORM NO LONGER OFFERS "CUSTOMER" AS A ROLE
+
+      /admin/users listed all seven roles, including Customer, Supplier and
+      Customer & Supplier. Those are PARTY roles — a shop that buys from us —
+      and choosing one produced a staff account with an employee code and no
+      party behind it. The form now shows staff roles only. Nothing was
+      deleted; the roles are still there and /parties still uses them.
+
+ 7.4  DELETING AN INVOICED ORDER IS STILL REFUSED — even for you
+
+      It would leave an invoice pointing at nothing. Raise a sales return.
+
+ 7.5  THE ORDER DATE IS STILL NOT EDITABLE
 
       Editing a quantity corrects a mistake. Moving the date an order was
-      placed rewrites history. The API refuses it.
+      placed rewrites history.
+
+ 7.6  THE WAREHOUSE STILL STARTS AT INVOICED, NOT AT CONFIRMED
+
+      Picking stock against an order the office has not billed is how goods
+      leave with no invoice behind them. One line in Services/OrderWorkflow.cs
+      — the Moves table — if you want the floor to start earlier.
 
 
 ───────────────────────────────────────────────────────────────────────────────
- 7.  THE DATE BUG — WHAT IT ACTUALLY WAS
+ 7A.  WHAT I RAN AGAINST THE LIVE DATABASE, AND ONE MISTAKE I MADE DOING IT
 ───────────────────────────────────────────────────────────────────────────────
 
- An order taken on the night of 3 September was stored as 2 September.
+ You said to run migration 18 in full and to invoice the six stranded orders,
+ so both are done. Here is exactly what happened, including the part that went
+ wrong.
 
- Every date came from DateTime.UtcNow. Pakistan is UTC+5, so between midnight
- and 5am our time it is still yesterday in UTC.
+ MIGRATION 18 — applied, verified:
+   · Sales now holds invoices.view, invoices.create, returns.sales.
+   · LOC-01/LOC-02 renamed to "Karachi Warehouse" / "Karachi Order Department";
+     LOC-06 "Lahore Warehouse" and LOC-07 "Lahore Order Department" added.
+   · "SalesInvoice"."PdfDeliverable" and "Party"."CreatedByUserId" exist.
+     16 of 25 parties now name a creator, back-filled from the assigned rep.
 
- Fixed by putting the business clock in one place —
- backend/vizo-backend/Services/BusinessClock.cs — and sweeping the seventeen
- other callers of UtcNow, including document numbering, which was stamping the
- wrong YEAR on every 1 January.
+ THE SIX INVOICES — raised through the real endpoint, not by hand, so the
+ numbering, lines, PDF, activity log and notifications all went the normal way:
 
- EXISTING ROWS ARE NOT CORRECTED. Anything already stored with the wrong date
- still has it. If that matters, say so — it needs a decision about which rows,
- because not every early-morning date is wrong.
+     ORD-26-0140 -> INV-26-8888      ORD-26-0168 -> INV-26-8891
+     ORD-26-0141 -> INV-26-8889      ORD-26-0170 -> INV-26-8892
+     ORD-26-0143 -> INV-26-8890      ORD-26-0171 -> INV-26-8893
+
+ THE DATES ARE BETTER THAN I WARNED YOU. I said they would carry today's date.
+ They do not: RaiseInvoiceForOrder dates an invoice from the ORDER, so these
+ read 10 Aug, 13 Aug, 14 Aug, 15 Sep, 16 Sep and 16 Sep — the days the orders
+ were actually taken. Only the numbers came off today's series. All six PDFs
+ are on Cloudinary.
+
+ AND THE MISTAKE. Raising those invoices rewound five of the orders. Widening
+ the "Raise invoice" button to orders further down the chain exposed a line
+ that had been harmless while the button only ever appeared at CONFIRMED:
+ RaiseInvoiceForOrder set the status to INVOICED unconditionally. So
+
+     ORD-26-0140 Dispatched      ORD-26-0141 Dispatched
+     ORD-26-0143 To Order Dept   ORD-26-0168 Dispatched
+     ORD-26-0171 Delivered
+
+ all briefly said "Invoiced" instead. Every one has been put back, and each
+ carries an ORDER_STATUS_RESTORED row in the activity log saying what happened.
+ No figures, lines or invoices were touched by the restore.
+
+ The line is fixed: the status now moves FORWARD to Invoiced only. An order
+ already at or past that step keeps where it is. Checked afterwards against a
+ real dispatched order — billing it again answers with the existing bill,
+ mints nothing, and leaves it dispatched.
+
+ They were put back with SQL rather than through the status endpoint on
+ purpose. That endpoint announces every move, and telling you, Accounts and
+ the rep that ORD-26-0171 "has left" and then "reached the customer" all over
+ again would be four notifications about something that did not happen.
+
+ WHAT ELSE I CHECKED WHILE I WAS IN THERE. Every endpoint this work touched,
+ against live data, as three different people — you, a salesperson and the
+ warehouse keeper. All green. The keeper sees 3 orders in his queue rather than
+ the 6 that qualify company-wide, because 3 of them are on the other two
+ shelves; the rep sees 16 invoices of 34 and 3 returns of 7. The stock screen
+ reports Karachi 23,875 units and Lahore 0, which is right — the Lahore
+ locations were created an hour ago and nothing has been moved into them.
 
 
 ───────────────────────────────────────────────────────────────────────────────
- 8.  SMALL THINGS LEFT ALONE ON PURPOSE
+ 7B.  TWO BITS OF DATA THAT ARE NOW VISIBLY ODD
 ───────────────────────────────────────────────────────────────────────────────
 
- 8.1  Debug console.log calls still in the code, printing to the browser
-      console in production:
+ 7B.1  MOST REPS WILL OPEN AN EMPTY CUSTOMERS SCREEN
 
-        vizo-erp/src/app/(app)/sales/orders/[id]/page.tsx : ~229  console.log(opened)
-        vizo-erp/src/app/login/page.tsx                   : ~114  console.log("Login error", err)
-        .../super-admin/super-admin-dashboard.tsx         : ~119  console.log("Dashboard load error:", e)
+       Of 25 parties: 7 are assigned to Sara Khan, 5 to Bilal Ahmed, 4 to
+       Hassan Raza, and 9 to nobody at all. Zara Malik, Imran Iqbal and
+       Muhammad Ammar Kamran are assigned none.
 
-      Harmless, but not mine to delete.
+       Their Customers screen is therefore empty, and it is telling the truth —
+       they have not opened an account and none has been given to them. It will
+       fill up as they open accounts, because the creator is recorded from now
+       on.
 
- 8.2  vizo-erp/src/components/layout/top-bar.tsx has an unused ago() helper.
-      It lints as a warning and was already unused before I touched the file.
+       If those nine unassigned accounts belong to somebody, set the Sales Rep
+       field on each and they will appear for that person immediately. Nothing
+       is lost meanwhile: the back office still sees all 25, and the customer
+       picker on the order form still offers every one of them to every rep.
 
- 8.3  The old statuses PROCESSING (90) and PACKED (91) are still in
-      "OrderStatus". Nothing in the new chain uses them and old orders still
-      point at them, so removing them would break history. They appear in no
+       BILAL AHMED IS ON THE ORDER DESK, not in sales, and five customers are
+       assigned to him. Harmless — the scoping only narrows the Sales role —
+       but it is probably not what anybody meant.
+
+ 7B.2  AHMED RIAZ IS AN ORDER-DESK CLERK POINTED AT A WAREHOUSE
+
+       His primary location is LOC-01, which is now "Karachi Warehouse". An
+       order-desk account should point at a department.
+
+       Nothing is broken today: the only screen that reads a person's place is
+       the warehouse queue, and that is gated on orders.warehouse, which he
+       does not hold. But he is the one existing account the new rule would
+       refuse, and the moment anything else starts reading that field he will
+       be looking at the wrong list.
+
+       Open him at /admin/users and pick "Karachi Order Department". The form
+       will now only offer departments, so it is two clicks.
+
+       He is NOT changed by migration 18 — that only fills in a primary
+       location where there was none, and his is set. Changing an existing
+       person's place is a decision about who works where.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ 8.  THINGS I FOUND AND DID NOT CHANGE
+───────────────────────────────────────────────────────────────────────────────
+
+ 8.1  THE VAPID KEYS IN .env.example DO NOT MATCH THE SERVER
+
+      Still true, still one line, still not mine to change. See changa.txt §4.
+
+ 8.2  THE WAREHOUSE LOGIN PANEL
+
+      src/app/login/page.tsx lists four panels and no warehouse one. The panels
+      only fill in an e-mail address — typing it by hand signs the keeper in
+      just the same — and you asked me not to touch that code. Four lines in
+      the PANELS array whenever you want it.
+
+ 8.3  DEBUG console.log CALLS STILL IN THE CODE
+
+        vizo-erp/src/app/login/page.tsx                   ~114
+        .../super-admin/super-admin-dashboard.tsx         ~119
+
+      The one at sales/orders/[id]/page.tsx is gone, because that function was
+      rewritten. These two were not touched.
+
+ 8.4  DOCUMENT NUMBERING IS STILL NOT ATOMIC
+
+      NextNumber reads and increments in two statements. Two documents created
+      in the same instant can take the same number. The proper fix is one
+      PostgreSQL sequence per series — a schema change, written up in
+      db_code_changes.txt §3.1 rather than faked.
+
+ 8.5  THE OLD STATUSES PROCESSING (90) AND PACKED (91)
+
+      Still in "OrderStatus". Nothing in the chain uses them, old orders still
+      point at them, and removing them would break history. They appear in no
       dropdown.
-
- 8.4  DATA TOUCHED WHILE TESTING, AND PUT BACK:
-
-        ORD-26-0157 (id 31)  Invoiced -> Seen by Warehouse -> On way to Order
-                             Dept -> back to Invoiced, twice, to prove each
-                             step notifies the right people
-        ORD-26-0086 (id 11)  Draft -> Submitted -> Draft (earlier session)
-        ORD-26-0159 (id 33)  saved through the edit endpoint with its own
-                             unchanged values, to prove INV-26-8880 rebuilds
-        Two products         TEST-NOTIF-01 and TEST-WH-01, created to prove the
-                             "added by <name>" notification, then deleted
-        Three parties        Two "Shenzhen Huaqiang Electronics Co., Ltd" and
-                             one "Guangzhou Baiyun Trading Co., Ltd", to prove
-                             a Chinese supplier goes in through the form, shows
-                             the right labels on the profile, and edits without
-                             losing anything. All deleted; make a real one when
-                             you have a real supplier.
-
-        One real party       Star Communications (VZ-C-0010) was saved through
-                             the new edit form with NO changes, to prove the
-                             opening balance, rating, limits and rep survive a
-                             round trip. They did, byte for byte. It appears in
-                             the activity log as an edit.
-
-      Every status change is in the activity log with a reason. No figures
-      changed and no products remain.
 
 
 ───────────────────────────────────────────────────────────────────────────────
@@ -417,55 +483,31 @@
 
  BACKEND
 
-   Services/OrderWorkflow.cs          the ten steps and who may move each one
-   Services/BusinessClock.cs          Pakistan time, in one place
-   Services/PermissionPolicy.cs       "perm:xxx" authorisation
-   Services/ConfirmReminderService.cs the six-hourly nudge
-   Services/NotificationHub.cs        SignalR, for the live bell
-   Services/NotificationKinds.cs      the catalogue, now with Catalogue and
-                                      Customers groups
-   Models/OrderChangeRequest.cs       a rep's application to edit or delete
-
-   SalesController                    PUT/DELETE /orders/{id}
-                                      GET /orders/{id}/workflow
-                                      GET /orders/{id}/my-permissions
-                                      POST /orders/{id}/change-request
-                                      GET/POST /order-change-requests…
-                                      GET /warehouse/queue
+   Services/AppLinks.cs               the website address, in one place
+   Documents/DocumentLinks.cs         the signed document link, in one place
+   Models/SalesInvoice.Custom.cs      PdfDeliverable
+   Models/Party.Custom.cs             CreatedByUserId
+   Documents/DocumentBuilder.cs       the "sales-return" credit note
+   SalesController                    EnsureBill, BillViewUrl, ReturnNoteUrl,
+                                      MyPlaceId; the invoice raised on the
+                                      Invoiced step
+   AdminUsersController               ValidatePlace — one warehouse, one desk
+   AdminDashboardController           the sales-returns figures
+   InventoryController                stock levels by city
 
  FRONTEND
 
-   components/sales/order-workflow.tsx            the chain strip and buttons
-   components/portals/super-admin/owner-decisions.tsx
-                                                  confirm queue + tick/cross
-   components/portals/warehouse/                  the keeper's queue
-   app/(app)/warehouse/page.tsx                   /warehouse
-   app/(app)/sales/orders/[id]/edit/page.tsx      the edit screen
-   app/(app)/parties/new/page.tsx                 the COPY table that holds
-                                                  everything differing between
-                                                  a Pakistani and a Chinese
-                                                  party
-   lib/use-live-notifications.ts                  the SignalR client
+   lib/app-url.ts                     absolute link → in-app path
+   lib/documents.ts   viewableUrl()   which of the two links to open
+   components/portals/super-admin/super-admin-dashboard.tsx
+                                      the red sales-returns column
+   app/(app)/inventory/stock-levels/  the city picker
+   app/(app)/admin/users/new/         "which warehouse"
+   app/(app)/sales/returns/           the return note, and the order it came off
 
+ DATABASE
 
-───────────────────────────────────────────────────────────────────────────────
- 10.  THE INVOICE
-───────────────────────────────────────────────────────────────────────────────
-
- In backend/vizo-backend/Documents/InvoicePdf.cs:
-
-   · a PACKING column between DESCRIPTION and QTY, showing Product.Packing and
-     a dash for anything sold loose
-   · SALESMAN: under the FROM block, naming whoever wrote the ORDER — not
-     whoever cut the invoice, because the customer wants the rep
-   · the navy is #0B2545 rather than #031833, which on a laser printer came out
-     as a slab of toner; the table header is a clear step lighter than the
-     banner instead of almost the same dark; the two background tints now
-     differ enough to be doing different jobs; the yellow is a thin accent rule
-     rather than a fill
-
- An invoice REBUILDS ITSELF when its order is edited — lines, totals, and the
- stored PDF thrown away so the next print is the new figures. The invoice
- number never changes.
+   database/18_sales_scope_returns_and_places.sql    RUN, 17 Sep — see 7A
+   database/changa.txt                               what is still yours to do
 
 ═══════════════════════════════════════════════════════════════════════════════

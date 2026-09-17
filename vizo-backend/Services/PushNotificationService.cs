@@ -121,6 +121,21 @@ public class PushNotificationService
 
             var title = Title(purpose);
 
+            /* WHO THIS WAS SENT TO, in the message itself. The same event goes
+               to four or five people at once and the wording never said which
+               copy you were holding -- so a keeper reading "Order invoiced"
+               could not tell whether it had been addressed to them, to the
+               order desk, or to the owner. Full name and the role in words,
+               because "zain" and "warehouse-keeper" are not what anybody calls
+               themselves out loud. */
+            body = await AddressedTo(userId, body);
+
+            /* A path becomes a real link. See Services/AppLinks.cs -- a bare
+               "/sales/orders/42" is meaningless to the service worker that
+               opens a push, and meaningless again the moment somebody forwards
+               the text to a colleague. */
+            url = AppLinks.Absolute(_cfg, url);
+
             if (bellOn)
             {
                 var row = new Notification
@@ -286,7 +301,11 @@ public class PushNotificationService
         {
             title,
             body,
-            url = url ?? "/dashboard",
+            /* Absolute by the time it gets here, but the fallback has to be
+               too -- sw.js opens this with clients.openWindow, and a bare path
+               there resolves against the service worker's scope rather than
+               against the site. */
+            url = url ?? AppLinks.Absolute(_cfg, "/dashboard"),
             icon = "/icon-192.png",
             badge = "/badge-96.png",
             severe
@@ -348,6 +367,47 @@ public class PushNotificationService
 
         /* An em dash, matching the wording used across the printed documents. */
         return $"VIZO — {what}";
+    }
+
+    /// <summary>
+    /// Puts "For &lt;Full Name&gt; (&lt;Role&gt;)." on the end of a body.
+    ///
+    /// Read from the database rather than from the JWT, because the person
+    /// being TOLD is not the person who acted -- the token belongs to whoever
+    /// pressed the button, and this line is about whoever is about to read it.
+    ///
+    /// The original wording is trimmed first when it would not otherwise fit:
+    /// the column is 300 characters, and losing the end of a sentence is a far
+    /// smaller failure than losing the whole row, which is what used to happen
+    /// when a long body overflowed. An unknown user id simply gets the body
+    /// back unchanged -- a notification with no addressee still beats no
+    /// notification.
+    /// </summary>
+    private async Task<string> AddressedTo(int userId, string body)
+    {
+        try
+        {
+            var who = await _db.Users.AsNoTracking()
+                .Where(u => u.UserId == userId)
+                .Select(u => new { u.FullName, role = u.Role.RoleName })
+                .FirstOrDefaultAsync();
+
+            if (who is null || string.IsNullOrWhiteSpace(who.FullName)) return body;
+
+            var line = $"For {who.FullName.Trim()} ({who.role}).";
+            var text = (body ?? "").Trim();
+
+            /* +1 for the space between the two. */
+            var room = 300 - line.Length - 1;
+            if (room <= 0) return line;
+
+            return text.Length == 0 ? line : $"{Truncate(text, room)} {line}";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not name the recipient of a notification to user {UserId}.", userId);
+            return body;
+        }
     }
 
     private static string Truncate(string s, int max) =>

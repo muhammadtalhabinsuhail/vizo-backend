@@ -157,7 +157,7 @@ A short record of what was built. Full reasoning, warnings and decisions are in
 - **Two reps have no customers assigned**, so they cannot raise an order until the owner
   assigns accounts. `changa.txt` §B1 — the most urgent item in this round.
 
-`api` (local, not pushed) · `web` (local, not pushed)
+`api 5ceecb1` · `web aa9ce49`
 
 ---
 

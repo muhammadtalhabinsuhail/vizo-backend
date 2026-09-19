@@ -45,7 +45,13 @@ public class InventoryController : ApiControllerBase
         try
         {
             if (page < 1) page = 1;
-            if (pageSize is < 1 or > 200) pageSize = 50;
+            /* Up to 5000 so ExportProducts, which calls this action for the
+               whole filtered list, actually gets the whole list. The limit used
+               to be 200 with an out-of-range fallback of 50 -- so the export
+               asked for 5000, was quietly given 50, and a catalogue of more than
+               fifty products exported as its first fifty. The screen itself
+               asks for a page of 24. */
+            if (pageSize is < 1 or > 5000) pageSize = 50;
 
             var rows = _db.Products.AsNoTracking().AsQueryable();
 
@@ -59,6 +65,21 @@ public class InventoryController : ApiControllerBase
                                        p.Sku.ToLower().Contains(term) ||
                                        p.ProductBarcodes.Any(b => b.Barcode.Contains(term)));
             }
+
+            /* Status is derived from stock, but it is filtered HERE, before the
+               page is cut -- filtering the page afterwards (as this used to)
+               returned "low stock, page 1" as whatever few of the first fifty
+               happened to be low. */
+            rows = (status ?? "").ToLowerInvariant() switch
+            {
+                "inactive" => rows.Where(p => !p.IsActive),
+                "out" => rows.Where(p => p.IsActive && (p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0) <= 0),
+                "low" => rows.Where(p => p.IsActive
+                                         && (p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0) > 0
+                                         && (p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0) <= p.MinQty),
+                "active" => rows.Where(p => p.IsActive && (p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0) > p.MinQty),
+                _ => rows
+            };
 
             var total = await rows.CountAsync();
 
@@ -78,8 +99,9 @@ public class InventoryController : ApiControllerBase
                     packing = p.Packing,
                     minQty = p.MinQty,
                     maxQty = p.MaxQty,
-                    openingCost = p.OpeningCost,
                     costPrice = p.CostPrice,
+                    dutyPrice = p.DutyPrice,
+                    marginPrice = p.MarginPrice,
                     salePrice = p.SalePrice,
                     taxRatePercent = p.TaxRatePercent,
                     hideStock = p.HideStock,
@@ -97,7 +119,8 @@ public class InventoryController : ApiControllerBase
                 p.id, p.sku, p.name, p.description,
                 p.categoryId, p.categoryName, p.brandId, p.brandName,
                 p.packing, p.minQty, p.maxQty,
-                p.openingCost, p.costPrice, p.salePrice, p.taxRatePercent,
+                p.costPrice, p.dutyPrice, p.marginPrice, p.salePrice, p.taxRatePercent,
+                marginPercent = MarginPercent(p.costPrice, p.dutyPrice, p.marginPrice),
                 p.hideStock, p.isActive, p.imageUrl, p.createdAt,
                 p.totalStock, p.barcodes,
                 status = !p.isActive ? "inactive"
@@ -105,10 +128,30 @@ public class InventoryController : ApiControllerBase
                        : p.totalStock <= p.minQty ? "low" : "active"
             }).ToList();
 
-            if (!string.IsNullOrWhiteSpace(status))
-                shaped = shaped.Where(p => p.status == status).ToList();
+            /* The figures over the WHOLE catalogue, not the page on screen.
+               The product screen pages on the server now (AGENTS.md rule 3),
+               and a "Low stock: 2" that only counted page one would be a
+               number that changes when you press Next. One small query, the
+               same status rule as the rows above. */
+            var all = await _db.Products.AsNoTracking()
+                .Select(p => new
+                {
+                    p.IsActive, p.MinQty, landed = p.CostPrice + p.DutyPrice,
+                    stock = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
+                })
+                .ToListAsync();
 
-            return Ok(new { total, page, pageSize, items = shaped });
+            var stats = new
+            {
+                total = all.Count,
+                active = all.Count(p => p.IsActive && p.stock > p.MinQty),
+                low = all.Count(p => p.IsActive && p.stock > 0 && p.stock <= p.MinQty),
+                @out = all.Count(p => p.IsActive && p.stock <= 0),
+                inactive = all.Count(p => !p.IsActive),
+                stockValue = all.Sum(p => Math.Max(0, p.stock) * p.landed)
+            };
+
+            return Ok(new { total, page, pageSize, stats, items = shaped });
         }
         catch (Exception ex)
         {
@@ -136,8 +179,9 @@ public class InventoryController : ApiControllerBase
                     packing = x.Packing,
                     minQty = x.MinQty,
                     maxQty = x.MaxQty,
-                    openingCost = x.OpeningCost,
                     costPrice = x.CostPrice,
+                    dutyPrice = x.DutyPrice,
+                    marginPrice = x.MarginPrice,
                     salePrice = x.SalePrice,
                     taxRatePercent = x.TaxRatePercent,
                     hideStock = x.HideStock,
@@ -163,7 +207,8 @@ public class InventoryController : ApiControllerBase
                 p.id, p.sku, p.name, p.description,
                 p.categoryId, p.categoryName, p.brandId, p.brandName,
                 p.packing, p.minQty, p.maxQty,
-                p.openingCost, p.costPrice, p.salePrice, p.taxRatePercent,
+                p.costPrice, p.dutyPrice, p.marginPrice, p.salePrice, p.taxRatePercent,
+                marginPercent = MarginPercent(p.costPrice, p.dutyPrice, p.marginPrice),
                 p.hideStock, p.isActive, p.imageUrl, p.createdAt,
                 p.barcodes, p.totalStock, p.stockSpread,
                 status = !p.isActive ? "inactive"
@@ -187,18 +232,32 @@ public class InventoryController : ApiControllerBase
 
             await using var tx = await _db.Database.BeginTransactionAsync();
 
+            /* THE SKU IS DECIDED HERE, not in the browser.
+
+               The form shows a preview, but between typing and saving somebody
+               else may have saved the same product and taken the serial -- only
+               the server can see the table. So the SKU is worked out again
+               inside the transaction, and the preview is only ever a guess.
+
+               The one exception is a SKU that came off a scanned BARCODE and
+               is already one of ours (VZ-...). That is not a guess: it is
+               printed on the box, and the product has to carry the code the
+               box says. It is still checked for uniqueness in ValidateProduct. */
+            var sku = await ResolveSku(body);
+
             var product = new Product
             {
-                Sku = body.Sku.Trim().ToUpperInvariant(),
-                ProductName = body.Name.Trim(),
+                Sku = sku,
+                ProductName = CleanName(body.Name),
                 Description = body.Description,
                 CategoryId = body.CategoryId,
                 BrandId = body.BrandId,
                 Packing = body.Packing,
                 MinQty = body.MinQty,
                 MaxQty = body.MaxQty,
-                OpeningCost = body.OpeningCost,
                 CostPrice = body.CostPrice,
+                DutyPrice = body.DutyPrice,
+                MarginPrice = body.SalePrice - body.CostPrice - body.DutyPrice,
                 SalePrice = body.SalePrice,
                 TaxRatePercent = body.TaxRatePercent,
                 HideStock = body.HideStock,
@@ -235,7 +294,12 @@ public class InventoryController : ApiControllerBase
                 url: $"/inventory/products/{product.ProductId}",
                 exceptUserId: CurrentUserId());
 
-            return Ok(new { id = product.ProductId, message = $"{product.ProductName} added." });
+            return Ok(new
+            {
+                id = product.ProductId,
+                sku = product.Sku,
+                message = $"{product.ProductName} added as {product.Sku}."
+            });
         }
         catch (Exception ex)
         {
@@ -256,16 +320,22 @@ public class InventoryController : ApiControllerBase
             var error = await ValidateProduct(body, id);
             if (error is not null) return BadRequest(new { message = error });
 
-            product.Sku = body.Sku.Trim().ToUpperInvariant();
-            product.ProductName = body.Name.Trim();
+            /* Editing keeps the SKU unless one is sent. It is printed on
+               labels and invoices already, so changing a product's name does
+               NOT re-derive it -- a SKU that shifted every time somebody fixed
+               a typo would be no use as an identifier. */
+            if (!string.IsNullOrWhiteSpace(body.Sku))
+                product.Sku = body.Sku.Trim().ToUpperInvariant();
+            product.ProductName = CleanName(body.Name);
             product.Description = body.Description;
             product.CategoryId = body.CategoryId;
             product.BrandId = body.BrandId;
             product.Packing = body.Packing;
             product.MinQty = body.MinQty;
             product.MaxQty = body.MaxQty;
-            product.OpeningCost = body.OpeningCost;
             product.CostPrice = body.CostPrice;
+            product.DutyPrice = body.DutyPrice;
+            product.MarginPrice = body.SalePrice - body.CostPrice - body.DutyPrice;
             product.SalePrice = body.SalePrice;
             product.TaxRatePercent = body.TaxRatePercent;
             product.HideStock = body.HideStock;
@@ -298,6 +368,174 @@ public class InventoryController : ApiControllerBase
         {
             return Fail(ex, $"save product {id}");
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  SKU, NAME AND BARCODE CHECKS  --  what the new-product form asks
+    //  while the person is still typing
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// What the SKU will be, and whether this exact product is already in the
+    /// catalogue -- asked on every pause in typing, so the answer is on screen
+    /// before Save is pressed rather than as an error after it.
+    ///
+    /// A PREVIEW. The real SKU is worked out again when the product is saved,
+    /// inside the same transaction as the insert; see ResolveSku.
+    /// </summary>
+    [HttpPost("products/sku-preview")]
+    public async Task<IActionResult> SkuPreview([FromBody] SkuPreviewRequest body)
+    {
+        try
+        {
+            var categoryName = body.CategoryId is null ? null
+                : await _db.Categories.AsNoTracking().Where(c => c.CategoryId == body.CategoryId)
+                    .Select(c => c.CategoryName).FirstOrDefaultAsync();
+            var brandName = body.BrandId is null ? null
+                : await _db.Brands.AsNoTracking().Where(b => b.BrandId == body.BrandId)
+                    .Select(b => b.BrandName).FirstOrDefaultAsync();
+
+            var fromBarcode = SkuFromBarcodes(body.Barcodes);
+            var parts = SkuGenerator.Parse(body.Name, categoryName, brandName);
+
+            string? sku = null;
+            if (fromBarcode is not null) sku = fromBarcode;
+            else if (!string.IsNullOrWhiteSpace(body.Name) && categoryName is not null)
+                sku = await NextSkuFor(parts.Stem);
+
+            /* The duplicate check, same rule the save uses: exactly the same
+               name, ignoring case and extra spaces. */
+            object? duplicate = null;
+            if (!string.IsNullOrWhiteSpace(body.Name))
+            {
+                var normal = SkuGenerator.NormalName(body.Name);
+                var names = await _db.Products.AsNoTracking()
+                    .Select(p => new { p.ProductId, p.ProductName, p.Sku })
+                    .ToListAsync();
+                var twin = names.FirstOrDefault(p => SkuGenerator.NormalName(p.ProductName) == normal);
+                if (twin is not null)
+                    duplicate = new { id = twin.ProductId, name = twin.ProductName, sku = twin.Sku };
+            }
+
+            bool? barcodeSkuTaken = fromBarcode is null ? null
+                : await _db.Products.AnyAsync(p => p.Sku.ToUpper() == fromBarcode);
+
+            return Ok(new
+            {
+                sku,
+                source = fromBarcode is not null ? "barcode" : sku is null ? "incomplete" : "generated",
+                barcodeSkuTaken,
+                parts = new { word = parts.Word, model = parts.Model, category = parts.Category, color = parts.Color },
+                duplicate
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "work out the SKU");
+        }
+    }
+
+    /// <summary>
+    /// Who already owns a barcode, answered the moment it is scanned -- so the
+    /// camera does not add a code to the form only for Save to refuse it later.
+    /// Also says whether the code is one of OUR SKUs printed as a barcode.
+    /// </summary>
+    [HttpGet("barcodes/lookup")]
+    public async Task<IActionResult> LookupBarcode([FromQuery] string code, [FromQuery] int? excludeProductId)
+    {
+        try
+        {
+            var c = (code ?? "").Trim();
+            if (c.Length == 0) return BadRequest(new { message = "No barcode to look up." });
+
+            var owner = await _db.ProductBarcodes.AsNoTracking()
+                .Where(b => b.Barcode == c && (excludeProductId == null || b.ProductId != excludeProductId))
+                .Select(b => new { id = b.ProductId, name = b.Product.ProductName, sku = b.Product.Sku })
+                .FirstOrDefaultAsync();
+
+            var sku = SkuFromBarcodes(new List<string> { c });
+
+            return Ok(new { code = c, taken = owner is not null, owner, sku });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "look up the barcode");
+        }
+    }
+
+    /// <summary>
+    /// The SKU a new product is saved under.
+    ///
+    ///   1. A barcode that CARRIES one of our SKUs wins. It is printed on the
+    ///      box, so the product has to have the code the box says -- the brief
+    ///      is explicit that a SKU found in a barcode replaces whatever was
+    ///      generated.
+    ///   2. Otherwise it is generated from the name and category, with the next
+    ///      free serial for that stem.
+    ///
+    /// The serial is allocated under a transaction-scoped advisory lock, so two
+    /// people saving the same product at the same moment get 01 and 02 rather
+    /// than one of them failing on the unique index. Adding a product is rare
+    /// enough that serialising it costs nothing anybody will notice.
+    /// </summary>
+    private async Task<string> ResolveSku(ProductRequest body)
+    {
+        var fromBarcode = SkuFromBarcodes(body.Barcodes)
+            ?? (SkuGenerator.LooksLikeSku(body.Sku) && (body.Barcodes ?? new()).Any(b =>
+                    b.Contains(body.Sku!.Trim(), StringComparison.OrdinalIgnoreCase))
+                ? body.Sku!.Trim().ToUpperInvariant() : null);
+        if (fromBarcode is not null) return fromBarcode;
+
+        var categoryName = await _db.Categories.AsNoTracking()
+            .Where(c => c.CategoryId == body.CategoryId).Select(c => c.CategoryName).FirstAsync();
+        var brandName = await _db.Brands.AsNoTracking()
+            .Where(b => b.BrandId == body.BrandId).Select(b => b.BrandName).FirstOrDefaultAsync();
+
+        await _db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_xact_lock(4242001)");
+
+        return await NextSkuFor(SkuGenerator.Parse(body.Name, categoryName, brandName).Stem);
+    }
+
+    private async Task<string> NextSkuFor(string stem)
+    {
+        var upper = stem.ToUpperInvariant();
+        var existing = await _db.Products.AsNoTracking()
+            .Where(p => p.Sku.ToUpper().StartsWith(upper))
+            .Select(p => p.Sku)
+            .ToListAsync();
+        return SkuGenerator.Next(upper, existing);
+    }
+
+    /// <summary>
+    /// The first of our own SKUs found inside any of the barcodes -- whole, or
+    /// embedded in a longer payload such as a QR code that carries "SKU:" and
+    /// a URL around it.
+    /// </summary>
+    private static string? SkuFromBarcodes(IEnumerable<string>? codes)
+    {
+        foreach (var raw in codes ?? Enumerable.Empty<string>())
+        {
+            if (string.IsNullOrWhiteSpace(raw)) continue;
+            var m = System.Text.RegularExpressions.Regex.Match(raw.ToUpperInvariant(),
+                @"(?<![A-Z0-9])VZ(-[A-Z0-9]{1,8}){2,6}(?![A-Z0-9-])");
+            if (m.Success) return m.Value;
+        }
+        return null;
+    }
+
+    /// <summary>A name as stored: trimmed, runs of spaces collapsed.</summary>
+    private static string CleanName(string name) =>
+        System.Text.RegularExpressions.Regex.Replace(name.Trim(), @"\s+", " ");
+
+    /// <summary>
+    /// Margin as a percentage of LANDED cost (cost + duty) -- the base the
+    /// pricing form works on, so the figure on the list and the figure the
+    /// person typed are the same number.
+    /// </summary>
+    private static decimal MarginPercent(decimal cost, decimal duty, decimal margin)
+    {
+        var landed = cost + duty;
+        return landed > 0 ? Math.Round(margin / landed * 100m, 2) : 0m;
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -936,6 +1174,16 @@ public class InventoryController : ApiControllerBase
                     .Where(b => b.IsActive).OrderBy(b => b.BrandName)
                     .Select(b => new { id = b.BrandId, code = b.BrandCode, name = b.BrandName })
                     .ToListAsync(),
+
+                /* Everything this company sells is VIZO, so the new-product
+                   form starts there. Looked up by NAME, not id -- nothing in
+                   the code should know a row's id -- and null if somebody has
+                   renamed or deactivated it, in which case the form simply
+                   starts empty. */
+                defaultBrandId = await _db.Brands.AsNoTracking()
+                    .Where(b => b.IsActive && b.BrandName.ToUpper() == "VIZO")
+                    .Select(b => (int?)b.BrandId)
+                    .FirstOrDefaultAsync(),
                 locations = await _db.Locations.AsNoTracking()
                     .Where(l => l.IsActive).OrderBy(l => l.LocationName)
                     .Select(l => new
@@ -1016,19 +1264,55 @@ public class InventoryController : ApiControllerBase
     private async Task<string?> ValidateProduct(ProductRequest b, int? existingId)
     {
         if (string.IsNullOrWhiteSpace(b.Name)) return "Product name is required.";
-        if (string.IsNullOrWhiteSpace(b.Sku)) return "SKU is required.";
         if (b.Packing < 1) return "Packing must be at least 1.";
         if (b.MinQty < 0) return "Minimum quantity cannot be negative.";
         if (b.MaxQty < 0) return "Maximum quantity cannot be negative.";
         if (b.MaxQty > 0 && b.MaxQty < b.MinQty)
             return "Maximum quantity cannot be below the minimum.";
-        if (b.CostPrice < 0 || b.SalePrice < 0) return "Prices cannot be negative.";
+        if (b.CostPrice < 0 || b.SalePrice < 0 || b.DutyPrice < 0) return "Prices cannot be negative.";
         if (b.TaxRatePercent is < 0 or > 100) return "Tax rate must be between 0 and 100.";
 
-        var sku = b.Sku.Trim().ToUpperInvariant();
-        if (await _db.Products.AnyAsync(p => p.Sku.ToUpper() == sku &&
-                                             (existingId == null || p.ProductId != existingId)))
-            return $"SKU {sku} is already in use.";
+        /* THE SAME PRODUCT TWICE IS REFUSED -- exactly the same name.
+
+           "Exactly" means what a person reading the shelf label would mean:
+           spaces and case do not count, so "VIZO  Titan T9" and "vizo titan
+           t9" are the same thing. Anything that actually differs -- a colour,
+           a model, a pack size -- is a different product and goes in with a
+           SKU of its own, which is what was asked for.
+
+           Checked here and not only in the form, because the form is not the
+           only way in and two people can press Save at the same moment. */
+        var normal = SkuGenerator.NormalName(b.Name);
+        var names = await _db.Products.AsNoTracking()
+            .Where(p => existingId == null || p.ProductId != existingId)
+            .Select(p => new { p.ProductId, p.ProductName, p.Sku })
+            .ToListAsync();
+        var twin = names.FirstOrDefault(p => SkuGenerator.NormalName(p.ProductName) == normal);
+        if (twin is not null)
+            return $"\"{twin.ProductName}\" is already in the catalogue as {twin.Sku}. " +
+                   "Change the name -- a different colour or model -- to add it as a separate product.";
+
+        if (!string.IsNullOrWhiteSpace(b.Sku))
+        {
+            var sku = b.Sku.Trim().ToUpperInvariant();
+            if (await _db.Products.AnyAsync(p => p.Sku.ToUpper() == sku &&
+                                                 (existingId == null || p.ProductId != existingId)))
+                return $"SKU {sku} is already in use.";
+        }
+
+        /* A barcode belongs to one product. The column is UNIQUE, so without
+           this the save would fail on a constraint name inside a stack trace. */
+        var codes = (b.Barcodes ?? new List<string>())
+            .Where(c => !string.IsNullOrWhiteSpace(c)).Select(c => c.Trim()).Distinct().ToList();
+        if (codes.Count > 0)
+        {
+            var taken = await _db.ProductBarcodes.AsNoTracking()
+                .Where(x => codes.Contains(x.Barcode) && (existingId == null || x.ProductId != existingId))
+                .Select(x => new { x.Barcode, x.Product.ProductName })
+                .FirstOrDefaultAsync();
+            if (taken is not null)
+                return $"Barcode {taken.Barcode} already belongs to {taken.ProductName}.";
+        }
 
         if (!await _db.Categories.AnyAsync(c => c.CategoryId == b.CategoryId))
             return "Pick a valid category.";
@@ -1040,11 +1324,19 @@ public class InventoryController : ApiControllerBase
 
     // ══════════════════════════ request bodies ══════════════════════════
 
+    /* Sku is OPTIONAL now. Leave it empty and the server generates one; send
+       one only when it came off a scanned barcode (see ResolveSku), or on an
+       edit to keep the one the product already has.
+
+       MarginPrice is not accepted: it is SalePrice - CostPrice - DutyPrice,
+       worked out here, so the three numbers on the row can never disagree. */
     public record ProductRequest(
-        string Sku, string Name, string? Description, int CategoryId, int BrandId,
+        string? Sku, string Name, string? Description, int CategoryId, int BrandId,
         int Packing, int MinQty, int MaxQty,
-        decimal OpeningCost, decimal CostPrice, decimal SalePrice, decimal TaxRatePercent,
+        decimal CostPrice, decimal DutyPrice, decimal SalePrice, decimal TaxRatePercent,
         bool HideStock, bool IsActive, string? ImageUrl, List<string>? Barcodes);
+
+    public record SkuPreviewRequest(string? Name, int? CategoryId, int? BrandId, List<string>? Barcodes);
 
     public record CategoryRequest(string Name, int? ParentId, bool IsActive);
 
@@ -1450,6 +1742,9 @@ public class InventoryController : ApiControllerBase
                 new XlsxWriter.Column("Brand", "brandName", XlsxWriter.CellKind.Text, 18),
                 new XlsxWriter.Column("Pack", "packing", XlsxWriter.CellKind.Integer, 8),
                 new XlsxWriter.Column("Cost", "costPrice", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Duty", "dutyPrice", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Margin", "marginPrice", XlsxWriter.CellKind.Money),
+                new XlsxWriter.Column("Margin %", "marginPercent", XlsxWriter.CellKind.Percent, 10),
                 new XlsxWriter.Column("Sale Price", "salePrice", XlsxWriter.CellKind.Money),
                 new XlsxWriter.Column("Tax %", "taxRatePercent", XlsxWriter.CellKind.Number, 10),
                 new XlsxWriter.Column("On Hand", "totalStock", XlsxWriter.CellKind.Integer, 12),

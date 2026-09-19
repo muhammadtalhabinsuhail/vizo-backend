@@ -1,4 +1,4 @@
-# Session Summary — 31 Aug to 17 Sep 2026
+# Session Summary — 31 Aug to 20 Sep 2026
 
 A short record of what was built. Full reasoning, warnings and decisions are in
 `convey.txt`; everything still to be done by hand is in `changa.txt`.
@@ -93,6 +93,39 @@ A short record of what was built. Full reasoning, warnings and decisions are in
 
 ---
 
+## 8. Products — 20 Sep
+
+- **SKU made, not typed:** `VZ-WORD-MODEL-CAT-COLOUR-NN`, e.g. *VIZO Titan T9 Wireless
+  Earbuds - Black* in Earbuds → `VZ-TIT-T9-EAR-BLK-01`. Worked out on the server inside the
+  insert's transaction, under a lock; the form shows a live preview. A barcode carrying one
+  of our SKUs wins. Existing SKUs untouched. Rules in `Services/SkuGenerator.cs`.
+- **The same product twice is refused** — same name ignoring case and spaces, on the form
+  and on the server. A different colour or model goes in with its own SKU.
+- **Brand defaults to VIZO** (looked up by name), still changeable.
+- **Pricing:** Cost · Duty · Margin price · Margin % · Sale. Margin % is on cost + duty.
+  New columns `DutyPrice`, `MarginPrice`. **Opening cost removed** everywhere; the column
+  drop waits for the deploy (changa.txt §A1).
+- **Barcode camera:** native reader first, `@zxing` fallback loaded on demand; 3-minute
+  limit, clear messages for no camera / refused / busy / not https. Not tested with a real
+  camera — the test browser has none.
+- **/inventory/products as cards** with big images; status filter and counts fixed to cover
+  the whole catalogue.
+- **Movements as cards** (one per transfer), each opening its own page with both legs and
+  **See complete transfer**.
+- **History page** — timeline, stock ledger (opening + in − out = on hand), Excel export
+  with seven tabs. Built for phones.
+- **No dates before today** on the 19 forms where a date is entered; list/report filters
+  left alone on purpose. Edit screens keep the record's own date.
+- **Times on screen were five hours late** since 3 Sep (API writes Pakistan time, screens
+  read UTC). Fixed in `lib/format.ts`.
+
+### Found and not changed
+- **Orders never take stock off the shelf** — 26 of 31 order invoices have no stock
+  movement. Needs a decision on which step moves the stock. `convey.txt` §P0.
+- **Seven exports silently stop at 50 rows** (orders is at 46). Fixed for products only.
+
+---
+
 ## Database migrations — all run on live Neon
 | File | Adds |
 |---|---|
@@ -100,6 +133,7 @@ A short record of what was built. Full reasoning, warnings and decisions are in
 | `16_warehouse_and_notification_links.sql` | *Seen by Warehouse*, notification links |
 | `17_party_country.sql` | `Province.Country` (PK / CN) |
 | `18_sales_scope_returns_and_places.sql` | Sales permissions, `PdfDeliverable`, `Party.CreatedByUserId`, the Lahore pair |
+| `19_product_pricing.sql` | `DutyPrice`, `MarginPrice` (run). Section 2 drops `OpeningCost` — **not run yet**, after deploy |
 
 Run these on any other environment (local copy, staging).
 

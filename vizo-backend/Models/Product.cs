@@ -23,8 +23,6 @@ public partial class Product
 
     public int MaxQty { get; set; }
 
-    public decimal OpeningCost { get; set; }
-
     public decimal CostPrice { get; set; }
 
     public decimal SalePrice { get; set; }

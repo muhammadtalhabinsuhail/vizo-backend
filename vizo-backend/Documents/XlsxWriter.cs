@@ -14,10 +14,15 @@ namespace vizo_backend.Documents;
 /// sheet of one table. An .xlsx is a zip of half a dozen small XML parts, and
 /// System.IO.Compression is in the framework. Same reasoning as PdfCanvas.
 ///
-/// Deliberately narrow: one sheet, one header row, typed cells, frozen header,
+/// Deliberately narrow: one header row per sheet, typed cells, frozen header,
 /// auto-filter, sensible column widths. No formulas, no charts, no merged
 /// cells. If any of those are ever wanted, that is the moment to reach for a
 /// library rather than to grow this file.
+///
+/// SEVERAL SHEETS are allowed (<see cref="FromSheets"/>), because a product's
+/// history is a summary, a timeline and a stock ledger, and three files for one
+/// question is worse than three tabs. That was a few lines in the workbook
+/// part, not a new object model -- the line above still stands.
 ///
 /// Strings are written INLINE rather than through a shared-strings table. That
 /// costs a few kilobytes on a big export and saves a whole part, a whole set of
@@ -33,6 +38,9 @@ public static class XlsxWriter
     public sealed record Column(string Header, string Field, CellKind Kind = CellKind.Text, double Width = 0);
 
     private sealed record Cell(string? Text, double? Number, CellKind Kind);
+
+    /// <summary>One tab of a multi-sheet workbook.</summary>
+    public sealed record SheetSpec(string Name, IReadOnlyList<Column> Columns, JsonElement Rows);
 
     /* Style indices, in the order they are written into styles.xml below. */
     private const int StyleDefault = 0;
@@ -64,7 +72,35 @@ public static class XlsxWriter
             }
         }
 
-        return Build(sheetName, columns, table);
+        return Build(new[] { (sheetName, columns, table) });
+    }
+
+    /// <summary>
+    /// Several sheets in one workbook, in the order given. Each is built the
+    /// same way FromJson builds its one.
+    /// </summary>
+    public static byte[] FromSheets(IReadOnlyList<SheetSpec> sheets)
+    {
+        var built = sheets.Select(sh => (sh.Name, sh.Columns, Table(sh.Rows, sh.Columns))).ToList();
+        return Build(built);
+    }
+
+    private static List<List<Cell>> Table(JsonElement rows, IReadOnlyList<Column> columns)
+    {
+        var table = new List<List<Cell>>();
+        if (rows.ValueKind != JsonValueKind.Array) return table;
+
+        foreach (var row in rows.EnumerateArray())
+        {
+            var cells = new List<Cell>(columns.Count);
+            foreach (var col in columns)
+            {
+                row.TryGetProperty(col.Field, out var v);
+                cells.Add(ToCell(v, col.Kind));
+            }
+            table.Add(cells);
+        }
+        return table;
     }
 
     /// <summary>
@@ -130,19 +166,32 @@ public static class XlsxWriter
 
     /* ─────────────────────────── the zip ─────────────────────────── */
 
-    private static byte[] Build(string sheetName, IReadOnlyList<Column> columns, List<List<Cell>> rows)
+    private static byte[] Build(
+        IReadOnlyList<(string Name, IReadOnlyList<Column> Columns, List<List<Cell>> Rows)> sheets)
     {
-        var safeSheet = SheetName(sheetName);
+        /* Excel refuses a workbook where two tabs share a name, so a clash is
+           numbered rather than trusted to the caller. */
+        var names = new List<string>();
+        foreach (var sh in sheets)
+        {
+            var n = SheetName(sh.Name);
+            var candidate = n;
+            for (var i = 2; names.Contains(candidate, StringComparer.OrdinalIgnoreCase); i++)
+                candidate = SheetName($"{n[..Math.Min(n.Length, 27)]} {i}");
+            names.Add(candidate);
+        }
+
         var buffer = new MemoryStream();
 
         using (var zip = new ZipArchive(buffer, ZipArchiveMode.Create, leaveOpen: true))
         {
-            Put(zip, "[Content_Types].xml", ContentTypes());
+            Put(zip, "[Content_Types].xml", ContentTypes(sheets.Count));
             Put(zip, "_rels/.rels", RootRels());
-            Put(zip, "xl/workbook.xml", Workbook(safeSheet));
-            Put(zip, "xl/_rels/workbook.xml.rels", WorkbookRels());
+            Put(zip, "xl/workbook.xml", Workbook(names));
+            Put(zip, "xl/_rels/workbook.xml.rels", WorkbookRels(sheets.Count));
             Put(zip, "xl/styles.xml", Styles());
-            Put(zip, "xl/worksheets/sheet1.xml", Sheet(columns, rows));
+            for (var i = 0; i < sheets.Count; i++)
+                Put(zip, $"xl/worksheets/sheet{i + 1}.xml", Sheet(sheets[i].Columns, sheets[i].Rows));
         }
 
         return buffer.ToArray();
@@ -158,13 +207,14 @@ public static class XlsxWriter
 
     private const string Decl = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>";
 
-    private static string ContentTypes() =>
+    private static string ContentTypes(int sheetCount) =>
         Decl +
         "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
         "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
         "<Default Extension=\"xml\" ContentType=\"application/xml\"/>" +
         "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>" +
-        "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>" +
+        string.Concat(Enumerable.Range(1, sheetCount).Select(i =>
+            $"<Override PartName=\"/xl/worksheets/sheet{i}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>")) +
         "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>" +
         "</Types>";
 
@@ -174,18 +224,24 @@ public static class XlsxWriter
         "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" +
         "</Relationships>";
 
-    private static string Workbook(string sheetName) =>
+    /* Sheet i is relationship rId{i}; the styles part takes the id after the
+       last sheet, so the two numbering schemes can never collide. */
+    private static string Workbook(IReadOnlyList<string> sheetNames) =>
         Decl +
         "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " +
         "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" +
-        $"<sheets><sheet name=\"{Esc(sheetName)}\" sheetId=\"1\" r:id=\"rId1\"/></sheets>" +
+        "<sheets>" +
+        string.Concat(sheetNames.Select((n, i) =>
+            $"<sheet name=\"{Esc(n)}\" sheetId=\"{i + 1}\" r:id=\"rId{i + 1}\"/>")) +
+        "</sheets>" +
         "</workbook>";
 
-    private static string WorkbookRels() =>
+    private static string WorkbookRels(int sheetCount) =>
         Decl +
         "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
-        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" +
-        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>" +
+        string.Concat(Enumerable.Range(1, sheetCount).Select(i =>
+            $"<Relationship Id=\"rId{i}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{i}.xml\"/>")) +
+        $"<Relationship Id=\"rId{sheetCount + 1}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>" +
         "</Relationships>";
 
     /// <summary>

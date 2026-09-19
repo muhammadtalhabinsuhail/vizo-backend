@@ -1240,7 +1240,6 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.IsActive).HasDefaultValue(true);
             entity.Property(e => e.MaxQty).HasDefaultValue(0);
             entity.Property(e => e.MinQty).HasDefaultValue(0);
-            entity.Property(e => e.OpeningCost).HasPrecision(14, 2);
             entity.Property(e => e.Packing).HasDefaultValue(1);
             entity.Property(e => e.ProductName).HasMaxLength(150);
             entity.Property(e => e.SalePrice).HasPrecision(14, 2);

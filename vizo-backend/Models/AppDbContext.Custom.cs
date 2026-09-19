@@ -79,6 +79,15 @@ public partial class AppDbContext
            declared here rather than in AppDbContext.cs -- same reason as
            everything else in this file: a re-scaffold must not lose them. */
 
+        modelBuilder.Entity<Product>(entity =>
+        {
+            /* Landed cost is derived, never stored. */
+            entity.Ignore(e => e.LandedCost);
+
+            entity.Property(e => e.DutyPrice).HasPrecision(14, 2).HasDefaultValue(0m);
+            entity.Property(e => e.MarginPrice).HasPrecision(14, 2).HasDefaultValue(0m);
+        });
+
         modelBuilder.Entity<SalesInvoice>(entity =>
         {
             entity.Property(e => e.PdfUrl).HasMaxLength(500);

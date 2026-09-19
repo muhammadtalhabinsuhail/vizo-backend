@@ -2,7 +2,61 @@
  CHANGA  —  what YOU have to change, by hand, outside the code
 ═══════════════════════════════════════════════════════════════════════════════
 
- Written 17 September 2026, with the sales-return / invoice-PDF / warehouse work.
+ Updated 20 September 2026 with the product work (section A, first).
+ Sections 1–4 are from 17 September and still stand.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ A.  PRODUCT WORK, 20 SEPTEMBER — three things
+───────────────────────────────────────────────────────────────────────────────
+
+ A1  DROP THE OPENING COST COLUMN — after the new API is deployed
+
+     You asked for the column to be dropped. Everything that USED it is gone
+     already; the column itself is left for you because of deploy order.
+
+     The API running today selects "OpeningCost" on every product query. If
+     the column disappears while that build is still live, every product
+     screen answers 500 until the new build replaces it. The new build never
+     reads it. So:
+
+        1. deploy the new API (the push of 20 September)
+        2. then run section 2 of
+               backend/database/19_product_pricing.sql
+           which is one line:
+               ALTER TABLE "Product" DROP COLUMN IF EXISTS "OpeningCost";
+
+     Section 1 of that file — the Duty and Margin columns, and every existing
+     product's margin filled in — is ALREADY RUN on Neon. Any other database
+     (a local copy, staging) needs the whole file.
+
+     Dropping a column cannot be undone. The values in it are all copies of
+     the cost price in any case, but take a backup first if in doubt.
+
+ A2  npm install IN THE FRONTEND
+
+     Two new packages, for the barcode camera on phones without a built-in
+     reader (Safari, iPhone, Firefox):
+
+         @zxing/browser   @zxing/library
+
+     They are in package.json; `npm install` in vizo-erp picks them up. The
+     build fails on the import without them. Vercel installs on its own.
+
+ A3  THE CAMERA ONLY WORKS ON HTTPS
+
+     Browsers refuse the camera on a plain http page. The live site is https
+     (Vercel), so nothing to do there — but on a phone pointed at a laptop on
+     the office network (http://192.168…) "Scan barcode" will say the camera is
+     blocked. That is the browser, not the app. Typing a barcode still works
+     everywhere.
+
+     NO ENVIRONMENT VARIABLES CHANGED in this round.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ 17 SEPTEMBER — still current
+═══════════════════════════════════════════════════════════════════════════════
 
  Nothing in this file is optional if you want that work to run. Everything in
  it is a setting, a migration or a click — there is no code left to write.

@@ -2,12 +2,348 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
- Last written 17 September 2026, after the sales-return, invoice-PDF, warehouse
- and notification work. Rewritten in full each time, so this is the current
- state of everything worth saying — not a log.
+ Last written 20 September 2026, after the product work — auto SKUs, duty and
+ margin pricing, barcode scanning, product cards, movements and history, and
+ the no-past-dates rule. Sections P0–P11 below are that work; sections 1–9
+ after them are the 17 September work and are all still current.
 
- WHAT MUST BE DONE BY HAND now lives in its own file: changa.txt, beside this
- one. Read that first and this second.
+ WHAT MUST BE DONE BY HAND lives in its own file: changa.txt, beside this one.
+ Read that first and this second.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART ONE — 20 SEPTEMBER: PRODUCTS
+═══════════════════════════════════════════════════════════════════════════════
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P0.  THE BIGGEST THING I FOUND, AND DID NOT CHANGE: ORDERS NEVER TAKE STOCK
+      OFF THE SHELF
+───────────────────────────────────────────────────────────────────────────────
+
+ Found while building the product history, because the history and the stock
+ ledger disagreed.
+
+ An order that goes through the ten-step chain — Confirmed, Invoiced, Seen by
+ Warehouse, On way, Received, Packaging, Dispatched, Delivered — never writes a
+ stock movement. Not at any step. The ONLY things that take stock out for a
+ sale are the old /packing screen and the counter sale.
+
+ COUNTED ON THE LIVE DATABASE: 31 invoices raised against orders, and 5 of
+ them have a SALE stock movement. The other 26 sold goods that are still
+ counted as sitting on a shelf.
+
+ Example: Redmi 14C shows 463 on hand. 100 of them were invoiced and delivered
+ to Arsalan Siddiqui on ORD-26-0171. The shelf count does not know.
+
+ So "Stock in Hand" is overstated by everything sold through the order chain
+ since 3 September, and the low-stock warnings fire late by the same amount.
+
+ NOT FIXED because it needs a decision only you can make: at WHICH step does
+ the stock leave? The candidates, and what each one means:
+
+   · Seen by Warehouse    the keeper has it in hand. Earliest, and stock is
+                          reserved the moment the warehouse accepts the order.
+   · On way to Order Dept the goods physically leave the warehouse shelf. This
+                          is really a TRANSFER (warehouse -> order desk), and
+                          the sale then happens from the order desk.
+   · Dispatched           the goods leave the building. What most distributors
+                          use, and what the old /packing screen did.
+
+ Whichever you pick, the 26 past orders also need their stock taken out once,
+ as a correction, or the shelves stay wrong. Tell me the step and I will do
+ both — the code is one method, the correction is one script.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P1.  THE SKU IS MADE, NOT TYPED
+───────────────────────────────────────────────────────────────────────────────
+
+     VZ - WORD - MODEL - CAT - COLOUR - NN
+
+     "VIZO Titan T9 Wireless Earbuds - Black"   in  Earbuds
+                                     ->  VZ-TIT-T9-EAR-BLK-01
+
+ Your example was "VZ-TIT-T9-EAR". Your own description of the format also
+ asked for the colour and a serial, so both are there: BLK, and 01. The serial
+ is what keeps it unique: two different products whose names reduce to the
+ same parts — "VIZO VOLT Car Charger 45W" and a "VIZO VOLT Wall Charger 45W",
+ say — are VZ-VOL-45W-CHA-01 and VZ-VOL-45W-CHA-02.
+
+ THE JUDGEMENT CALLS, all in backend Services/SkuGenerator.cs, one file, so
+ they can be argued with:
+
+   · The brand word is skipped (VZ already says it).
+   · Descriptions are never the WORD: Wireless, Bluetooth, Smart, Fast, Type…
+     "Wireless Earbuds T9" is a T9, and "WIR" tells nobody anything.
+   · The category's own words are never the WORD either, or every earbud would
+     be VZ-EAR-…
+   · MODEL is the first token with letters AND digits (T9, V65, X2, VPD45W).
+   · No model number? A rating stands in: 10000mAh -> 10K, 65W -> 65W. The
+     10,000 and 20,000 mAh power banks differ in nothing but that.
+   · COLOUR is what follows a dash ("… - Black"), or a colour word anywhere.
+     Two-word shades keep their first letter: Sky Blue -> SBLU, Rose Gold ->
+     RGLD, Cool White -> CWHT.
+
+ Run over all 38 names in the live catalogue before shipping. A few:
+
+     VIZO PowerX 10000mAh Power Bank - Black   VZ-POW-10K-POW-BLK-01
+     VIZO VOLT 65W GaN Type-C Charger (PD)     VZ-VOL-65W-CHA-01
+     VIZO Blaze Pro V65 Handfree               VZ-BLA-V65-HAN-01
+     VIZO LED Bulb 9W (Cool White)             VZ-LED-9W-LED-CWHT-01
+     VIZO G530 Samsung Battery                 VZ-SAM-G530-BAT-01
+
+ EXISTING PRODUCTS KEEP THEIR SKUs. They are printed on labels and invoices
+ already (05050781 and friends). Nothing was renumbered, and editing a product
+ does not re-derive its SKU — a code that shifted every time somebody fixed a
+ typo would be useless as a code.
+
+ WHERE IT IS DECIDED: on the server, inside the same transaction as the insert,
+ under a lock, so two people saving at the same moment get 01 and 02 rather
+ than a crash. The box on the form is a live PREVIEW.
+
+ A BARCODE THAT CARRIES ONE OF OUR SKUs WINS. Scan or type a code containing
+ VZ-…-… (whole, or inside a QR payload) and the SKU box switches to it, with a
+ "From barcode" tag. Remove the barcode and it goes back to the generated one.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P2.  THE SAME PRODUCT TWICE IS REFUSED
+───────────────────────────────────────────────────────────────────────────────
+
+ Exactly the same name — ignoring capital letters and extra spaces — is refused,
+ on the form as you type AND on the server. "vizo  titan t9 wireless earbuds -
+ black" is caught as a copy of the existing product and the message names its
+ SKU with a link to it. Change anything real — "- Red" instead of "- Black" —
+ and it goes in as a new product with its own SKU. Checked against live data.
+
+ A barcode that already belongs to another product is refused the same way,
+ with that product's name. The column was always UNIQUE; this used to surface
+ as a constraint name inside a 500.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P3.  PRICING: COST + DUTY + MARGIN = SALE
+───────────────────────────────────────────────────────────────────────────────
+
+ Five boxes, in the order a price is built: Cost, Duty, Margin price, Margin %,
+ Sale. Your worked example, checked in the browser:
+
+     cost 200, duty 50, margin 20 %      -> margin 50,  sale 300
+     then type margin price 75           -> 30 %,       sale 325
+     then change cost to 300             -> 75 stays,   21.43 %, sale 425
+     then type sale 499 directly         -> margin 149, 42.57 %
+
+ The PERCENTAGE IS ON COST + DUTY, never on the sale price — as you specified.
+ Whichever of the three you typed last is held still when cost or duty
+ changes. The sum is written out under the boxes so nobody has to trust them.
+
+ STORED: DutyPrice and MarginPrice, new columns (migration 19). The percentage
+ is NOT stored; it is margin ÷ (cost + duty), always derivable, and a
+ percentage kept beside the three prices is a second answer that can disagree.
+ SalePrice stays the one every invoice and report reads.
+
+ Existing products were given the margin their prices already imply
+ (sale − cost) with duty 0, so every row agrees from day one.
+
+ SELLING BELOW COST IS ALLOWED. The form turns red and says so; the database
+ does not refuse it, because clearance and loss-leaders are real.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P4.  OPENING COST IS GONE — EXCEPT THE COLUMN ITSELF, WHICH IS YOURS TO DROP
+───────────────────────────────────────────────────────────────────────────────
+
+ Removed from every screen, the API, the model and the old mock data. Checked
+ first: nothing in the ledger, invoices, purchases, reports or any database
+ view read it. It lived on three product screens and nowhere else.
+
+ THE COLUMN IS STILL IN THE DATABASE, on purpose, until the new API is
+ deployed. The old build selects it on every product query, so dropping it
+ while the old build is still running breaks the product screens until the
+ deploy lands. The new build never touches it. See changa.txt §A1 — one line.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P5.  BARCODES AND THE CAMERA
+───────────────────────────────────────────────────────────────────────────────
+
+ "Scan barcode" opens a small window with the camera. It reads EAN-13/8,
+ UPC-A/E, Code 128/39/93, ITF, Codabar and QR, and ends one of three ways:
+
+   · a code is read       it goes into the next empty box, editable
+   · three minutes pass   "Barcode was not found", window closes
+   · no camera            "Camera was not found on this device"
+
+ Also handled, because they happen: permission refused, camera in use by
+ another app, and a page that is not https (the browser does not allow the
+ camera at all on plain http — the message says that instead of "no camera").
+
+ Any number of barcodes per product; each is checked against the catalogue the
+ moment it is scanned or typed.
+
+ TWO DECODERS. Chrome, Edge and Android have a built-in barcode reader and it
+ is used first. Safari, iPhone and Firefox do not; there the @zxing library
+ does the job. That library loads only when the scan window opens — it never
+ touches a page that does not scan.
+
+ WHAT I COULD NOT TEST: an actual scan. My browser has no camera — it refused
+ the camera, and the "permission refused" path worked exactly as written. The
+ scanning itself needs a real phone. Please try one box before relying on it.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P6.  PRODUCTS AS CARDS
+───────────────────────────────────────────────────────────────────────────────
+
+ /inventory/products is now cards: a big picture, brand and category, name,
+ SKU, sale price, landed cost, margin %, stock, reorder level, pack size,
+ barcode count. The whole card opens the product. A table view is one click
+ away and the choice is remembered on that device.
+
+ Two faults fixed on the way, both in the list endpoint:
+
+   · The status filter ran AFTER the page was cut, so "Low stock" showed
+     whichever low items happened to be on page one. It filters first now.
+   · The counts at the top (Low 2, Out 5…) now cover the whole catalogue.
+     With paging, counting only the page on screen would change on "Next".
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P7.  MOVEMENTS, ONE MOVEMENT, AND "SEE COMPLETE TRANSFER"
+───────────────────────────────────────────────────────────────────────────────
+
+ The Movements tab is cards. A transfer is ONE card — from, to, how many,
+ when, received when — not two half-rows (out of here, into there) that have
+ to be found and read together.
+
+ Each card opens its own page: /inventory/products/{id}/movements/{movementId}
+ — who did it and their role, the time, the location and what was left there,
+ every fact on the document, BOTH legs of a transfer with their own times, the
+ other products on the same document, and "See complete transfer", which opens
+ the whole transfer. Receipts, invoices, returns and corrections get the same
+ page with their own "See complete …" button.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P8.  HISTORY
+───────────────────────────────────────────────────────────────────────────────
+
+ A History tab on the product (headline figures and the latest few events), and
+ its own page for the whole story: /inventory/products/{id}/history
+
+   Timeline      ordered from the supplier · received · billed by the supplier
+                 · customer ordered · confirmed · picked up by the warehouse ·
+                 on its way · received at the order desk · packed · dispatched
+                 · delivered · invoiced · returned · moved · corrected ·
+                 warranty claims · catalogue edits. Filter chips by kind.
+   Stock ledger  the accounting reading: opening + in − out = on hand, proved
+                 on screen, then line by line with the running total.
+   Export Excel  one workbook, seven tabs: Summary, Timeline, Stock ledger,
+                 Purchases, Sales, Journey & delivery, Transfers. All of it —
+                 not the page on screen.
+
+ Headline figures: on hand and its value, units received, sold, net sales,
+ cost of sales, gross profit and its %, returns both ways, transfers,
+ corrections, claims.
+
+ Cards on a phone, a table for the ledger on a desk. Checked at phone width.
+
+ NOTHING NEW IS STORED. Every line is read from the documents that already
+ exist, plus the activity log for the order's journey. A separate history
+ table would be a second record of the same facts.
+
+ The ledger's OPENING line is the stock that was on the shelves before
+ anything recorded it moving — the seed catalogue came in with balances and no
+ history. Opening + movements = on hand is the ledger's own equation, so it is
+ shown as a line of its own rather than folded silently into the first entry.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P9.  NO DATES BEFORE TODAY
+───────────────────────────────────────────────────────────────────────────────
+
+ Every date a person ENTERS on a document now starts at today: orders and
+ delivery dates, invoices and due dates, returns, purchase orders and expected
+ dates, goods receipts and expiry, supplier bills, purchase returns, transfers,
+ stock corrections, expenses, journal entries, vouchers, payments, collections,
+ and the dispatch "should reach by" date. 19 forms.
+
+ Checked twice over, because the calendar alone is not enough: the picker will
+ not offer an earlier day, AND a date typed in by hand is refused with "Dates
+ before today cannot be chosen". Tested both in the browser.
+
+ WHAT IT DELIBERATELY DOES NOT COVER — the From / To filters on lists and
+ reports. Those ask "show me what happened between these dates", and a report
+ that could not look backwards would be empty on every screen. If you did mean
+ those too, say so; it is one line each.
+
+ EDIT SCREENS keep the date the record already has. An expense entered on the
+ 10th can still be edited on the 20th without being forced to change its date;
+ it just cannot be moved to a different past date.
+
+ THREE THINGS YOU MIGHT WANT DIFFERENTLY:
+
+   · CHEQUE DATE is included. A cheque handed over today is often dated a few
+     days ago, and it now cannot be recorded with its real date.
+   · SUPPLIER BILL DATE is included. A supplier's bill typed in the day after
+     it arrived can no longer carry the day it arrived.
+   · THE API DOES NOT ENFORCE IT. The rule is on the screens. Anything posting
+     straight to the API can still date a document in the past. Enforcing it
+     server-side would also stop the owner correcting an old date, which is
+     why I did not do it without asking.
+
+ "TODAY" IS THE DEVICE'S OWN DATE, as asked. The date fields used to default
+ with a UTC date, which is yesterday between midnight and 5 am in Pakistan —
+ with the new rule, those forms would have refused their own default every
+ night. Fixed in the same change.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P10.  TIMES ON SCREEN WERE FIVE HOURS LATE — FIXED, WITH ONE SIDE EFFECT
+───────────────────────────────────────────────────────────────────────────────
+
+ Found while checking the timeline against the database.
+
+ Since 3 September the API has written every timestamp in Pakistan time
+ (BusinessClock). The screens went on reading them as UTC, so everything
+ recorded since then displayed five hours late, and anything done in the last
+ five hours showed as "just now". Proved on live data: the newest activity row
+ was stamped LATER than the current UTC time, which only a Pakistan clock can
+ do.
+
+ Now read as Pakistan time, everywhere: vizo-erp/src/lib/format.ts.
+
+ THE SIDE EFFECT: rows written BEFORE 3 September were UTC, and now display
+ five hours early. convey.txt §7 already said those rows were never converted.
+ Following the system's own clock is right going forward; old rows are old.
+
+ Dates are also printed the same on every device now. A browser set to US
+ time showed a transfer of the 17th as the 16th.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ P11.  SMALLER THINGS FOUND AND NOT CHANGED
+───────────────────────────────────────────────────────────────────────────────
+
+ P11.1  SEVEN EXPORTS SILENTLY STOP AT 50 ROWS — orders is about to
+
+        Each export calls its list action with "give me 5000", and the list
+        action caps that: over 200 (or 500) it quietly falls back to 50. So
+        the spreadsheet is the first 50 rows and says nothing.
+
+            Orders          46 today — next few orders and it starts losing
+            Journal entries 44
+            Invoices        39     Parties 26    Vouchers 17
+            Expenses        10     Walk-in sales
+
+        Fixed for PRODUCTS only, because I rebuilt that screen. The rest is the
+        same one-line change in each list action. Say the word.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART TWO — 17 SEPTEMBER: INVOICES, RETURNS, PLACES, NOTIFICATIONS
+═══════════════════════════════════════════════════════════════════════════════
 
 
 ───────────────────────────────────────────────────────────────────────────────
@@ -508,6 +844,23 @@
  DATABASE
 
    database/18_sales_scope_returns_and_places.sql    RUN, 17 Sep — see 7A
+   database/19_product_pricing.sql                   section 1 RUN, 20 Sep;
+                                                     section 2 (drop) is yours
    database/changa.txt                               what is still yours to do
+
+ PRODUCT WORK, 20 SEP
+
+   Services/SkuGenerator.cs                  the SKU rules
+   Controllers/ProductHistoryController.cs   movements, history, ledger, export
+   Controllers/InventoryController.cs        sku-preview, barcodes/lookup,
+                                             duplicate check, pricing
+   Documents/XlsxWriter.cs                   now several sheets per workbook
+   vizo-erp/src/lib/pricing.ts               the price arithmetic
+   vizo-erp/src/lib/dates.ts                 today, and the no-past-date rule
+   vizo-erp/src/components/ui/date-input.tsx
+   vizo-erp/src/components/inventory/        scanner, barcode fields, pricing
+                                             fields, movement cards, timeline
+   app/(app)/inventory/products/[id]/movements/[movementId]/
+   app/(app)/inventory/products/[id]/history/
 
 ═══════════════════════════════════════════════════════════════════════════════

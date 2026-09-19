@@ -2,9 +2,89 @@
  CHANGA  —  what YOU have to change, by hand, outside the code
 ═══════════════════════════════════════════════════════════════════════════════
 
- Updated 20 September 2026 with the product work (section A, first).
- Sections 1–4 are from 17 September and still stand.
+ Updated 21 September 2026 with the returns and rights work (section B, first).
+ Section A is from 20 September and 1–4 from 17 September; both still stand.
 
+
+───────────────────────────────────────────────────────────────────────────────
+ B.  21 SEPTEMBER — FOUR THINGS, AND THE FIRST ONE IS URGENT
+───────────────────────────────────────────────────────────────────────────────
+
+ B1  ASSIGN YOUR CUSTOMERS TO THE RIGHT SALESMAN — TODAY
+
+     You asked that a salesman only see his own customers in every dropdown,
+     the way his Customers screen already works. That is done. On today's data
+     it means:
+
+         Sara Khan               7 customers
+         Zara Malik              1
+         Imran Iqbal             0      <-- cannot raise an order at all
+         Muhammad AMMAR KAMRAN   0      <-- cannot raise an order at all
+
+     Because the customer box is the first thing on the order form, a rep with
+     an empty list is stuck. Two of your four are in that state.
+
+     WHY: of the 18 shop accounts, 7 are assigned to Sara, 5 are assigned to
+     BILAL AHMED (order department), 4 to HASSAN RAZA (accountant) and 2 to
+     nobody. Nine of them are owned by people who never take an order.
+
+     THE FIX, five minutes, no deploy, no sign-out:
+         People → Customers → open each account → set the SALESMAN to the rep
+         who actually calls on that shop → Save.
+
+     I did not reassign them myself: who calls on which shop is your business,
+     not something the database can be asked.
+
+ B2  THE MIGRATION IS ALREADY RUN — on Neon only
+
+     backend/database/20_places_rights_and_returns.sql
+
+     RUN AND VERIFIED on the live database on 21 September, because you said to
+     run it. ANY OTHER ENVIRONMENT — a colleague's copy, a staging database —
+     needs it before the new API goes up there. Safe to run twice.
+
+     What it did:
+       · deleted the "In Transit" location AND the location type, after moving
+         ORD-26-0158 and INV-26-8878 to Karachi Order Department and removing
+         240 duplicate units of stock (see convey.txt R1 — those 240 were
+         counted twice, once here and once in Shop 2 where they really are)
+       · took invoices.create off the SALES role (they keep invoices.view, so a
+         rep can still print his own bill)
+       · took returns.sales off SALES and off the ORDER DEPARTMENT, leaving it
+         with you and the accountant
+       · made "SalesReturn"."InvoiceId" nullable, so a return can cover several
+         orders
+       · renamed the INVOICED status to "Invoiced/Edit" (the internal key is
+         untouched, so nothing else had to change)
+
+     DEPLOY ORDER: run it BEFORE or WITH the new API build, never long after.
+     The old build copes with all of it.
+
+ B3  EVERYBODY SIGNS OUT AND BACK IN — the same day
+
+     Same reason as migration 18 in September: permissions travel inside the
+     JWT and a token lasts eight hours. Until a salesman signs out and back in,
+     his old token still carries invoices.create and returns.sales, and the
+     API will let him bill an order with it. Signing out fixes it at once;
+     doing nothing fixes it by tomorrow morning.
+
+     NO ENVIRONMENT VARIABLES CHANGED in this round. Nothing to set on the host.
+
+ B4  TELL YOUR ACCOUNTANT THAT BILLING IS THEIRS NOW
+
+     Nobody in sales can press Invoiced any more. If Hassan or Nadia do not
+     know that they are the ones who bill a confirmed order, orders will sit at
+     Confirmed and nobody will be waiting on anything.
+
+     They get a notification on every confirmation ("Waiting for accounts to
+     invoice it"), and the step is called "Invoiced/Edit" because at that
+     moment they may also correct the order — lines, quantities, prices —
+     before the bill is cut. The invoice rebuilds itself to match.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ 20 SEPTEMBER — still current
+═══════════════════════════════════════════════════════════════════════════════
 
 ───────────────────────────────────────────────────────────────────────────────
  A.  PRODUCT WORK, 20 SEPTEMBER — three things

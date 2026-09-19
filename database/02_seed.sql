@@ -92,8 +92,11 @@ INSERT INTO "LocationKind" (kind_id, kind_key, kind_name) VALUES
     (1, 'warehouse',  'Warehouse'),
     (2, 'shop',       'Shop'),
     (3, 'department', 'Department'),
-    (4, 'claim',      'Claim / Damaged'),
-    (5, 'transit',    'In Transit');
+    (4, 'claim',      'Claim / Damaged');
+/* There is no 'transit' kind. Goods on a van belong to neither end of a
+   transfer -- that is what "StockTransfer"'s own IN_TRANSIT status says -- and
+   a shelf for them only ever held a second copy of the same units. Removed
+   from the live database by migration 20. */
 
 INSERT INTO "PartyCategory" (category_id, category_key, category_name) VALUES
     (1, 'RETAILER',     'Retailer'),
@@ -324,8 +327,7 @@ INSERT INTO "Location" (location_id, location_code, location_name, kind_id, city
     (1, 'LOC-01', 'Warehouse',        1, 1, 'Kohinoor Market, Saddar, Karachi', NULL, TRUE, FALSE, FALSE),
     (2, 'LOC-02', 'Order Department', 3, 1, 'Kohinoor Market, Saddar, Karachi', NULL, TRUE, TRUE,  FALSE),
     (3, 'LOC-03', 'Shop 2',           2, 1, 'Saddar Mobile Plaza, Karachi',     NULL, TRUE, FALSE, FALSE),
-    (4, 'LOC-04', 'Claim Stock',      4, 1, 'Kohinoor Market, Saddar, Karachi', NULL, TRUE, FALSE, TRUE),
-    (5, 'LOC-05', 'In Transit',       5, 1, 'Between locations',                NULL, TRUE, FALSE, TRUE);
+    (4, 'LOC-04', 'Claim Stock',      4, 1, 'Kohinoor Market, Saddar, Karachi', NULL, TRUE, FALSE, TRUE);
 
 INSERT INTO "DocumentSeries" (series_id, series_key, label, prefix, include_year, padding, next_number) VALUES
     (1,  'sales.order',      'Customer Order',    'ORD', TRUE, 4, 143),
@@ -663,9 +665,7 @@ INSERT INTO "StockBalance" (product_id, location_id, quantity) VALUES
     (33,1,90),(33,2,54),(33,3,36),
     /* LOC-04 Claim Stock: the pieces sitting on the claim shelf right now.
        Never counted as sellable. */
-    (11,4,12),(1,4,3),(24,4,2),
-    /* LOC-05 In Transit: TRF-26-0014 left the warehouse and has not landed. */
-    (19,5,120),(20,5,120);
+    (11,4,12),(1,4,3),(24,4,2);
 
 
 /* ===========================================================================
@@ -1314,8 +1314,10 @@ INSERT INTO "PurchaseReturnItem" (pr_item_id, pr_id, line_no, product_id, quanti
    SECTION 9 -- STOCK MOVEMENT
    =========================================================================== */
 
-/* TRF-26-0014 is the one currently in the air: it left the Warehouse, has not
-   landed at Shop 2, and its 240 pieces sit against LOC-05 In Transit. */
+/* TRF-26-0014 is the one currently in the air: it left the Warehouse (status
+   IN_TRANSIT) and has not landed at Shop 2. Its 240 pieces are on NO shelf
+   while they are on the van -- that is what the status is for, and it is why
+   there is no "In Transit" location for them to sit on. */
 INSERT INTO "StockTransfer" (transfer_id, transfer_no, from_location_id, to_location_id, transfer_date, status_id, initiated_by_user_id, approved_by_user_id, received_on, notes) VALUES
     (1, 'TRF-26-0014', 1, 3, '2026-08-12', 4, 2, 1,    NULL,         'Cables for the Shop 2 counter'),
     (2, 'TRF-26-0013', 1, 2, '2026-08-11', 5, 4, 1,    '2026-08-12', NULL),
@@ -1364,10 +1366,12 @@ INSERT INTO "StockMovement" (movement_id, product_id, location_id, movement_type
     (3,  19, 1, 2, '2026-08-13 11:42:00', 'ORD-26-0142',     -126, 920,  7),
     (4,  24, 1, 1, '2026-04-29 16:20:00', 'GRN-26-0089',      153, 230,  4),
     (5,  3,  1, 1, '2026-04-29 16:20:00', 'GRN-26-0089',      147, 320,  4),
+    /* TRF-26-0014 leaves the warehouse here and lands at Shop 2 when it is
+       received -- two legs, not three. The middle pair used to add the same
+       240 units to an "In Transit" shelf as well, and nothing ever took them
+       off it again. */
     (6,  19, 1, 3, '2026-08-12 14:00:00', 'TRF-26-0014',     -120, 920,  2),
-    (7,  19, 5, 4, '2026-08-12 14:00:00', 'TRF-26-0014',      120, 120,  2),
     (8,  20, 1, 3, '2026-08-12 14:00:00', 'TRF-26-0014',     -120, 1240, 2),
-    (9,  20, 5, 4, '2026-08-12 14:00:00', 'TRF-26-0014',      120, 120,  2),
     (10, 15, 1, 5, '2026-08-13 17:30:00', 'ADJ-26-0034',       -3, 420,  2),
     (11, 2,  1, 6, '2026-08-14 10:15:00', 'RET-KHI-26-0008',    4, 490,  4),
     (12, 21, 1, 7, '2026-04-28 12:00:00', 'PR-26-0008',       -40, 310,  4);

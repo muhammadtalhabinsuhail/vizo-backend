@@ -146,8 +146,11 @@ public class AdminDashboardController : AdminControllerBase
                 {
                     id = r.ReturnId,
                     returnNo = r.ReturnNo,
-                    invoiceNo = r.Invoice.InvoiceNo,
-                    orderNo = r.Invoice.Order != null ? r.Invoice.Order.OrderNo : null,
+                    /* Both null for a return raised against the customer's
+                       whole buying history rather than one bill -- the tile
+                       says "several orders" for those. */
+                    invoiceNo = r.Invoice != null ? r.Invoice.InvoiceNo : null,
+                    orderNo = r.Invoice != null && r.Invoice.Order != null ? r.Invoice.Order.OrderNo : null,
                     customerName = r.CustomerUser.LegalName,
                     raisedBy = r.CreatedByUser.FullName,
                     returnDate = r.ReturnDate,

@@ -9,7 +9,12 @@ public partial class SalesReturn
 
     public string ReturnNo { get; set; } = null!;
 
-    public int InvoiceId { get; set; }
+    /// <summary>
+    /// The one bill this came off, or NULL when the return is against the
+    /// customer's buying history rather than a single invoice.
+    /// Made nullable by backend/database/20_places_rights_and_returns.sql.
+    /// </summary>
+    public int? InvoiceId { get; set; }
 
     public int CustomerUserId { get; set; }
 
@@ -42,7 +47,7 @@ public partial class SalesReturn
 
     public virtual JournalEntry? Entry { get; set; }
 
-    public virtual SalesInvoice Invoice { get; set; } = null!;
+    public virtual SalesInvoice? Invoice { get; set; }
 
     public virtual Location Location { get; set; } = null!;
 

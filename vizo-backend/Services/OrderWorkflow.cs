@@ -92,8 +92,19 @@ public static class OrderWorkflow
         (Submitted,   Confirmed,   new[] { RoleAdmin }),
         (Submitted,   Declined,    new[] { RoleAdmin }),
 
-        // Billing it. The brief is explicit: sales OR admin, once confirmed.
-        (Confirmed,   Invoiced,    new[] { RoleSales, RoleAdmin }),
+        /* BILLING IT IS THE BACK OFFICE'S JOB, NOT THE REP'S.
+
+           It used to be (Confirmed -> Invoiced, sales or admin). The owner took
+           that right off sales: "invoiced/Edit ka status done krna ka right
+           sales person se lelo ... wo accountant ya super admin krsakta hai".
+
+           The reasoning behind it is the ordinary one for a distributor: the
+           person who negotiated the price should not also be the person who
+           settles what the customer is billed. The step is called
+           "Invoiced/Edit" on screen because at that moment accounts may still
+           correct the order -- see MayEditOrder -- and the invoice is cut from
+           whatever the order says once they are done with it. */
+        (Confirmed,   Invoiced,    new[] { RoleAccountant }),
 
         /* The warehouse keeper, and ONLY after the order has been invoiced.
            Two moves, in order: acknowledge it, then send it. That is the whole
@@ -190,6 +201,38 @@ public static class OrderWorkflow
         roleKey == RoleAdmin || statusKey is Draft or Submitted;
 
     /// <summary>
+    /// May this role cut an invoice for an order at all?
+    ///
+    /// The same rule as the Confirmed -> Invoiced move above, in a form the
+    /// other two routes to a bill can ask: POST /orders/{id}/invoice, and the
+    /// "raise the invoice too" tick on a new order. All three used to answer
+    /// this question differently -- the chain said sales or admin, the endpoint
+    /// said anybody holding invoices.create (which the order desk holds), and
+    /// the tick said anybody but sales -- so taking the right off the rep in
+    /// one place would simply have moved them to another.
+    /// </summary>
+    public static bool MayInvoice(string roleKey) =>
+        roleKey is RoleAdmin or RoleAccountant;
+
+    /// <summary>
+    /// May this role change an order's lines and prices as it stands, with no
+    /// approved change request behind them?
+    ///
+    /// The Super Admin always may. Accounts may while the order is theirs to
+    /// deal with -- confirmed, or invoiced and not yet picked -- because that
+    /// is the half of "Invoiced/Edit" that is not the invoice: a price the
+    /// office has to correct before the customer is billed for it. Once the
+    /// warehouse has the order in hand the goods are moving, so it goes back to
+    /// being the owner's decision alone.
+    ///
+    /// Everybody else asks, and the admin approves one change at a time -- see
+    /// OrderChangeRequest.
+    /// </summary>
+    public static bool MayEditOrder(string roleKey, string statusKey) =>
+        roleKey == RoleAdmin ||
+        (roleKey == RoleAccountant && statusKey is Confirmed or Invoiced);
+
+    /// <summary>
     /// Which roles hear about an order arriving at this status, and in what
     /// words. Empty audience means nobody needs telling.
     /// </summary>
@@ -203,21 +246,32 @@ public static class OrderWorkflow
                 $"{orderNo} -- {customer}. Waiting for you to confirm or decline it."),
 
             Confirmed => (NotificationKinds.OrderConfirmed,
-                /* The warehouse keeper is the one who acts next, so they are
-                   the real audience here -- not just an observer. */
-                new[] { RoleAdmin, RoleWarehouse, RoleSales },
+                /* ACCOUNTS IS THE ONE WHO ACTS NEXT. Confirming an order used
+                   to tell the warehouse to "prepare the stock", which they
+                   cannot do: their first move opens at Invoiced, and the
+                   invoice is now the back office's to cut. So the accountant is
+                   on this list, and the words say what is actually waited on.
+                   The keeper is kept on it as a heads-up -- knowing an order is
+                   coming is worth something even when there is nothing to
+                   press yet. */
+                new[] { RoleAdmin, RoleAccountant, RoleWarehouse, RoleSales },
                 $"Order confirmed by {actor}",
-                $"{orderNo} -- {customer}. Warehouse can prepare the stock."),
+                $"{orderNo} -- {customer}. Waiting for accounts to invoice it."),
 
             Declined => (NotificationKinds.OrderConfirmed,
                 new[] { RoleAdmin, RoleSales },
                 $"Order declined by {actor}",
                 $"{orderNo} -- {customer} was declined."),
 
+            /* The owner asked to be told, and so does the accountant who did it
+               (their copy is suppressed by exceptUserId, so this reaches the
+               other one). The keeper is here because THIS is the step that puts
+               the order in their queue -- the invoice is cut and the stock can
+               be picked. */
             Invoiced => (NotificationKinds.InvoiceRaised,
-                new[] { RoleAdmin, RoleAccountant },
+                new[] { RoleAdmin, RoleAccountant, RoleWarehouse },
                 $"Order invoiced by {actor}",
-                $"{orderNo} -- {customer} has been invoiced."),
+                $"{orderNo} -- {customer} has been invoiced. The warehouse can pick it."),
 
             /* The keeper has the order in hand. The owner wants to know work
                has started; the rep wants to be able to tell the customer. The

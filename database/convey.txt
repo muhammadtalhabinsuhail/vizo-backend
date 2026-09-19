@@ -2,13 +2,388 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
- Last written 20 September 2026, after the product work — auto SKUs, duty and
- margin pricing, barcode scanning, product cards, movements and history, and
- the no-past-dates rule. Sections P0–P11 below are that work; sections 1–9
- after them are the 17 September work and are all still current.
+ Last written 21 September 2026, after four things you asked for: the In Transit
+ location deleted, every customer dropdown cut down to the rep's own accounts,
+ billing (now "Invoiced/Edit") taken off sales and given to accounts, and the
+ sales return rebuilt around the CUSTOMER instead of one invoice.
+
+ Sections R0–R9 below are that work. Sections P0–P11 after them are the
+ 20 September product work, and sections 1–9 after those are 17 September.
+ All of it is still current unless a newer section says otherwise.
 
  WHAT MUST BE DONE BY HAND lives in its own file: changa.txt, beside this one.
  Read that first and this second.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART ZERO — 21 SEPTEMBER: PLACES, RIGHTS AND RETURNS
+═══════════════════════════════════════════════════════════════════════════════
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R0.  READ THIS ONE FIRST — TWO OF YOUR SALESMEN CANNOT TAKE AN ORDER NOW
+───────────────────────────────────────────────────────────────────────────────
+
+ You asked for the customer dropdown to show a salesman only his own customers,
+ the way his Customers screen already does. Done — and here is what it means on
+ today's data, counted on the live database:
+
+     Sara Khan               7 customers
+     Zara Malik              1 customer      (the one account she opened)
+     Imran Iqbal             0
+     Muhammad AMMAR KAMRAN   0
+     Asad Ali                0               (account is inactive anyway)
+
+ A rep with nobody on his list cannot raise an order at all, because the
+ customer box is the first thing on the form. IMRAN AND AMMAR ARE IN THAT
+ STATE TODAY.
+
+ The reason is not the change; it is who the accounts are assigned to. Of the
+ 18 shop accounts:
+
+     7  assigned to Sara Khan       (sales)
+     5  assigned to Bilal Ahmed     (ORDER DEPARTMENT, not a salesman)
+     4  assigned to Hassan Raza     (ACCOUNTANT, not a salesman)
+     2  assigned to nobody at all
+
+ So nine accounts are "owned" by people who never take an order, and two are
+ owned by nobody. That was invisible while the picker showed everybody every
+ customer; it is not invisible any more.
+
+ WHAT TO DO: open Customers, and set the salesman on each account to the rep
+ who actually calls on that shop. Five minutes of work, and it is the same
+ field the Customers screen has always used. Nothing in the code needs
+ changing, and it takes effect the moment you save — no sign-out needed for
+ this one.
+
+ I did NOT reassign them myself. Who calls on which shop is a fact about your
+ business that I cannot read off the database, and guessing it would put real
+ orders in front of the wrong man.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R1.  "IN TRANSIT" IS GONE, AND IT WAS HOLDING 240 PIECES THAT DO NOT EXIST
+───────────────────────────────────────────────────────────────────────────────
+
+ The location (LOC-05) and the location TYPE are both deleted — migration 20,
+ already run on Neon. Nobody can create another one from Administration →
+ Locations, because the type is gone from that dropdown too.
+
+ THREE THINGS WERE ATTACHED TO IT, and none of them could simply be deleted
+ with it:
+
+ 1. 240 PIECES OF STOCK — 120 Linko VC101 cables and 120 Maxo VC202 cables —
+    put there by the seeded transfer TRF-26-0014. That transfer was RECEIVED
+    into Shop 2 on 25 August and the same 240 pieces were added there as well.
+    So they were counted TWICE in any total that adds the locations up: once on
+    a shelf in Shop 2 where they really are, and once on a shelf that was never
+    a place. Those 240 are deleted. Stock in Hand is 240 units lower than it
+    was yesterday and 240 units closer to the truth.
+
+ 2. ONE ORDER AND ITS INVOICE — ORD-26-0158 and INV-26-8878 — had In Transit as
+    their location. They are moved to Karachi Order Department, which is what
+    you chose. Nothing else about them changed.
+
+    THIS ONE NEARLY COST YOU AN INVOICE. Every link into "Location" in this
+    database is ON DELETE CASCADE, so a plain DELETE of the row would have
+    taken that order and that invoice with it, silently. The migration moves
+    them first and refuses to run if anything else is still pointing at the
+    location.
+
+ 3. TWO STOCK MOVEMENTS from the same seed, deleted with the balance they
+    created. The transfer now reads the way it actually happened: 120 out of
+    the warehouse, 120 into Shop 2.
+
+ WHAT IS NOT AFFECTED: the transfer STATUS called "In Transit". That is a
+ different thing and it stays — it is what a transfer says while the goods are
+ on the van, and it is the right answer to "where are they". Goods in a van
+ belong to neither shelf; that is exactly why a location for them was wrong.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R2.  EVERY CUSTOMER DROPDOWN IS NOW THE REP'S OWN LIST
+───────────────────────────────────────────────────────────────────────────────
+
+ One change, in one place: GET /sales/lookups, which is where the order form,
+ the order edit screen, the invoice form, the counter screen and the return
+ screen all get their customer list. A salesman gets the accounts he opened
+ plus the accounts assigned to him — the same rule the Customers screen has
+ always used, so the two lists cannot disagree. Everybody else (you, accounts,
+ the order desk, the warehouse) still sees the whole book.
+
+ THE API REFUSES IT TOO, not just the screen. Posting an order for somebody
+ else's customer answers:
+
+     "That customer is not yours. You can only sell to accounts you opened or
+      have been assigned."
+
+ A list that leaves a name out is not a rule — anybody can send the id by hand.
+
+ THIS REVERSES A DECISION FROM 17 SEPTEMBER. Back then you said "issued still
+ he can see all customers", and the picker was deliberately left unfiltered so
+ a rep covering for a colleague could still take the order. You have now said
+ the opposite, in these words: "jesa ka sales ka customer ka page pe sirf us ka
+ hi customer dikh raha hn wese hi hr dropdown ma sales ka apna hi customers
+ dikhna chahiya hn." The new rule is in, the old comment is gone, and R0 above
+ is the cost of it.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R3.  BILLING IS THE BACK OFFICE'S NOW — THE STEP IS CALLED "INVOICED/EDIT"
+───────────────────────────────────────────────────────────────────────────────
+
+ Step 4 of the chain reads "Invoiced/Edit" everywhere it appears. Only the
+ ACCOUNTANT and the SUPER ADMIN can press it. A salesman can still see his
+ order and print its bill; he cannot bill it.
+
+ It is closed in three places, because there were three ways to reach a bill
+ and they did not agree with each other:
+
+     the chain step           Confirmed → Invoiced/Edit, accountant or you
+     the "Raise invoice"      the button is not drawn for anybody else, and
+       button                 the endpoint refuses them if they call it anyway
+     "raise the invoice too"  ignored for any role that may not bill
+       on a new order
+
+ The right also came off the Sales ROLE in the database (migration 20 removes
+ invoices.create from it). They keep invoices.view, which is what lets a rep
+ open and print his own bill.
+
+ THE ORDER DESK KEEPS invoices.create, deliberately: the counter raises its own
+ invoice the second a walk-in pays, and that is not the same act as billing an
+ order that is going through the chain. The chain refuses them by role.
+
+ THE "EDIT" HALF. At that step the accountant may also CHANGE the order —
+ lines, quantities, prices — without asking you, while it is confirmed or
+ invoiced and the warehouse has not picked it yet. Editing an invoiced order
+ rebuilds its invoice and its PDF to match, as it always did. Once the
+ warehouse has it in hand, editing goes back to being yours alone.
+
+ WHO IS TOLD, since you asked for accounts and yourself to be notified:
+
+     order confirmed   → you, ACCOUNTS (new), the warehouse, the rep
+                         "Waiting for accounts to invoice it."
+     order invoiced    → you, accounts, the WAREHOUSE (new), the rep
+                         "The warehouse can pick it."
+
+ The confirmed message used to say "Warehouse can prepare the stock", which was
+ never true — the warehouse's first move only opens once the invoice exists.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R4.  THE INVOICE STILL SAVES ITSELF — THERE WAS NOTHING TO FIX
+───────────────────────────────────────────────────────────────────────────────
+
+ You asked that after Invoiced nobody should have to go to Sale Invoices → New
+ and make the invoice separately. That has been true since 17 September:
+ pressing the step cuts the invoice, numbers it, renders the bill, pushes it to
+ Cloudinary and stores the link, all in one move, and pressing it twice never
+ makes a second bill. Checked again today.
+
+ The sales return then works off that invoice like any other — and from today
+ it does not even need it, because a return is against the customer (R5).
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R5.  THE SALES RETURN, REBUILT
+───────────────────────────────────────────────────────────────────────────────
+
+ WHO. Only the accountant and you. The screen is gone from the salesman's
+ sidebar, typing the address sends him to the 403 page, and every returns
+ endpoint refuses his token — permission AND role, both. The order desk lost it
+ as well, because you said "only admin and accountant".
+
+ THE FLOW, in the order you described it:
+
+   1  SALESPERSON, optional. Only narrows the customer list to his.
+   2  CUSTOMER, required. Everything below comes from this one choice.
+   3  On the right: HIS LAST 5 ORDERS with date, order and invoice number, and
+      every item with its quantity — and under it EVERYTHING HE HAS EVER
+      BOUGHT, from his first bill to his last, with how many were bought, how
+      many have already come back and how many still may. No date window at
+      all, exactly as you asked.
+   4  In the middle: ADD PRODUCT, which offers ONLY what this customer has been
+      billed for. Anything already returned in full is greyed out.
+   5  WHERE THE GOODS GO — asked, never guessed. One location for the return,
+      and every returned piece is added to it the moment you save.
+   6  Save. The date is today (system date, not typeable), the credit note is
+      generated and stored, and the stock is on the shelf before the screen
+      moves.
+
+ TAPPING IS FASTER THAN TYPING. A line in the "last 5 orders" panel adds that
+ item with the quantity that was sold on that order; a line in the "everything
+ bought" list adds one. Both respect the ceiling.
+
+ THE CEILING, which you were most particular about: bought minus already
+ returned, per item, per customer. Five hundred bought means at most five
+ hundred back, and 501 is refused. It is checked in four places, on purpose:
+
+     · the + and − buttons stop at it
+     · a typed number is clamped to it
+     · adding the same item twice sums the two rather than letting each pass
+     · and the API recomputes the whole thing INSIDE the transaction that
+       writes the return, under a per-customer lock, so two people saving at
+       the same second cannot both get through
+
+ Tested against the live database, every path: 33 of 32 refused, an item the
+ customer never bought refused, zero and negative quantities refused, no items
+ refused, a closed location refused, a salesman's token refused.
+
+ THE PRICE. Each piece is credited at what THAT customer actually paid for it
+ on average — discount taken off, tax on — across every bill they have had.
+ That was your answer to the question; the other options were the latest price
+ they paid, or today's catalogue price. Nobody can type a rate on this screen,
+ which is deliberate: a refund amount typed into a browser is a refund amount
+ somebody can change.
+
+ DAMAGED GOODS. There is no "condition" question any more. The shelf answers
+ it: send them to Claim Stock and the return records them as damaged and says
+ so on the screen; send them anywhere else and they are resalable. Either way
+ the pieces land where you said they should, which is what you asked for.
+
+ NO APPROVAL STEP. The return is POSTED the moment it is saved, because the
+ only two people who can raise one are the two who used to approve it. If it
+ turns out to be wrong, "Reverse & reject" on the return still takes the units
+ back off the shelf.
+
+ OLD RETURNS ARE UNTOUCHED. The seven that already exist still point at their
+ invoice and still read the way they did. The new ones say "Several orders"
+ where the old ones name a bill.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R6.  WHAT I RAN AGAINST THE LIVE DATABASE
+───────────────────────────────────────────────────────────────────────────────
+
+ MIGRATION 20 — run in full, on your say-so:
+     · In Transit removed (R1), with the order and invoice moved first
+     · invoices.create taken off Sales
+     · returns.sales taken off Sales and the order desk; confirmed present for
+       you and the accountant
+     · "SalesReturn"."InvoiceId" made nullable
+     · the INVOICED status renamed to "Invoiced/Edit" (the KEY is untouched —
+       every comparison in the code is on the key)
+
+ ONE TEST RETURN, raised and then removed, also on your say-so:
+     SR-26-0043, Cellular World KHI, 2 Titan AirPro + 1 Itel battery, PKR
+     3,118, into Karachi Warehouse. It proved the whole path: the row, the
+     stock going up, the movements, the credit note on Cloudinary (200 OK,
+     6,212 bytes), the list, the detail screen, the dashboard tile.
+
+     It is gone now. The three units were taken back off Karachi Warehouse, its
+     movements, activity row, notifications and document record were deleted,
+     and the SR counter was wound back so your next real return is SR-26-0043
+     with no gap in the book. Counted before and after: 7 returns before,
+     7 after; the two products are back at exactly the quantities they had.
+
+     ONE LEFTOVER I COULD NOT REMOVE: the credit-note PDF is still sitting in
+     the Cloudinary account, unreferenced by anything. Deleting a file there
+     needs the account's own API and I did not think that was mine to call.
+     It costs a few kilobytes and nothing links to it.
+
+ NOTHING ELSE WAS WRITTEN.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R7.  THINGS I FOUND AND DID NOT CHANGE
+───────────────────────────────────────────────────────────────────────────────
+
+ R7.1  A SALE INVOICE STILL DOES NOT REACH THE LEDGER
+
+       Found while deciding what a return should post. No invoice raised by
+       this application writes a journal entry — 39 invoices exist and 12 have
+       one, and those 12 are all seeded. Sales returns are the same, and have
+       always been.
+
+       WHAT IT MEANS: a customer's "outstanding" is computed from posted
+       journal lines, so the money owed on every invoice raised through the app
+       is not in that figure, and neither is the credit for a return. The
+       customer STATEMENT is built from the documents themselves and is right;
+       the aged-receivable figures and the credit-limit check are the ones that
+       under-state.
+
+       I kept the new return consistent with the invoice rather than posting
+       one side of a pair. Posting both is a real piece of work — which account
+       is Sales Returns, which is Receivable, what happens at period close —
+       and it is not something to slip into a screen change. Say the word and
+       it is a session of its own.
+
+ R7.2  PER-INVOICE "RETURNED" COUNTS STOP GROWING
+
+       The invoice screen shows how many of each line have come back. It counts
+       returns that name that invoice, and returns raised from now on do not
+       name one, so that number will stay where it is. The figure that matters
+       — how many of this item may still come back — is on the return screen
+       and is always right.
+
+       Fixing it properly means recording which bill each returned piece came
+       off, oldest first. Worth doing if you ever want a return matched to a
+       tax invoice, and not worth doing for stock.
+
+ R7.3  THE SIX EXPORTS ARE STILL CAPPED AT 50 ROWS
+
+       Unchanged from 20 September (P11.1): orders, invoices, walk-in, parties,
+       journal entries, vouchers and expenses all stop at 50 rows in the
+       spreadsheet. One line each. Still waiting on your word.
+
+ R7.4  ORDERS STILL DO NOT MOVE STOCK
+
+       The big one from 20 September (P0) is exactly as it was: an order going
+       through the ten steps writes no stock movement, so Stock in Hand is
+       overstated by everything sold through the chain. Today's change makes
+       one part of it worse in an obvious way — a sales return ADDS stock
+       properly, while the sale that took it out never subtracted it. Tell me
+       which step should take the stock off the shelf and it is one method and
+       one correction script.
+
+ R7.5  THE ACCOUNTING NOTE ON THE RETURN SCREEN IS STILL ASPIRATIONAL
+
+       The panel that reads "DR Sales Returns & Allowances · CR Accounts
+       Receivable" describes the entry an accountant WOULD raise. Nothing posts
+       it (R7.1). Left as it was, because it is true as a description of what
+       should happen and I did not want to hide the question.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R8.  WHERE THE NEW THINGS LIVE
+───────────────────────────────────────────────────────────────────────────────
+
+ BACKEND
+   Services/OrderWorkflow.cs            who may bill (MayInvoice), who may edit
+                                        (MayEditOrder), who is told at each step
+   Controllers/SalesController.cs       GET  /sales/returns/lookups
+                                        GET  /sales/returns/customer/{id}
+                                        POST /sales/returns   (rewritten)
+                                        customer scoping in /sales/lookups and
+                                        in ValidateOrderRequest
+   Models/SalesReturn.cs                InvoiceId is int? now
+   Documents/DocumentBuilder.cs         credit note with no invoice behind it
+   database/20_places_rights_and_returns.sql
+
+ FRONTEND
+   app/(app)/sales/returns/new/page.tsx     the new screen, rewritten whole
+   app/(app)/sales/returns/[id]/page.tsx    reads with or without one invoice
+   app/(app)/sales/returns/page.tsx         "Several orders" in the Against column
+   components/sales/order-workflow.tsx      canInvoice, and the Edit label
+   proxy.ts                                 /sales/returns is admin + accounts
+   lib/labels.ts                            INVOICED reads "Invoiced/Edit"
+
+
+───────────────────────────────────────────────────────────────────────────────
+ R9.  HOW TO CHECK IT YOURSELF, IN FIVE MINUTES
+───────────────────────────────────────────────────────────────────────────────
+
+  1  Sign in as a salesman. There is no "Sales Returns" in his sidebar; typing
+     /sales/returns gives the 403 page. On one of his orders there is no
+     "Raise invoice" button and no status button at Confirmed.
+  2  Sign in as the accountant. The same order offers "Invoiced/Edit" and
+     "Edit". Sales Returns is in his sidebar.
+  3  Administration → Locations: five places, no In Transit, and New Location
+     does not offer that type.
+  4  Sales Returns → New Return: pick a customer, and his last five orders and
+     everything he has ever bought fill the right-hand side. Try to return more
+     than he bought — the box will not let you, and the server refuses it too.
+  5  Inventory → Stock in Hand: four columns, no In Transit.
 
 
 ═══════════════════════════════════════════════════════════════════════════════

@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -1204,8 +1204,12 @@ public class InventoryController : ApiControllerBase
                         kindLabel = l.Kind.KindName,
                         cityId = l.CityId,
                         city = l.City.CityName,
-                        /* Claim and in-transit shelves hold stock that is not
-                           for sale. Counted, but the screen can say so. */
+                        /* The claim shelf holds stock that is not for sale --
+                           damaged goods waiting on a supplier. Counted, but the
+                           screen can say so. (There was an In Transit shelf
+                           here too until migration 20 removed it: goods on a van
+                           belong to neither end of a transfer, and a location
+                           for them only ever held a duplicate of the units.) */
                         isSellable = !l.ExcludeFromSellable
                     })
                     .ToListAsync(),

@@ -377,9 +377,13 @@ public static class DocumentBuilder
                 x.ReturnNo, x.ReturnDate, x.Reason,
                 status = x.Status.StatusName,
                 location = x.Location.LocationName,
-                invoiceNo = x.Invoice.InvoiceNo,
-                invoiceDate = x.Invoice.InvoiceDate,
-                orderNo = x.Invoice.Order != null ? x.Invoice.Order.OrderNo : null,
+                /* All three are null on a return raised against the customer's
+                   buying history instead of one bill -- InvoiceId is nullable
+                   from migration 20. The note says so in words rather than
+                   printing an empty box. */
+                invoiceNo = x.Invoice != null ? x.Invoice.InvoiceNo : null,
+                invoiceDate = x.Invoice != null ? (DateOnly?)x.Invoice.InvoiceDate : null,
+                orderNo = x.Invoice != null && x.Invoice.Order != null ? x.Invoice.Order.OrderNo : null,
                 refundMethod = x.RefundMethod.MethodName,
                 customer = x.CustomerUser.LegalName,
                 customerCode = x.CustomerUser.PartyCode,
@@ -391,9 +395,11 @@ public static class DocumentBuilder
                 /* Whoever wrote the ORDER the goods were sold on, which is the
                    name the customer knows -- same reasoning as the SALESMAN
                    line on the invoice itself. */
-                salesman = x.Invoice.Order != null && x.Invoice.Order.SalesPersonUser != null
+                salesman = x.Invoice != null && x.Invoice.Order != null && x.Invoice.Order.SalesPersonUser != null
                     ? x.Invoice.Order.SalesPersonUser.User.FullName
-                    : x.CreatedByUser.FullName,
+                    : x.CustomerUser.SalesPersonUser != null
+                        ? x.CustomerUser.SalesPersonUser.User.FullName
+                        : x.CreatedByUser.FullName,
                 lines = x.SalesReturnItems.OrderBy(l => l.LineNo).Select(l => new
                 {
                     l.LineNo,
@@ -427,9 +433,10 @@ public static class DocumentBuilder
             Meta: new[]
             {
                 new DocumentPdf.Fact("Return Date", DocumentPdf.Day(r.ReturnDate)),
-                new DocumentPdf.Fact("Against Invoice", r.invoiceNo),
-                new DocumentPdf.Fact("Invoice Date", DocumentPdf.Day(r.invoiceDate)),
-                new DocumentPdf.Fact("Order", r.orderNo ?? "Counter sale"),
+                new DocumentPdf.Fact("Against Invoice", r.invoiceNo ?? "Customer's purchases"),
+                new DocumentPdf.Fact("Invoice Date",
+                    r.invoiceDate is DateOnly d ? DocumentPdf.Day(d) : "--"),
+                new DocumentPdf.Fact("Order", r.orderNo ?? (r.invoiceNo is null ? "Several" : "Counter sale")),
                 new DocumentPdf.Fact("Taken Back To", r.location),
                 new DocumentPdf.Fact("Refund By", r.refundMethod),
                 new DocumentPdf.Fact("Salesman", r.salesman),

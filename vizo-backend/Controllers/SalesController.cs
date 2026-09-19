@@ -411,11 +411,16 @@ public class SalesController : ApiControllerBase
             if (invalidOrder is not null) return BadRequest(new { message = invalidOrder });
 
             /* The chain is: sales writes it, the Super Admin confirms it, and
-               only then is it billed. A rep ticking "invoice it too" would step
-               straight over the confirmation, so for that role the tick is
-               ignored and the reply says so. The admin and the order desk can
-               still bill on the spot, which is what the counter needs. */
-            var raiseInvoice = body.RaiseInvoice && CurrentRole() != OrderWorkflow.RoleSales;
+               only then does ACCOUNTS bill it. A rep ticking "invoice it too"
+               would step straight over both, so for that role the tick is
+               ignored and the reply says so.
+
+               The order desk lost this tick with the same change: billing is
+               the accountant's or the owner's now (OrderWorkflow.MayInvoice).
+               The counter is not affected -- a walk-in is rung up through
+               POST /sales/direct, which raises its own invoice because the cash
+               is in the drawer before anybody could approve anything. */
+            var raiseInvoice = body.RaiseInvoice && OrderWorkflow.MayInvoice(CurrentRole());
             var invoiceRefused = body.RaiseInvoice && !raiseInvoice;
 
             var (subtotal, discount, tax, total) = Totals(body.Lines);
@@ -589,6 +594,16 @@ public class SalesController : ApiControllerBase
             return "An order needs at least one line.";
         if (!await _db.Parties.AnyAsync(p => p.UserId == body.CustomerId))
             return "Pick a valid customer.";
+
+        /* A REP SELLS TO THEIR OWN ACCOUNTS ONLY -- checked here, not just in
+           the picker. GET /sales/lookups now hands a salesperson their own
+           customers, but a list that leaves a name out does not stop anybody
+           posting that customer's id, and this is the endpoint that writes the
+           order. Everybody else is unfiltered and skips the query entirely. */
+        if (SalesScopeUserId() is int onlyMine &&
+            !await _db.Parties.AnyAsync(p => p.UserId == body.CustomerId
+                                          && (p.CreatedByUserId == onlyMine || p.SalesPersonUserId == onlyMine)))
+            return "That customer is not yours. You can only sell to accounts you opened or have been assigned.";
         if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
             return "Pick a valid location.";
         if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
@@ -797,6 +812,19 @@ public class SalesController : ApiControllerBase
                 });
             }
 
+            /* CUTTING A BILL IS ACCOUNTS' OR THE OWNER'S. The permission alone
+               is not enough here: the order desk holds invoices.create for the
+               counter, and a rep held it until migration 20 took it away. The
+               rule the owner asked for is about the ROLE, so it is asked of the
+               workflow rather than of the token, and it is asked AFTER the
+               already-invoiced branch above -- anybody who may see a bill may
+               ask for the one that already exists. */
+            if (!OrderWorkflow.MayInvoice(CurrentRole()))
+                return StatusCode(403, new
+                {
+                    message = "Only the accountant or the Super Admin can invoice an order."
+                });
+
             var statusKey = await _db.OrderStatuses.Where(s => s.StatusId == order.StatusId)
                 .Select(s => s.StatusKey).FirstAsync();
             if (statusKey is "DRAFT" or "CREDIT_HOLD" or "CANCELLED")
@@ -892,10 +920,18 @@ public class SalesController : ApiControllerBase
             var role = CurrentRole();
             OrderChangeRequest? key = null;
 
-            if (role != OrderWorkflow.RoleAdmin)
+            /* THE "EDIT" HALF OF "INVOICED/EDIT".
+
+               The accountant may correct an order that is confirmed, or
+               invoiced and not yet picked, with no approved request behind
+               them -- that is the step the owner named Invoiced/Edit, and a
+               price the office has to fix before the customer is billed for it
+               cannot wait on a round trip through the owner. The rule itself
+               lives in OrderWorkflow.MayEditOrder. */
+            if (!OrderWorkflow.MayEditOrder(role, order.Status.StatusKey))
             {
-                /* Not an admin -- so this needs an approved request, and it has
-                   to belong to this person and this order. */
+                /* Everybody else needs an approved request, and it has to
+                   belong to this person and this order. */
                 key = await _db.OrderChangeRequests
                     .FirstOrDefaultAsync(r => r.OrderId == id
                                            && r.RequestedByUserId == CurrentUserId()
@@ -904,8 +940,12 @@ public class SalesController : ApiControllerBase
                 if (key is null)
                     return StatusCode(403, new
                     {
-                        message = "Only the Super Admin can edit an order. "
-                                + "Ask for permission from the order screen and try again once it is approved."
+                        message = role == OrderWorkflow.RoleAccountant
+                            ? $"{order.OrderNo} is {order.Status.StatusName.ToLowerInvariant()}. "
+                              + "Accounts can change an order while it is confirmed or at Invoiced/Edit; "
+                              + "after that only the Super Admin can."
+                            : "Only the Super Admin can edit an order. "
+                              + "Ask for permission from the order screen and try again once it is approved."
                     });
             }
 
@@ -1304,7 +1344,15 @@ public class SalesController : ApiControllerBase
             {
                 isAdmin,
                 isMine = mine,
-                canEdit = isAdmin || Granted("EDIT"),
+                canEdit = OrderWorkflow.MayEditOrder(role, order.StatusKey) || Granted("EDIT"),
+                /* Whether to draw "Raise invoice" at all. It is the same answer
+                   POST /orders/{id}/invoice gives, asked before the button is
+                   drawn rather than after it is pressed -- a rep pressing it
+                   and being refused is a worse screen than a rep never seeing
+                   it. Already-invoiced orders say false; the bill is reached
+                   from the invoice itself. */
+                canInvoice = OrderWorkflow.MayInvoice(role) && !invoiced
+                             && order.StatusKey is not ("DRAFT" or "CREDIT_HOLD" or "CANCELLED"),
                 canDelete = (isAdmin || Granted("DELETE")) && !invoiced,
                 editRequested = Asked("EDIT"),
                 deleteRequested = Asked("DELETE"),
@@ -2199,19 +2247,47 @@ public class SalesController : ApiControllerBase
     //  RETURNS
     // ══════════════════════════════════════════════════════════════════
 
+    /* ══════════════════════════════════════════════════════════════════════
+       SALES RETURNS -- WHO, AND AGAINST WHAT
+
+       TWO THINGS CHANGED HERE ON 21 SEPTEMBER, both asked for in these words:
+
+         "sales person apna panel se koi bhi sales return nhi krsakta ...
+          sales return only admin and accountant hi krsakta hn"
+
+         "sales return multiple orders se ho sakti hai"
+
+       1. ONLY THE ACCOUNTANT AND THE OWNER. Every action in this section
+          carries BOTH the permission and the Accountant role policy, and they
+          are ANDed. The permission alone was not enough: a Super Admin can tick
+          "Handle sales returns" for any role in Setup, and the rule the owner
+          gave is about the job, not the tick. Migration 20 takes the permission
+          off Sales and the order desk as well, so the two agree today; the role
+          check is what keeps them agreeing after somebody edits a role.
+
+       2. A RETURN IS AGAINST THE CUSTOMER, NOT AGAINST ONE INVOICE.
+          "SalesReturn"."InvoiceId" is nullable from migration 20 and new
+          returns leave it empty: what may come back is everything that customer
+          has ever been billed for, less whatever has already come back. The
+          seven returns raised before this still carry their invoice and still
+          read correctly -- every projection below asks whether it is there.
+       ══════════════════════════════════════════════════════════════════════ */
+
     [HttpGet("returns")]
     [Authorize(Policy = "perm:returns.sales")]
+    [Authorize(Policy = "Accountant")]
     public async Task<IActionResult> GetReturns([FromQuery] string? q, [FromQuery] string? status)
     {
         try
         {
             var rows = _db.SalesReturns.AsNoTracking().AsQueryable();
 
-            /* A rep who has been given the returns right gets the returns that
-               belong to their own orders -- not the whole company's. */
+            /* Kept for a rep who somehow holds both the permission and the role
+               policy -- which nobody does today. Null-safe on Invoice, because
+               a return raised from 21 September has none. */
             if (SalesScopeUserId() is int mine)
                 rows = rows.Where(r => r.CreatedByUserId == mine ||
-                                       (r.Invoice.Order != null &&
+                                       (r.Invoice != null && r.Invoice.Order != null &&
                                         r.Invoice.Order.SalesPersonUserId == mine));
 
             if (!string.IsNullOrWhiteSpace(status))
@@ -2230,7 +2306,7 @@ public class SalesController : ApiControllerBase
                     id = r.ReturnId,
                     returnNo = r.ReturnNo,
                     invoiceId = r.InvoiceId,
-                    invoiceNo = r.Invoice.InvoiceNo,
+                    invoiceNo = r.Invoice != null ? r.Invoice.InvoiceNo : null,
                     customerId = r.CustomerUserId,
                     customerName = r.CustomerUser.LegalName,
                     location = r.Location.LocationName,
@@ -2246,11 +2322,18 @@ public class SalesController : ApiControllerBase
                     damagedQty = r.SalesReturnItems
                         .Where(l => !l.Condition.IsResalable).Sum(l => (int?)l.Quantity) ?? 0,
                     createdBy = r.CreatedByUser.FullName,
-                    salesPerson = r.Invoice.Order != null && r.Invoice.Order.SalesPersonUser != null
+                    /* Whose customer this is. For a return against one invoice
+                       that is the rep who wrote the order it was sold on; for a
+                       return across the customer's whole history there is no
+                       single order to ask, so it is the rep the account is
+                       assigned to. Falls back to whoever raised the return. */
+                    salesPerson = r.Invoice != null && r.Invoice.Order != null && r.Invoice.Order.SalesPersonUser != null
                         ? r.Invoice.Order.SalesPersonUser.User.FullName
-                        : r.CreatedByUser.FullName,
-                    orderId = r.Invoice.OrderId,
-                    orderNo = r.Invoice.Order != null ? r.Invoice.Order.OrderNo : null
+                        : r.CustomerUser.SalesPersonUser != null
+                            ? r.CustomerUser.SalesPersonUser.User.FullName
+                            : r.CreatedByUser.FullName,
+                    orderId = r.Invoice != null ? r.Invoice.OrderId : null,
+                    orderNo = r.Invoice != null && r.Invoice.Order != null ? r.Invoice.Order.OrderNo : null
                 })
                 .ToListAsync();
 
@@ -2294,6 +2377,7 @@ public class SalesController : ApiControllerBase
 
     [HttpGet("returns/{id:int}")]
     [Authorize(Policy = "perm:returns.sales")]
+    [Authorize(Policy = "Accountant")]
     public async Task<IActionResult> GetReturn(int id)
     {
         try
@@ -2302,7 +2386,8 @@ public class SalesController : ApiControllerBase
                 !await _db.SalesReturns.AsNoTracking().AnyAsync(x =>
                     x.ReturnId == id &&
                     (x.CreatedByUserId == mine ||
-                     (x.Invoice.Order != null && x.Invoice.Order.SalesPersonUserId == mine))))
+                     (x.Invoice != null && x.Invoice.Order != null &&
+                      x.Invoice.Order.SalesPersonUserId == mine))))
                 return NotYours("return");
 
             var r = await _db.SalesReturns.AsNoTracking()
@@ -2311,24 +2396,31 @@ public class SalesController : ApiControllerBase
                 {
                     id = x.ReturnId,
                     returnNo = x.ReturnNo,
+                    /* NULL FOR A RETURN RAISED AGAINST THE CUSTOMER'S HISTORY.
+                       Everything downstream of this -- the invoice card, the
+                       "Original bill" button, the sold-of-how-many figure -- is
+                       written to cope with that rather than to assume an
+                       invoice is there. */
                     invoiceId = x.InvoiceId,
-                    invoiceNo = x.Invoice.InvoiceNo,
-                    invoiceDate = x.Invoice.InvoiceDate,
-                    invoiceTotal = x.Invoice.TotalAmount,
-                    invoicePdfUrl = x.Invoice.PdfUrl,
-                    invoiceDeliverable = x.Invoice.PdfDeliverable,
+                    invoiceNo = x.Invoice != null ? x.Invoice.InvoiceNo : null,
+                    invoiceDate = x.Invoice != null ? (DateOnly?)x.Invoice.InvoiceDate : null,
+                    invoiceTotal = x.Invoice != null ? (decimal?)x.Invoice.TotalAmount : null,
+                    invoicePdfUrl = x.Invoice != null ? x.Invoice.PdfUrl : null,
+                    invoiceDeliverable = x.Invoice != null && x.Invoice.PdfDeliverable,
                     /* The order the goods were sold on, so the screen can say
-                       WHICH order was returned against and link to it. A return
-                       is always against an invoice; an invoice is not always
-                       against an order (a counter sale is not), so this is
-                       nullable and the screen says "counter sale" for null. */
-                    orderId = x.Invoice.OrderId,
-                    orderNo = x.Invoice.Order != null ? x.Invoice.Order.OrderNo : null,
-                    orderDate = x.Invoice.Order != null ? (DateOnly?)x.Invoice.Order.OrderDate : null,
-                    orderTotal = x.Invoice.Order != null ? (decimal?)x.Invoice.Order.TotalAmount : null,
-                    salesPerson = x.Invoice.Order != null && x.Invoice.Order.SalesPersonUser != null
+                       WHICH order was returned against and link to it. Null
+                       when the return has no single invoice, and null for a
+                       counter sale, which has an invoice but never had an
+                       order. */
+                    orderId = x.Invoice != null ? x.Invoice.OrderId : null,
+                    orderNo = x.Invoice != null && x.Invoice.Order != null ? x.Invoice.Order.OrderNo : null,
+                    orderDate = x.Invoice != null && x.Invoice.Order != null ? (DateOnly?)x.Invoice.Order.OrderDate : null,
+                    orderTotal = x.Invoice != null && x.Invoice.Order != null ? (decimal?)x.Invoice.Order.TotalAmount : null,
+                    salesPerson = x.Invoice != null && x.Invoice.Order != null && x.Invoice.Order.SalesPersonUser != null
                         ? x.Invoice.Order.SalesPersonUser.User.FullName
-                        : null,
+                        : x.CustomerUser.SalesPersonUser != null
+                            ? x.CustomerUser.SalesPersonUser.User.FullName
+                            : null,
                     customerId = x.CustomerUserId,
                     customerName = x.CustomerUser.LegalName,
                     customerPhone = x.CustomerUser.User.Phone,
@@ -2359,11 +2451,19 @@ public class SalesController : ApiControllerBase
                         isResalable = l.Condition.IsResalable,
                         restockLocation = l.RestockLocation != null ? l.RestockLocation.LocationName : null,
 
-                        /* What the original invoice sold, so the screen can show
-                           "6 of 100" rather than a bare 6. */
-                        soldQty = _db.SalesInvoiceItems
-                            .Where(s => s.InvoiceId == x.InvoiceId && s.ProductId == l.ProductId)
-                            .Sum(s => (int?)s.Quantity) ?? 0
+                        /* What this line came out of, so the screen can show
+                           "6 of 100" rather than a bare 6. Against one invoice
+                           that is what that invoice sold; against the customer's
+                           history it is everything they have ever been billed
+                           for of that item, which is the ceiling the return was
+                           actually checked against. */
+                        soldQty = x.InvoiceId != null
+                            ? _db.SalesInvoiceItems
+                                .Where(s => s.InvoiceId == x.InvoiceId && s.ProductId == l.ProductId)
+                                .Sum(s => (int?)s.Quantity) ?? 0
+                            : _db.SalesInvoiceItems
+                                .Where(s => s.Invoice.CustomerUserId == x.CustomerUserId && s.ProductId == l.ProductId)
+                                .Sum(s => (int?)s.Quantity) ?? 0
                     }).ToList()
                 })
                 .FirstOrDefaultAsync();
@@ -2403,14 +2503,20 @@ public class SalesController : ApiControllerBase
                 damagedQty = r.lines.Where(l => !l.isResalable).Sum(l => l.qty),
                 /* How much of the original bill has come back, so the screen can
                    say "3 of the 12 items on INV-26-8871" rather than leaving the
-                   reader to work it out. */
-                invoiceItemCount = await _db.SalesInvoiceItems
-                    .Where(l => l.InvoiceId == r.invoiceId).SumAsync(l => (int?)l.Quantity) ?? 0,
-                /* The two documents this screen can print: the return's own
-                   credit note, and the bill it came off. */
+                   reader to work it out. With no single invoice behind the
+                   return it is everything the customer has ever bought. */
+                invoiceItemCount = r.invoiceId is int onlyBill
+                    ? await _db.SalesInvoiceItems
+                        .Where(l => l.InvoiceId == onlyBill).SumAsync(l => (int?)l.Quantity) ?? 0
+                    : await _db.SalesInvoiceItems
+                        .Where(l => l.Invoice.CustomerUserId == r.customerId).SumAsync(l => (int?)l.Quantity) ?? 0,
+                /* The documents this screen can print: the return's own credit
+                   note always, and the bill it came off when there is one. */
                 pdfUrl = note?.PdfUrl,
                 viewUrl = ReturnNoteUrl(r.id, note?.PdfUrl, note?.IsDeliverable ?? false),
-                invoiceViewUrl = BillViewUrl(r.invoiceNo, r.invoicePdfUrl, r.invoiceDeliverable),
+                invoiceViewUrl = r.invoiceNo is null
+                    ? null
+                    : BillViewUrl(r.invoiceNo, r.invoicePdfUrl, r.invoiceDeliverable),
                 r.lines,
                 activity
             });
@@ -2431,7 +2537,7 @@ public class SalesController : ApiControllerBase
     /// count only comes apart at the next stock take.
     /// </summary>
     [HttpPatch("returns/{id:int}/status")]
-    [Authorize(Policy = "BackOffice")]
+    [Authorize(Policy = "Accountant")]
     public async Task<IActionResult> SetReturnStatus(int id, [FromBody] ReturnDecisionRequest body)
     {
         try
@@ -2468,7 +2574,16 @@ public class SalesController : ApiControllerBase
             {
                 var saleOut = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "SALE_RETURN");
 
-                foreach (var l in ret.SalesReturnItems.Where(l => l.Condition.IsResalable))
+                /* EVERY LINE WHOSE STOCK ACTUALLY WENT IN, which is every line
+                   carrying a restock location. It used to ask the CONDITION
+                   instead, and the two stopped agreeing on 21 September: a
+                   return taken into Claim Stock is recorded as damaged and its
+                   units are still put on that shelf, because the owner asked
+                   for the returned quantity to land wherever the operator says.
+                   Reading the condition would have left those units behind on a
+                   rejection. Returns raised the old way are unaffected -- their
+                   write-off lines never had a restock location. */
+                foreach (var l in ret.SalesReturnItems.Where(l => l.RestockLocationId != null))
                 {
                     var locationId = l.RestockLocationId ?? ret.LocationId;
                     var bal = await _db.StockBalances
@@ -2548,6 +2663,249 @@ public class SalesController : ApiControllerBase
         }
     }
 
+    /// <summary>
+    /// Everything the new-return screen needs to draw its first two pickers,
+    /// and nothing else.
+    ///
+    /// Deliberately NOT GET /sales/lookups. That call carries the whole product
+    /// catalogue with a stock sum per row, and this screen does not want a
+    /// catalogue: the only items it may offer are the ones this customer has
+    /// actually bought, which are not known until a customer is chosen.
+    /// </summary>
+    [HttpGet("returns/lookups")]
+    [Authorize(Policy = "perm:returns.sales")]
+    [Authorize(Policy = "Accountant")]
+    public async Task<IActionResult> ReturnLookups()
+    {
+        try
+        {
+            /* The rep filter on the return screen is a convenience, not a rule:
+               picking a salesperson narrows the customer list to theirs. Both
+               ways a customer belongs to a rep are carried, because the
+               Customers screen uses both -- opened by them, or assigned to
+               them. */
+            var customers = await _db.Parties.AsNoTracking()
+                .Where(p => (p.User.RoleId == 5 || p.User.RoleId == 7) && p.User.IsActive
+                         && p.PartyCode != WalkInPartyCode)
+                .Select(p => new
+                {
+                    id = p.UserId,
+                    code = p.PartyCode,
+                    name = p.LegalName,
+                    city = p.City.CityName,
+                    phone = p.User.Phone,
+                    repId = p.SalesPersonUserId,
+                    openedById = p.CreatedByUserId,
+                    /* Somebody who has never been billed has nothing that can
+                       come back. The screen greys them out rather than hiding
+                       them, so nobody hunts for a name that is really there. */
+                    lastPurchase = _db.SalesInvoices
+                        .Where(i => i.CustomerUserId == p.UserId)
+                        .Max(i => (DateOnly?)i.InvoiceDate)
+                })
+                .OrderBy(p => p.name)
+                .ToListAsync();
+
+            var methods = await _db.PaymentMethods.AsNoTracking()
+                .Where(m => m.IsActive)
+                .Select(m => new { id = m.MethodId, key = m.MethodKey, name = m.MethodName, kind = m.MethodKind })
+                .ToListAsync();
+
+            return Ok(new
+            {
+                salesPeople = await _db.Employees.AsNoTracking()
+                    .Where(e => e.User.Role.RoleKey == "sales" && e.User.IsActive)
+                    .OrderBy(e => e.User.FullName)
+                    .Select(e => new { id = e.UserId, name = e.User.FullName })
+                    .ToListAsync(),
+                customers,
+                /* Where the goods are being taken back INTO. Claim Stock is a
+                   real answer here -- that is the shelf damaged returns belong
+                   on -- so the list is every active location with a flag saying
+                   which ones are sellable, not a filtered list. */
+                locations = await _db.Locations.AsNoTracking()
+                    .Where(l => l.IsActive)
+                    .OrderByDescending(l => l.Kind.KindKey == "warehouse" || l.Kind.KindKey == "shop")
+                    .ThenBy(l => l.LocationName)
+                    .Select(l => new
+                    {
+                        id = l.LocationId,
+                        code = l.LocationCode,
+                        name = l.LocationName,
+                        kind = l.Kind.KindKey,
+                        kindLabel = l.Kind.KindName,
+                        city = l.City.CityName,
+                        isSellable = !l.ExcludeFromSellable
+                    })
+                    .ToListAsync(),
+                refundMethods = methods,
+                /* A credit note is what a distributor almost always gives, so
+                   the form starts there and the operator changes it only when
+                   money really is going back out. */
+                defaultRefundMethodId = methods.FirstOrDefault(m => m.key == "CREDIT_NOTE")?.id
+                                     ?? methods.FirstOrDefault()?.id,
+                /* Today, from the one Pakistan clock. The screen shows it and
+                   does not let anybody type another -- "AUTOMATIC SYSTEM KI
+                   DATE SALES RETURN KI DATE HOJAE GI". */
+                today = Today()
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load what the return screen needs");
+        }
+    }
+
+    /// <summary>
+    /// One customer's whole buying history, in the three shapes the return
+    /// screen asks it in:
+    ///
+    ///   recentOrders  the last five, with their items and quantities, so the
+    ///                 operator can see what the conversation is about
+    ///   items         every product ever billed to them, with how many were
+    ///                 bought, how many have already come back, and therefore
+    ///                 how many still may -- from the first invoice to the last,
+    ///                 no date window at all
+    ///   summary       the totals of that
+    ///
+    /// THE RETURNABLE FIGURE IS THE WHOLE POINT. It is bought minus already
+    /// returned, counting every return except the rejected ones, and the create
+    /// endpoint recomputes exactly the same number inside its transaction
+    /// before writing anything. The screen showing it is a courtesy; the
+    /// recompute is the rule.
+    /// </summary>
+    [HttpGet("returns/customer/{customerId:int}")]
+    [Authorize(Policy = "perm:returns.sales")]
+    [Authorize(Policy = "Accountant")]
+    public async Task<IActionResult> ReturnCustomerHistory(int customerId)
+    {
+        try
+        {
+            var customer = await _db.Parties.AsNoTracking()
+                .Where(p => p.UserId == customerId)
+                .Select(p => new
+                {
+                    id = p.UserId,
+                    code = p.PartyCode,
+                    name = p.LegalName,
+                    city = p.City.CityName,
+                    phone = p.User.Phone,
+                    address = p.AddressLine,
+                    rep = p.SalesPersonUser != null ? p.SalesPersonUser.User.FullName : null,
+                    defaultLocationId = p.DefaultLocationId
+                })
+                .FirstOrDefaultAsync();
+
+            if (customer is null) return NotFound(new { message = $"No customer with id {customerId}." });
+
+            /* THE LAST FIVE, newest first. An invoice is the sale -- an order
+               that has not been billed has not left the building and cannot
+               come back -- so the list is built from invoices and names the
+               order each one was raised against. */
+            var recent = await _db.SalesInvoices.AsNoTracking()
+                .Where(i => i.CustomerUserId == customerId)
+                .OrderByDescending(i => i.InvoiceDate).ThenByDescending(i => i.InvoiceId)
+                .Take(5)
+                .Select(i => new
+                {
+                    invoiceId = i.InvoiceId,
+                    invoiceNo = i.InvoiceNo,
+                    orderId = i.OrderId,
+                    orderNo = i.Order != null ? i.Order.OrderNo : null,
+                    date = i.InvoiceDate,
+                    total = i.TotalAmount,
+                    status = i.Status.StatusName,
+                    lines = i.SalesInvoiceItems.OrderBy(l => l.LineNo).Select(l => new
+                    {
+                        productId = l.ProductId,
+                        name = l.Product.ProductName,
+                        sku = l.Product.Sku,
+                        qty = l.Quantity
+                    }).ToList()
+                })
+                .ToListAsync();
+
+            /* EVERY ITEM EVER BILLED TO THEM, from the first invoice to the
+               last. The value is LineTotal, which is what they were actually
+               charged -- discount taken off, tax on -- so value / qty is the
+               price a returned piece is credited at. Unit price on its own
+               would credit a discounted line at full rate. */
+            var bought = await _db.SalesInvoiceItems.AsNoTracking()
+                .Where(l => l.Invoice.CustomerUserId == customerId)
+                .GroupBy(l => l.ProductId)
+                .Select(g => new
+                {
+                    productId = g.Key,
+                    qty = g.Sum(x => x.Quantity),
+                    value = g.Sum(x => x.LineTotal),
+                    first = g.Min(x => x.Invoice.InvoiceDate),
+                    last = g.Max(x => x.Invoice.InvoiceDate),
+                    invoices = g.Select(x => x.InvoiceId).Distinct().Count()
+                })
+                .ToListAsync();
+
+            var backAlready = await _db.SalesReturnItems.AsNoTracking()
+                .Where(l => l.Return.CustomerUserId == customerId && l.Return.Status.StatusKey != "REJECTED")
+                .GroupBy(l => l.ProductId)
+                .Select(g => new { productId = g.Key, qty = g.Sum(x => x.Quantity) })
+                .ToDictionaryAsync(g => g.productId, g => g.qty);
+
+            var ids = bought.Select(b => b.productId).ToList();
+            var products = await _db.Products.AsNoTracking()
+                .Where(p => ids.Contains(p.ProductId))
+                .Select(p => new { p.ProductId, p.ProductName, p.Sku, p.Packing, p.SalePrice })
+                .ToDictionaryAsync(p => p.ProductId);
+
+            var items = bought
+                .Select(b =>
+                {
+                    products.TryGetValue(b.productId, out var p);
+                    var returned = backAlready.TryGetValue(b.productId, out var r) ? r : 0;
+                    return new
+                    {
+                        productId = b.productId,
+                        name = p?.ProductName ?? $"Product {b.productId}",
+                        sku = p?.Sku ?? "",
+                        packing = p?.Packing,
+                        purchased = b.qty,
+                        returned,
+                        returnable = Math.Max(0, b.qty - returned),
+                        /* What a returned piece is credited at, rounded to the
+                           paisa the same way every other money figure in this
+                           API is. */
+                        unitPrice = b.qty <= 0 ? 0m : Money(b.value / b.qty),
+                        spent = b.value,
+                        firstBought = b.first,
+                        lastBought = b.last,
+                        invoices = b.invoices
+                    };
+                })
+                .OrderBy(i => i.name)
+                .ToList();
+
+            return Ok(new
+            {
+                customer,
+                recentOrders = recent,
+                items,
+                summary = new
+                {
+                    products = items.Count,
+                    unitsBought = items.Sum(i => i.purchased),
+                    unitsReturned = items.Sum(i => i.returned),
+                    unitsReturnable = items.Sum(i => i.returnable),
+                    spent = items.Sum(i => i.spent),
+                    firstBought = items.Count == 0 ? (DateOnly?)null : items.Min(i => i.firstBought),
+                    lastBought = items.Count == 0 ? (DateOnly?)null : items.Max(i => i.lastBought)
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"load what customer {customerId} has bought");
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════
     //  LOOKUPS
     // ══════════════════════════════════════════════════════════════════
@@ -2574,6 +2932,11 @@ public class SalesController : ApiControllerBase
                 .Where(p => p.PartyCode == WalkInPartyCode)
                 .Select(p => (int?)p.UserId)
                 .FirstOrDefaultAsync();
+
+            /* Null for everybody except a salesperson, whose pickers are cut
+               down to their own accounts a few lines below. Read once: inside
+               the query it would be a method call EF cannot translate. */
+            var mineOnly = SalesScopeUserId();
 
             var commonTax = await _db.Products.AsNoTracking()
                 .Where(p => p.IsActive)
@@ -2604,8 +2967,13 @@ public class SalesController : ApiControllerBase
                 /* Ordered so the first entry is a sane default for a till.
                    Alphabetical put "Claim Stock" -- damaged goods -- at the top
                    of the counter screen, which is the one shelf nothing should
-                   ever be sold off. isSellable marks the real ones: claim and
-                   in-transit stock are held, not sold. */
+                   ever be sold off. isSellable marks the real ones: claim stock
+                   is held, not sold.
+
+                   There is no "In Transit" shelf any more -- see migration 20.
+                   Goods on a van belong to neither end of a transfer, which is
+                   what the transfer's own IN_TRANSIT status says; a location
+                   for them only ever held a second copy of the same units. */
                 locations = await _db.Locations.AsNoTracking()
                     .Where(l => l.IsActive)
                     .OrderByDescending(l => l.Kind.KindKey == "shop" || l.Kind.KindKey == "warehouse")
@@ -2616,12 +2984,30 @@ public class SalesController : ApiControllerBase
                         code = l.LocationCode,
                         name = l.LocationName,
                         kind = l.Kind.KindKey,
-                        isSellable = l.Kind.KindKey != "claim" && l.Kind.KindKey != "transit"
+                        isSellable = !l.ExcludeFromSellable
                     })
                     .ToListAsync(),
+
+                /* THE PICKER IS THE REP'S OWN CUSTOMERS NOW.
+
+                   It used to be every account in the book, on the reading that
+                   a rep covering for a colleague still has to be able to take
+                   the order. The owner has settled it the other way, in these
+                   words: "jesa ka sales ka customer ka page pe sirf us ka hi
+                   customer dikh raha hn wese hi hr dropdown ma sales ka apna hi
+                   customers dikhna chahiya hn."
+
+                   Same rule as the Customers screen, so the two lists cannot
+                   disagree: the accounts this rep opened, plus any the owner
+                   has since assigned to them (PartiesController.MyPartiesOnly).
+                   Everybody else still sees the whole book. The API refuses an
+                   order for somebody else's customer as well -- a picker that
+                   hides a name is not a rule (ValidateOrderRequest). */
                 customers = await _db.Parties.AsNoTracking()
                     .Where(p => (p.User.RoleId == 5 || p.User.RoleId == 7) && p.User.IsActive
                              && p.PartyCode != WalkInPartyCode)
+                    .Where(p => mineOnly == null
+                             || p.CreatedByUserId == mineOnly || p.SalesPersonUserId == mineOnly)
                     .OrderBy(p => p.LegalName)
                     .Select(p => new
                     {
@@ -2810,103 +3196,185 @@ public class SalesController : ApiControllerBase
     }
 
     /// <summary>
-    /// Takes goods back from a customer. Only RESALABLE lines go back on the
-    /// shelf -- damaged, expired and missing are recorded against the return so
-    /// the loss is visible, but putting them back would sell a broken item twice.
+    /// Takes goods back from a customer, against everything they have ever
+    /// bought rather than against one bill.
+    ///
+    /// WHAT THE OWNER ASKED FOR, and what each part of it means here:
+    ///
+    ///   "sales return multiple orders se ho sakti hai"
+    ///       No InvoiceId. The ceiling on every line is what that customer has
+    ///       been billed for in total, less what has already come back.
+    ///
+    ///   "agr kisi customer na khareeda hi 500 pieces hn tou 600 pieces ka
+    ///    sales return nhi ho sakta ... validation strong rakhna hr eak point pa"
+    ///       Checked here, inside the transaction, under a per-customer
+    ///       advisory lock -- not only in the browser, and not before the
+    ///       transaction either, because two operators saving at the same
+    ///       moment would both read the same "already returned" and both pass.
+    ///
+    ///   "automatic system ki date sales return ki date hojae gi"
+    ///       The date is today, from the business clock. The request cannot
+    ///       carry one.
+    ///
+    ///   "konsi location ma item add krna hai ... us location ma us item ko
+    ///    add krdena jitna sales return hoa hai"
+    ///       One location for the whole return, and EVERY line lands on it --
+    ///       including the damaged ones, which is what Claim Stock is for.
+    ///       The condition is derived from the shelf rather than asked for a
+    ///       second time: a location marked not-sellable (Claim Stock) records
+    ///       its lines as damaged, everything else as resalable.
+    ///
+    ///   "sales return ki invoice generate hojae gi"
+    ///       A credit note (SR-...), not a second invoice -- see
+    ///       DocumentBuilder.SalesReturn -- archived before this returns.
+    ///
+    /// It is POSTED on the spot. There is no approval step left to wait for:
+    /// only the accountant and the owner can raise one now, and a return that
+    /// sits in a draft state while the goods are already on the shelf is a
+    /// stock count nobody can trust. Rejecting it afterwards is still possible
+    /// and still takes the units back off (SetReturnStatus).
     /// </summary>
     [HttpPost("returns")]
     [Authorize(Policy = "perm:returns.sales")]
+    [Authorize(Policy = "Accountant")]
     public async Task<IActionResult> CreateReturn([FromBody] ReturnRequest body)
     {
         try
         {
-            /* "a salesperson can only create sales returns of his created
-               order" -- so the invoice being returned against has to be one of
-               theirs before anything else is checked. */
-            if (!await MaySeeInvoice(body.InvoiceId)) return NotYours("invoice");
-
             if (body.Lines is null || body.Lines.Count == 0)
-                return BadRequest(new { message = "A return needs at least one line." });
-            if (string.IsNullOrWhiteSpace(body.Reason))
-                return BadRequest(new { message = "A reason is required." });
+                return BadRequest(new { message = "A return needs at least one item." });
 
-            var inv = await _db.SalesInvoices.FirstOrDefaultAsync(i => i.InvoiceId == body.InvoiceId);
-            if (inv is null) return BadRequest(new { message = "Pick a valid invoice." });
-            if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
-                return BadRequest(new { message = "Pick a valid location." });
-            if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.RefundMethodId))
+            /* The same product twice on the form is one line of the sum of the
+               two, not two lines that each pass the check on their own. */
+            var wanted = body.Lines
+                .GroupBy(l => l.ProductId)
+                .Select(g => new { ProductId = g.Key, Qty = g.Sum(x => x.Qty) })
+                .ToList();
+
+            if (wanted.Any(l => l.Qty <= 0))
+                return BadRequest(new { message = "Every item needs a quantity above zero." });
+
+            var customer = await _db.Parties.AsNoTracking()
+                .Where(p => p.UserId == body.CustomerId)
+                .Select(p => new { p.UserId, p.LegalName, p.PartyCode })
+                .FirstOrDefaultAsync();
+            if (customer is null) return BadRequest(new { message = "Pick a valid customer." });
+            if (customer.PartyCode == WalkInPartyCode)
+                return BadRequest(new
+                {
+                    message = "Walk-in sales are not billed to an account, so they cannot be returned this way. "
+                            + "Raise a counter refund instead."
+                });
+
+            var location = await _db.Locations.AsNoTracking()
+                .Where(l => l.LocationId == body.LocationId)
+                .Select(l => new { l.LocationId, l.LocationName, l.IsActive, l.ExcludeFromSellable })
+                .FirstOrDefaultAsync();
+            if (location is null || !location.IsActive)
+                return BadRequest(new { message = "Pick a location that is still open, to take the goods back into." });
+
+            /* A credit note unless the operator said otherwise. */
+            var refundMethodId = body.RefundMethodId
+                ?? await _db.PaymentMethods.Where(m => m.MethodKey == "CREDIT_NOTE")
+                    .Select(m => (int?)m.MethodId).FirstOrDefaultAsync()
+                ?? 0;
+            if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == refundMethodId))
                 return BadRequest(new { message = "Pick a valid refund method." });
 
-            /* Nothing may come back that never went out, and nothing may come
-               back twice. Both checks are here rather than in the browser,
-               because the browser is where the numbers can be edited. */
-            foreach (var l in body.Lines)
-            {
-                if (l.Qty <= 0) return BadRequest(new { message = "Every line needs a quantity above zero." });
+            /* The shelf decides the condition -- see the summary above. */
+            var conditionKey = location.ExcludeFromSellable ? "DAMAGED" : "RESALABLE";
+            var condition = await _db.ReturnConditions.FirstOrDefaultAsync(c => c.ConditionKey == conditionKey)
+                         ?? await _db.ReturnConditions.FirstOrDefaultAsync();
+            if (condition is null) return BadRequest(new { message = "Return conditions are not configured." });
 
-                var sold = await _db.SalesInvoiceItems
-                    .Where(s => s.InvoiceId == body.InvoiceId && s.ProductId == l.ProductId)
-                    .SumAsync(s => (int?)s.Quantity) ?? 0;
-
-                if (sold == 0)
-                {
-                    var name = await _db.Products.Where(p => p.ProductId == l.ProductId)
-                        .Select(p => p.ProductName).FirstOrDefaultAsync();
-                    return BadRequest(new
-                    {
-                        message = $"{name ?? $"Product {l.ProductId}"} is not on invoice {inv.InvoiceNo}."
-                    });
-                }
-
-                var already = await _db.SalesReturnItems
-                    .Where(r => r.Return.InvoiceId == body.InvoiceId
-                             && r.ProductId == l.ProductId
-                             && r.Return.Status.StatusKey != "REJECTED")
-                    .SumAsync(r => (int?)r.Quantity) ?? 0;
-
-                if (already + l.Qty > sold)
-                {
-                    var name = await _db.Products.Where(p => p.ProductId == l.ProductId)
-                        .Select(p => p.ProductName).FirstOrDefaultAsync();
-                    return BadRequest(new
-                    {
-                        message = $"{name ?? $"Product {l.ProductId}"}: {sold} sold, {already} already returned. " +
-                                  $"At most {sold - already} can come back."
-                    });
-                }
-            }
-
-            var status = await _db.ReturnStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
+            var status = await _db.ReturnStatuses.FirstOrDefaultAsync(s => s.StatusKey == "POSTED");
             if (status is null) return BadRequest(new { message = "Return statuses are not configured." });
 
             var backIn = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "SALE_RETURN");
+            if (backIn is null) return BadRequest(new { message = "The SALE_RETURN movement type is not configured." });
 
             await using var tx = await _db.Database.BeginTransactionAsync();
+
+            /* ONE CUSTOMER AT A TIME. Everything below reads what has been
+               bought and what has already come back and then writes against
+               it; two returns for the same customer running side by side would
+               both read the old figure. The lock is released when the
+               transaction ends, whichever way it ends. 4242002 is this file's
+               key -- 4242001 is the SKU serial in InventoryController. */
+            await _db.Database.ExecuteSqlRawAsync(
+                "SELECT pg_advisory_xact_lock(4242002, {0})", body.CustomerId);
+
+            /* What they were billed for, in total, ever. The value is LineTotal
+               -- discount off, tax on -- so value / qty is the price actually
+               paid per piece, which is what a return credits. */
+            var bought = await _db.SalesInvoiceItems
+                .Where(l => l.Invoice.CustomerUserId == body.CustomerId)
+                .GroupBy(l => l.ProductId)
+                .Select(g => new { productId = g.Key, qty = g.Sum(x => x.Quantity), value = g.Sum(x => x.LineTotal) })
+                .ToDictionaryAsync(g => g.productId);
+
+            var backAlready = await _db.SalesReturnItems
+                .Where(l => l.Return.CustomerUserId == body.CustomerId && l.Return.Status.StatusKey != "REJECTED")
+                .GroupBy(l => l.ProductId)
+                .Select(g => new { productId = g.Key, qty = g.Sum(x => x.Quantity) })
+                .ToDictionaryAsync(g => g.productId, g => g.qty);
+
+            var names = await _db.Products.AsNoTracking()
+                .Where(p => wanted.Select(w => w.ProductId).Contains(p.ProductId))
+                .ToDictionaryAsync(p => p.ProductId, p => p.ProductName);
+
+            foreach (var l in wanted)
+            {
+                var name = names.TryGetValue(l.ProductId, out var nm) ? nm : $"Product {l.ProductId}";
+
+                if (!bought.TryGetValue(l.ProductId, out var sold) || sold.qty <= 0)
+                    return BadRequest(new
+                    {
+                        message = $"{customer.LegalName} has never been billed for {name}, so it cannot come back."
+                    });
+
+                var already = backAlready.TryGetValue(l.ProductId, out var r) ? r : 0;
+                if (already + l.Qty > sold.qty)
+                    return BadRequest(new
+                    {
+                        message = $"{name}: {sold.qty} bought, {already} already returned. " +
+                                  $"At most {sold.qty - already} can come back."
+                    });
+            }
 
             var ret = new SalesReturn
             {
                 ReturnNo = await NextNumber("SR"),
-                InvoiceId = body.InvoiceId,
-                CustomerUserId = inv.CustomerUserId,
+                /* No single invoice -- the whole point of this endpoint. */
+                InvoiceId = null,
+                CustomerUserId = body.CustomerId,
                 LocationId = body.LocationId,
-                ReturnDate = body.ReturnDate ?? Today(),
-                Reason = body.Reason.Trim(),
-                RefundMethodId = body.RefundMethodId,
+                ReturnDate = Today(),
+                Reason = string.IsNullOrWhiteSpace(body.Reason)
+                    ? "Customer return"
+                    : body.Reason.Trim(),
+                RefundMethodId = refundMethodId,
                 StatusId = status.StatusId,
-                CreatedByUserId = CurrentUserId()
+                CreatedByUserId = CurrentUserId(),
+                /* Raised and settled in one move, by somebody who is allowed to
+                   do both. Recorded so the screen does not read as though it is
+                   still waiting on a decision nobody is going to make. */
+                DecidedByUserId = CurrentUserId(),
+                DecidedAt = Now()
             };
             _db.SalesReturns.Add(ret);
             await _db.SaveChangesAsync();
 
             short n = 1;
-            decimal refund = 0;
-            foreach (var l in body.Lines)
-            {
-                var cond = await _db.ReturnConditions.FirstOrDefaultAsync(c => c.ConditionId == l.ConditionId);
-                if (cond is null) return BadRequest(new { message = "Pick a valid condition for every line." });
+            decimal credit = 0;
+            var units = 0;
 
-                var restockTo = cond.IsResalable ? (l.RestockLocationId ?? body.LocationId) : (int?)null;
-                refund += l.Qty * l.Rate;
+            foreach (var l in wanted.OrderBy(l => names.TryGetValue(l.ProductId, out var nm) ? nm : ""))
+            {
+                var sold = bought[l.ProductId];
+                var rate = sold.qty <= 0 ? 0m : Money(sold.value / sold.qty);
+                credit += Money(rate * l.Qty);
+                units += l.Qty;
 
                 _db.SalesReturnItems.Add(new SalesReturnItem
                 {
@@ -2914,18 +3382,18 @@ public class SalesController : ApiControllerBase
                     LineNo = n++,
                     ProductId = l.ProductId,
                     Quantity = l.Qty,
-                    UnitPrice = l.Rate,
-                    ConditionId = l.ConditionId,
-                    RestockLocationId = restockTo
+                    UnitPrice = rate,
+                    ConditionId = condition.ConditionId,
+                    /* Every line goes onto the chosen shelf, damaged included --
+                       the operator picked Claim Stock for those on purpose. */
+                    RestockLocationId = body.LocationId
                 });
 
-                if (restockTo is null || backIn is null) continue;
-
                 var bal = await _db.StockBalances
-                    .FirstOrDefaultAsync(s => s.ProductId == l.ProductId && s.LocationId == restockTo);
+                    .FirstOrDefaultAsync(s => s.ProductId == l.ProductId && s.LocationId == body.LocationId);
                 if (bal is null)
                 {
-                    bal = new StockBalance { ProductId = l.ProductId, LocationId = restockTo.Value, Quantity = 0 };
+                    bal = new StockBalance { ProductId = l.ProductId, LocationId = body.LocationId, Quantity = 0 };
                     _db.StockBalances.Add(bal);
                     await _db.SaveChangesAsync();
                 }
@@ -2934,7 +3402,7 @@ public class SalesController : ApiControllerBase
                 _db.StockMovements.Add(new StockMovement
                 {
                     ProductId = l.ProductId,
-                    LocationId = restockTo.Value,
+                    LocationId = body.LocationId,
                     MovementTypeId = backIn.MovementTypeId,
                     MovedAt = Now(),
                     ReferenceNo = ret.ReturnNo,
@@ -2947,7 +3415,8 @@ public class SalesController : ApiControllerBase
             await tx.CommitAsync();
 
             await Log("SALES_RETURN_CREATED", "SalesReturn", ret.ReturnNo,
-                $"{body.Lines.Count} lines, {refund:N0} against {inv.InvoiceNo}. {body.Reason.Trim()}", 2);
+                $"{wanted.Count} {(wanted.Count == 1 ? "item" : "items")}, {units} units, {credit:N0} " +
+                $"from {customer.LegalName} into {location.LocationName}. {ret.Reason}", 2);
 
             /* THE RETURN NOTE. A credit note of its own, NOT a second invoice:
                the order keeps the one bill it was billed on, and what comes
@@ -2962,14 +3431,17 @@ public class SalesController : ApiControllerBase
                return is money going back out and stock coming back in, and the
                brief asks for it by name. Accounts raise the credit note and the
                order desk looks after the shelf it lands on, so both hear it
-               too. Every copy now says who it was addressed to -- see
-               PushNotificationService.AddressedTo. */
+               too. It no longer says "needs a decision", because it does not --
+               whoever raised it was entitled to settle it. Every copy says who
+               it was addressed to -- see PushNotificationService.AddressedTo. */
             await _push.NotifyRolesAsync(
                 new[] { "super-admin", "accountant", "order-dept" },
                 NotificationKinds.ReturnRequested,
-                $"Sales return raised by {CurrentUserName()}",
-                $"{ret.ReturnNo} -- {body.Lines.Count} " +
-                $"{(body.Lines.Count == 1 ? "line" : "lines")}, PKR {refund:N0} returned against {inv.InvoiceNo}. Needs a decision.",
+                $"Sales return by {CurrentUserName()}",
+                $"{ret.ReturnNo} -- {customer.LegalName} returned {units} " +
+                $"{(units == 1 ? "unit" : "units")} across {wanted.Count} " +
+                $"{(wanted.Count == 1 ? "item" : "items")}, PKR {credit:N0} credited. " +
+                $"Stock is back at {location.LocationName}.",
                 url: $"/sales/returns/{ret.ReturnId}",
                 exceptUserId: CurrentUserId());
 
@@ -2977,12 +3449,14 @@ public class SalesController : ApiControllerBase
             {
                 id = ret.ReturnId,
                 returnNo = ret.ReturnNo,
-                totalAmount = refund,
-                invoiceNo = inv.InvoiceNo,
+                totalAmount = credit,
+                units,
+                location = location.LocationName,
+                customerName = customer.LegalName,
                 pdfUrl = note?.PdfUrl,
                 viewUrl = ReturnNoteUrl(ret.ReturnId, note?.PdfUrl, note?.Deliverable ?? false),
-                message = $"Return {ret.ReturnNo} saved as a draft, with its return note. " +
-                          "It needs approving before the refund goes out."
+                message = $"Return {ret.ReturnNo} saved. {units} {(units == 1 ? "unit is" : "units are")} " +
+                          $"back at {location.LocationName} and the credit note is ready to print."
             });
         }
         catch (Exception ex)
@@ -3727,12 +4201,19 @@ public class SalesController : ApiControllerBase
         DateOnly? InvoiceDate, DateOnly? DueDate, int MethodId,
         List<InvoiceLineRequest> Lines);
 
-    public record ReturnLineRequest(
-        int ProductId, int Qty, decimal Rate, int ConditionId, int? RestockLocationId);
+    /* A RETURN LINE IS A PRODUCT AND A QUANTITY, AND NOTHING ELSE.
+
+       It used to carry a rate, a condition and a restock location as well. All
+       three are now decided by the server: the rate is the average the customer
+       actually paid (a rate in the request is a refund the browser could set),
+       the condition follows the shelf, and the shelf is the one location the
+       whole return is taken back into. There is no date either -- it is today.
+       See CreateReturn. */
+    public record ReturnLineRequest(int ProductId, int Qty);
 
     public record ReturnRequest(
-        int InvoiceId, int LocationId, DateOnly? ReturnDate, string Reason,
-        int RefundMethodId, List<ReturnLineRequest> Lines);
+        int CustomerId, int LocationId, int? RefundMethodId, string? Reason,
+        List<ReturnLineRequest> Lines);
 
     public record ReturnDecisionRequest(string StatusKey, string? Reason);
 

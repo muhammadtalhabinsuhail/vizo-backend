@@ -486,7 +486,9 @@ public class ProductHistoryController : ApiControllerBase
                         date = x.ReturnDate,
                         status = x.Status.StatusName,
                         customer = x.CustomerUser.LegalName,
-                        invoiceNo = x.Invoice.InvoiceNo,
+                        /* Null when the return was raised against everything
+                           the customer has bought rather than one bill. */
+                        invoiceNo = x.Invoice != null ? x.Invoice.InvoiceNo : null,
                         reason = x.Reason,
                         by = x.CreatedByUser.FullName,
                         lines = x.SalesReturnItems.OrderBy(l => l.LineNo).Select(l => new
@@ -996,7 +998,8 @@ public class ProductHistoryController : ApiControllerBase
             .Select(i => new
             {
                 id = i.Return.ReturnId, no = i.Return.ReturnNo, date = i.Return.ReturnDate,
-                customer = i.Return.CustomerUser.LegalName, invoiceNo = i.Return.Invoice.InvoiceNo,
+                customer = i.Return.CustomerUser.LegalName,
+                invoiceNo = i.Return.Invoice != null ? i.Return.Invoice.InvoiceNo : null,
                 status = i.Return.Status.StatusName, by = i.Return.CreatedByUser.FullName,
                 reason = i.Return.Reason, condition = i.Condition.ConditionName, resalable = i.Condition.IsResalable,
                 back = i.RestockLocation != null ? i.RestockLocation.LocationName : null,

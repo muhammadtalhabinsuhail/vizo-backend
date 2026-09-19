@@ -800,7 +800,7 @@ public class ProductHistoryController : ApiControllerBase
             .Where(p => p.ProductId == productId)
             .Select(p => new Head(p.ProductId, p.Sku, p.ProductName, p.ImageUrl,
                 p.Category.CategoryName, p.Brand.BrandName, p.Packing,
-                p.CostPrice, p.DutyPrice, p.MarginPrice, p.SalePrice, p.CreatedAt, p.IsActive))
+                p.CostPrice, p.DutyPrice, p.SalePrice - p.CostPrice - p.DutyPrice, p.SalePrice, p.CreatedAt, p.IsActive))
             .FirstOrDefaultAsync();
 
     private static DateTime Day(DateOnly d) => d.ToDateTime(TimeOnly.MinValue);

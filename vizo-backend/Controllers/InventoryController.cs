@@ -101,7 +101,10 @@ public class InventoryController : ApiControllerBase
                     maxQty = p.MaxQty,
                     costPrice = p.CostPrice,
                     dutyPrice = p.DutyPrice,
-                    marginPrice = p.MarginPrice,
+                    /* Derived, not read from the column: SalePrice is the
+                       authority, and a row written by an older build (which
+                       leaves MarginPrice at 0) must not show a margin of 0. */
+                    marginPrice = p.SalePrice - p.CostPrice - p.DutyPrice,
                     salePrice = p.SalePrice,
                     taxRatePercent = p.TaxRatePercent,
                     hideStock = p.HideStock,
@@ -181,7 +184,7 @@ public class InventoryController : ApiControllerBase
                     maxQty = x.MaxQty,
                     costPrice = x.CostPrice,
                     dutyPrice = x.DutyPrice,
-                    marginPrice = x.MarginPrice,
+                    marginPrice = x.SalePrice - x.CostPrice - x.DutyPrice,
                     salePrice = x.SalePrice,
                     taxRatePercent = x.TaxRatePercent,
                     hideStock = x.HideStock,

@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -74,7 +74,7 @@ public class ReportsController : ApiControllerBase
                     i.DiscountAmount,
                     i.TaxAmount,
                     Location = i.Location.LocationName,
-                    Customer = i.CustomerUser.LegalName,
+                    Customer = (i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName),
                     Cost = i.SalesInvoiceItems.Sum(l => (decimal?)(l.Quantity * l.UnitCost)) ?? 0m,
                     Units = i.SalesInvoiceItems.Sum(l => (int?)l.Quantity) ?? 0
                 })
@@ -155,7 +155,7 @@ public class ReportsController : ApiControllerBase
                 .Select(i => new
                 {
                     customerId = i.CustomerUserId,
-                    customerName = i.CustomerUser.LegalName,
+                    customerName = (i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName),
                     creditDays = i.CustomerUser.CreditDays,
                     creditLimit = i.CustomerUser.CreditLimit,
                     i.InvoiceNo,
@@ -235,7 +235,7 @@ public class ReportsController : ApiControllerBase
                 .Select(i => new
                 {
                     supplierId = i.SupplierUserId,
-                    supplierName = i.SupplierUser.LegalName,
+                    supplierName = (i.SupplierUser.DisplayName ?? i.SupplierUser.LegalName),
                     creditDays = i.SupplierUser.CreditDays,
                     i.InvoiceNo,
                     i.DueDate,
@@ -444,11 +444,16 @@ public class ReportsController : ApiControllerBase
 
             var rows = await _db.SalesInvoices.AsNoTracking()
                 .Where(i => i.InvoiceDate >= start && i.InvoiceDate <= end)
-                .GroupBy(i => new { i.CustomerUserId, i.CustomerUser.LegalName, City = i.CustomerUser.City.CityName })
+                .GroupBy(i => new
+                {
+                    i.CustomerUserId,
+                    Name = i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName,
+                    City = i.CustomerUser.City.CityName
+                })
                 .Select(g => new
                 {
                     customerId = g.Key.CustomerUserId,
-                    customerName = g.Key.LegalName,
+                    customerName = g.Key.Name,
                     city = g.Key.City,
                     invoiceCount = g.Count(),
                     revenue = g.Sum(i => i.TotalAmount),
@@ -627,12 +632,20 @@ public class ReportsController : ApiControllerBase
 
             // ── by customer ────────────────────────────────────────────────
             var curByCustomer = await cur
-                .GroupBy(i => new { i.CustomerUserId, i.CustomerUser.LegalName })
-                .Select(g => new { g.Key.CustomerUserId, g.Key.LegalName, amount = g.Sum(i => i.TotalAmount), orders = g.Count() })
+                .GroupBy(i => new
+                {
+                    i.CustomerUserId,
+                    Name = i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName
+                })
+                .Select(g => new { g.Key.CustomerUserId, g.Key.Name, amount = g.Sum(i => i.TotalAmount), orders = g.Count() })
                 .ToListAsync();
             var prevByCustomer = await prev
-                .GroupBy(i => new { i.CustomerUserId, i.CustomerUser.LegalName })
-                .Select(g => new { g.Key.CustomerUserId, g.Key.LegalName, amount = g.Sum(i => i.TotalAmount), orders = g.Count() })
+                .GroupBy(i => new
+                {
+                    i.CustomerUserId,
+                    Name = i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName
+                })
+                .Select(g => new { g.Key.CustomerUserId, g.Key.Name, amount = g.Sum(i => i.TotalAmount), orders = g.Count() })
                 .ToListAsync();
 
             var customerRows = prevByCustomer
@@ -643,7 +656,7 @@ public class ReportsController : ApiControllerBase
                     return new
                     {
                         id = pv.CustomerUserId,
-                        name = pv.LegalName,
+                        name = pv.Name,
                         was = pv.amount,
                         now = nowAmt,
                         change = nowAmt - pv.amount,
@@ -915,7 +928,7 @@ public class ReportsController : ApiControllerBase
                     i.InvoiceId,
                     i.InvoiceNo,
                     i.CustomerUserId,
-                    customer = i.CustomerUser.LegalName,
+                    customer = (i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName),
                     phone = i.CustomerUser.User.Phone,
                     creditLimit = i.CustomerUser.CreditLimit,
                     creditDays = i.CustomerUser.CreditDays,
@@ -1107,7 +1120,7 @@ public class ReportsController : ApiControllerBase
                 .Select(o => new
                 {
                     o.CustomerUserId,
-                    name = o.CustomerUser.LegalName,
+                    name = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     phone = o.CustomerUser.User.Phone,
                     rep = o.CustomerUser.SalesPersonUser != null
                         ? o.CustomerUser.SalesPersonUser.User.FullName : null,
@@ -1402,7 +1415,7 @@ public class ReportsController : ApiControllerBase
             var invoiceCount = await invoices.CountAsync(ct);
 
             var topCustomers = await invoices
-                .GroupBy(i => i.CustomerUser.LegalName)
+                .GroupBy(i => (i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName))
                 .Select(g => new { name = g.Key, amount = g.Sum(x => x.TotalAmount), invoices = g.Count() })
                 .OrderByDescending(x => x.amount).Take(5).ToListAsync(ct);
 
@@ -1671,7 +1684,7 @@ public class ReportsController : ApiControllerBase
                 {
                     id = c.CollectionId,
                     receiptNo = c.ReceiptNo,
-                    customerName = c.CustomerUser.LegalName,
+                    customerName = (c.CustomerUser.DisplayName ?? c.CustomerUser.LegalName),
                     collectedBy = c.CollectedByUser.User.FullName,
                     collectedOn = c.CollectedOn,
                     amount = c.Amount,
@@ -1728,7 +1741,7 @@ public class ReportsController : ApiControllerBase
                 {
                     id = i.PiId,
                     invoiceNo = i.InvoiceNo,
-                    supplier = i.SupplierUser.LegalName,
+                    supplier = (i.SupplierUser.DisplayName ?? i.SupplierUser.LegalName),
                     dueDate = i.DueDate,
                     total = i.TotalAmount,
                     paid = i.VoucherAllocations
@@ -1848,7 +1861,7 @@ public class ReportsController : ApiControllerBase
                 {
                     id = o.OrderId,
                     orderNo = o.OrderNo,
-                    customer = o.CustomerUser.LegalName,
+                    customer = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     orderDate = o.OrderDate,
                     deliveryDate = o.DeliveryDate,
                     total = o.TotalAmount,
@@ -1885,7 +1898,7 @@ public class ReportsController : ApiControllerBase
                 {
                     id = c.ClaimId,
                     claimNo = c.ClaimNo,
-                    customer = c.CustomerUser.LegalName,
+                    customer = (c.CustomerUser.DisplayName ?? c.CustomerUser.LegalName),
                     product = c.Product.ProductName,
                     quantity = c.Quantity,
                     value = c.Quantity * c.UnitCost,
@@ -1976,7 +1989,7 @@ public class ReportsController : ApiControllerBase
                 {
                     id = o.OrderId,
                     orderNo = o.OrderNo,
-                    customer = o.CustomerUser.LegalName,
+                    customer = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     orderDate = o.OrderDate,
                     total = o.TotalAmount,
                     status = o.Status.StatusKey,
@@ -1990,7 +2003,7 @@ public class ReportsController : ApiControllerBase
                 {
                     id = o.OrderId,
                     orderNo = o.OrderNo,
-                    customer = o.CustomerUser.LegalName,
+                    customer = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     total = o.TotalAmount,
                     reason = o.CreditHoldReason
                 })
@@ -2004,7 +2017,7 @@ public class ReportsController : ApiControllerBase
                 {
                     id = c.CollectionId,
                     receiptNo = c.ReceiptNo,
-                    customer = c.CustomerUser.LegalName,
+                    customer = (c.CustomerUser.DisplayName ?? c.CustomerUser.LegalName),
                     amount = c.Amount,
                     collectedOn = c.CollectedOn
                 })

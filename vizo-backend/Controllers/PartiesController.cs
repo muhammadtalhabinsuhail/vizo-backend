@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -115,7 +115,7 @@ public class PartiesController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(p =>
-                    p.LegalName.ToLower().Contains(term) ||
+                    (p.DisplayName ?? p.LegalName).ToLower().Contains(term) ||
                     p.PartyCode.ToLower().Contains(term) ||
                     (p.DisplayName != null && p.DisplayName.ToLower().Contains(term)) ||
                     (p.User.Phone != null && p.User.Phone.Contains(term)));
@@ -124,7 +124,7 @@ public class PartiesController : ApiControllerBase
             var total = await rows.CountAsync();
 
             var items = await rows
-                .OrderBy(p => p.LegalName)
+                .OrderBy(p => (p.DisplayName ?? p.LegalName))
                 .Skip((page - 1) * pageSize)
                 .Take(pageSize)
                 .Select(p => new
@@ -134,7 +134,7 @@ public class PartiesController : ApiControllerBase
                     type = p.User.RoleId == RoleSupplier ? "SUPPLIER"
                          : p.User.RoleId == RoleBoth ? "BOTH" : "CUSTOMER",
                     legalName = p.LegalName,
-                    displayName = p.DisplayName ?? p.LegalName,
+                    displayName = p.DisplayName ?? (p.DisplayName ?? p.LegalName),
                     initials = "",
                     phone = p.User.Phone,
                     email = p.User.Email,
@@ -217,7 +217,7 @@ public class PartiesController : ApiControllerBase
                     type = x.User.RoleId == RoleSupplier ? "SUPPLIER"
                          : x.User.RoleId == RoleBoth ? "BOTH" : "CUSTOMER",
                     legalName = x.LegalName,
-                    displayName = x.DisplayName ?? x.LegalName,
+                    displayName = x.DisplayName ?? (x.DisplayName ?? x.LegalName),
                     phone = x.User.Phone,
                     altPhone = x.AltPhone,
                     email = x.User.Email,
@@ -424,7 +424,7 @@ public class PartiesController : ApiControllerBase
                 {
                     id = v.VisitId,
                     customerId = v.CustomerUserId,
-                    customerName = v.CustomerUser.LegalName,
+                    customerName = (v.CustomerUser.DisplayName ?? v.CustomerUser.LegalName),
                     visitedAt = v.VisitedAt,
                     salesPerson = v.SalesPersonUser.User.FullName,
                     outcome = v.Outcome.OutcomeKey,
@@ -456,9 +456,27 @@ public class PartiesController : ApiControllerBase
     {
         try
         {
+            var everyKind = CurrentRole() == Services.OrderWorkflow.RoleAdmin;
+
             return Ok(new
             {
+                /* WHAT A REP MAY OPEN AN ACCOUNT AS.
+
+                   Sales and accounts see Retailer, Wholesaler and Agent --
+                   the three kinds of customer this business actually sells to,
+                   and the owner's instruction. Distributor and Manufacturer
+                   stay for the Super Admin, who opens the rare account that is
+                   neither. Filtered here rather than in the screen so the list
+                   cannot be widened by editing the browser. */
                 categories = await _db.PartyCategories.AsNoTracking()
+                    /* `everyKind` is read into a local first: a method call on
+                       the controller inside a Where is not something EF can
+                       turn into SQL, and it fails at run time rather than at
+                       build time. */
+                    .Where(c => everyKind
+                             || c.CategoryKey == "RETAILER"
+                             || c.CategoryKey == "WHOLESALER"
+                             || c.CategoryKey == "AGENT")
                     .OrderBy(c => c.CategoryId)
                     .Select(c => new { id = c.CategoryId, key = c.CategoryKey, name = c.CategoryName })
                     .ToListAsync(),
@@ -794,7 +812,7 @@ public class PartiesController : ApiControllerBase
 
     private async Task<string?> ValidateParty(PartyRequest b, int? existingId)
     {
-        if (string.IsNullOrWhiteSpace(b.LegalName)) return "Legal name is required.";
+        if (string.IsNullOrWhiteSpace((b.DisplayName ?? b.LegalName))) return "Legal name is required.";
         if (b.CreditLimit < 0) return "Credit limit cannot be negative.";
         if (b.CreditDays < 0 || b.CreditDays > 365) return "Credit days must be between 0 and 365.";
 

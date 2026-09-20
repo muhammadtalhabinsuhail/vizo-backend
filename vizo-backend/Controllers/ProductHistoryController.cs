@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -376,7 +376,7 @@ public class ProductHistoryController : ApiControllerBase
                         no = x.GrnNo,
                         date = x.ReceiptDate,
                         status = x.Status.StatusName,
-                        supplier = x.SupplierUser.LegalName,
+                        supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                         location = x.Location.LocationName,
                         poNo = x.Po != null ? x.Po.PoNo : null,
                         deliveryNote = x.DeliveryNoteNo,
@@ -430,7 +430,7 @@ public class ProductHistoryController : ApiControllerBase
                         no = x.InvoiceNo,
                         date = x.InvoiceDate,
                         status = x.Status.StatusName,
-                        customer = x.IsWalkIn && x.WalkInName != null ? x.WalkInName : x.CustomerUser.LegalName,
+                        customer = x.IsWalkIn && x.WalkInName != null ? x.WalkInName : (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
                         city = x.IsWalkIn ? null : x.CustomerUser.City.CityName,
                         location = x.Location.LocationName,
                         orderNo = x.Order != null ? x.Order.OrderNo : null,
@@ -485,7 +485,7 @@ public class ProductHistoryController : ApiControllerBase
                         no = x.ReturnNo,
                         date = x.ReturnDate,
                         status = x.Status.StatusName,
-                        customer = x.CustomerUser.LegalName,
+                        customer = (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
                         /* Null when the return was raised against everything
                            the customer has bought rather than one bill. */
                         invoiceNo = x.Invoice != null ? x.Invoice.InvoiceNo : null,
@@ -535,7 +535,7 @@ public class ProductHistoryController : ApiControllerBase
                         no = x.ReturnNo,
                         date = x.ReturnDate,
                         status = x.Status.StatusName,
-                        supplier = x.SupplierUser.LegalName,
+                        supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                         invoiceNo = x.Pi.InvoiceNo,
                         location = x.Location.LocationName,
                         reason = x.Reason,
@@ -822,7 +822,7 @@ public class ProductHistoryController : ApiControllerBase
             .Select(i => new
             {
                 id = i.Po.PoId, no = i.Po.PoNo, date = i.Po.PoDate, expected = i.Po.ExpectedDate,
-                supplier = i.Po.SupplierUser.LegalName, location = i.Po.Location.LocationName,
+                supplier = (i.Po.SupplierUser.DisplayName ?? i.Po.SupplierUser.LegalName), location = i.Po.Location.LocationName,
                 status = i.Po.Status.StatusName, by = i.Po.CreatedByUser.User.FullName,
                 i.Quantity, i.UnitCost, i.LineTotal
             })
@@ -838,7 +838,7 @@ public class ProductHistoryController : ApiControllerBase
             .Select(i => new
             {
                 id = i.Grn.GrnId, no = i.Grn.GrnNo, date = i.Grn.ReceiptDate,
-                supplier = i.Grn.SupplierUser.LegalName, location = i.Grn.Location.LocationName,
+                supplier = (i.Grn.SupplierUser.DisplayName ?? i.Grn.SupplierUser.LegalName), location = i.Grn.Location.LocationName,
                 status = i.Grn.Status.StatusName, by = i.Grn.ReceivedByUser.User.FullName,
                 poNo = i.Grn.Po != null ? i.Grn.Po.PoNo : null,
                 i.QtyReceived, i.QtyDamaged, i.UnitCost, i.BatchNo
@@ -857,7 +857,7 @@ public class ProductHistoryController : ApiControllerBase
             .Select(i => new
             {
                 id = i.Pi.PiId, no = i.Pi.InvoiceNo, supplierNo = i.Pi.SupplierInvoiceNo, date = i.Pi.InvoiceDate,
-                due = i.Pi.DueDate, supplier = i.Pi.SupplierUser.LegalName, status = i.Pi.Status.StatusName,
+                due = i.Pi.DueDate, supplier = (i.Pi.SupplierUser.DisplayName ?? i.Pi.SupplierUser.LegalName), status = i.Pi.Status.StatusName,
                 by = i.Pi.CreatedByUser.User.FullName, i.Quantity, i.UnitCost, i.LineTotal
             })
             .ToListAsync();
@@ -872,7 +872,7 @@ public class ProductHistoryController : ApiControllerBase
             .Select(i => new
             {
                 id = i.Pr.PrId, no = i.Pr.ReturnNo, date = i.Pr.ReturnDate,
-                supplier = i.Pr.SupplierUser.LegalName, location = i.Pr.Location.LocationName,
+                supplier = (i.Pr.SupplierUser.DisplayName ?? i.Pr.SupplierUser.LegalName), location = i.Pr.Location.LocationName,
                 status = i.Pr.Status.StatusName, by = i.Pr.CreatedByUser.User.FullName, reason = i.Pr.Reason,
                 i.Quantity, i.UnitCost
             })
@@ -889,7 +889,7 @@ public class ProductHistoryController : ApiControllerBase
             .Select(i => new
             {
                 id = i.Order.OrderId, no = i.Order.OrderNo, date = i.Order.OrderDate,
-                customer = i.Order.CustomerUser.LegalName, city = i.Order.CustomerUser.City.CityName,
+                customer = (i.Order.CustomerUser.DisplayName ?? i.Order.CustomerUser.LegalName), city = i.Order.CustomerUser.City.CityName,
                 location = i.Order.Location.LocationName, status = i.Order.Status.StatusName,
                 rep = i.Order.SalesPersonUser != null ? i.Order.SalesPersonUser.User.FullName : i.Order.CreatedByUser.FullName,
                 i.Quantity, i.UnitPrice, i.LineTotal, i.DiscountPercent
@@ -936,7 +936,7 @@ public class ProductHistoryController : ApiControllerBase
             .Select(i => new
             {
                 id = i.Invoice.InvoiceId, no = i.Invoice.InvoiceNo, date = i.Invoice.InvoiceDate,
-                customer = i.Invoice.IsWalkIn && i.Invoice.WalkInName != null ? i.Invoice.WalkInName : i.Invoice.CustomerUser.LegalName,
+                customer = i.Invoice.IsWalkIn && i.Invoice.WalkInName != null ? i.Invoice.WalkInName : (i.Invoice.CustomerUser.DisplayName ?? i.Invoice.CustomerUser.LegalName),
                 location = i.Invoice.Location.LocationName, status = i.Invoice.Status.StatusName,
                 orderNo = i.Invoice.Order != null ? i.Invoice.Order.OrderNo : null,
                 by = i.Invoice.CreatedByUser.FullName, walkIn = i.Invoice.IsWalkIn,
@@ -998,7 +998,7 @@ public class ProductHistoryController : ApiControllerBase
             .Select(i => new
             {
                 id = i.Return.ReturnId, no = i.Return.ReturnNo, date = i.Return.ReturnDate,
-                customer = i.Return.CustomerUser.LegalName,
+                customer = (i.Return.CustomerUser.DisplayName ?? i.Return.CustomerUser.LegalName),
                 invoiceNo = i.Return.Invoice != null ? i.Return.Invoice.InvoiceNo : null,
                 status = i.Return.Status.StatusName, by = i.Return.CreatedByUser.FullName,
                 reason = i.Return.Reason, condition = i.Condition.ConditionName, resalable = i.Condition.IsResalable,
@@ -1057,7 +1057,7 @@ public class ProductHistoryController : ApiControllerBase
             .Select(c => new
             {
                 c.ClaimId, c.ClaimNo, c.ReceivedOn, c.SentOn, c.SettledOn, c.Quantity, c.UnitCost,
-                customer = c.CustomerUser.LegalName, supplier = c.SupplierUser != null ? c.SupplierUser.LegalName : null,
+                customer = (c.CustomerUser.DisplayName ?? c.CustomerUser.LegalName), supplier = c.SupplierUser != null ? (c.SupplierUser.DisplayName ?? c.SupplierUser.LegalName) : null,
                 stage = c.Stage.StageName, outcome = c.Outcome.OutcomeName, reason = c.Reason.ReasonName,
                 by = c.ReceivedByUser.User.FullName
             })

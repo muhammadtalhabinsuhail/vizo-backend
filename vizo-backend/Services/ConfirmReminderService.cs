@@ -1,4 +1,4 @@
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
 
 namespace vizo_backend.Services;
@@ -115,7 +115,7 @@ public class ConfirmReminderService : BackgroundService
            bell. */
         var names = await db.Parties.AsNoTracking()
             .Where(p => due.Select(o => o.CustomerUserId).Contains(p.UserId))
-            .ToDictionaryAsync(p => p.UserId, p => p.LegalName, ct);
+            .ToDictionaryAsync(p => p.UserId, p => (p.DisplayName ?? p.LegalName), ct);
 
         var total = due.Sum(o => o.TotalAmount);
         var oldest = due.Min(o => o.ConfirmRemindedAt ?? o.CreatedAt.ToDateTime(TimeOnly.MinValue));

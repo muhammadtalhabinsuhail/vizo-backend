@@ -256,6 +256,15 @@ public partial class AppDbContext
             entity.Property(e => e.PdfDeliverable).HasDefaultValue(false);
         });
 
+        modelBuilder.Entity<PaymentMethod>(entity =>
+        {
+            /* Whether money can come IN this way. False for every row that
+               predates the column, and set true for the owner's four by
+               database/21_order_chain_and_receiving.sql -- see
+               Models/PaymentMethod.Custom.cs. */
+            entity.Property(e => e.IsForReceiving).HasDefaultValue(false);
+        });
+
         modelBuilder.Entity<Party>(entity =>
         {
             /* Who opened the account, as opposed to which rep it is assigned

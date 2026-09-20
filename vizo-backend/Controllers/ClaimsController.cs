@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Authorization;
+﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
@@ -53,7 +53,7 @@ public class ClaimsController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(c => c.ClaimNo.ToLower().Contains(term) ||
-                                       c.CustomerUser.LegalName.ToLower().Contains(term) ||
+                                       (c.CustomerUser.DisplayName ?? c.CustomerUser.LegalName).ToLower().Contains(term) ||
                                        c.Product.ProductName.ToLower().Contains(term) ||
                                        c.Product.Sku.ToLower().Contains(term));
             }
@@ -65,7 +65,7 @@ public class ClaimsController : ApiControllerBase
                     id = c.ClaimId,
                     claimNo = c.ClaimNo,
                     customerId = c.CustomerUserId,
-                    customerName = c.CustomerUser.LegalName,
+                    customerName = (c.CustomerUser.DisplayName ?? c.CustomerUser.LegalName),
                     receivedOn = c.ReceivedOn,
                     receivedBy = c.ReceivedByUser.User.FullName,
                     productId = c.ProductId,
@@ -85,7 +85,7 @@ public class ClaimsController : ApiControllerBase
                     stageLabel = c.Stage.StageName,
                     isOpen = c.Stage.IsOpen,
                     supplierId = c.SupplierUserId,
-                    supplierName = c.SupplierUser != null ? c.SupplierUser.LegalName : null,
+                    supplierName = c.SupplierUser != null ? (c.SupplierUser.DisplayName ?? c.SupplierUser.LegalName) : null,
                     sentOn = c.SentOn,
                     settledOn = c.SettledOn,
                     supplierNote = c.SupplierNote,
@@ -137,7 +137,7 @@ public class ClaimsController : ApiControllerBase
                     id = x.ClaimId,
                     claimNo = x.ClaimNo,
                     customerId = x.CustomerUserId,
-                    customerName = x.CustomerUser.LegalName,
+                    customerName = (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
                     customerCode = x.CustomerUser.PartyCode,
                     customerPhone = x.CustomerUser.User.Phone,
                     receivedOn = x.ReceivedOn,
@@ -161,7 +161,7 @@ public class ClaimsController : ApiControllerBase
                     stageLabel = x.Stage.StageName,
                     isOpen = x.Stage.IsOpen,
                     supplierId = x.SupplierUserId,
-                    supplierName = x.SupplierUser != null ? x.SupplierUser.LegalName : null,
+                    supplierName = x.SupplierUser != null ? (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName) : null,
                     sentOn = x.SentOn,
                     settledOn = x.SettledOn,
                     supplierNote = x.SupplierNote,
@@ -554,13 +554,13 @@ public class ClaimsController : ApiControllerBase
                     .ToListAsync(),
                 suppliers = await _db.Parties.AsNoTracking()
                     .Where(p => (p.User.RoleId == 6 || p.User.RoleId == 7) && p.User.IsActive)
-                    .OrderBy(p => p.LegalName)
-                    .Select(p => new { id = p.UserId, code = p.PartyCode, name = p.LegalName })
+                    .OrderBy(p => (p.DisplayName ?? p.LegalName))
+                    .Select(p => new { id = p.UserId, code = p.PartyCode, name = (p.DisplayName ?? p.LegalName) })
                     .ToListAsync(),
                 customers = await _db.Parties.AsNoTracking()
                     .Where(p => (p.User.RoleId == 5 || p.User.RoleId == 7) && p.User.IsActive)
-                    .OrderBy(p => p.LegalName)
-                    .Select(p => new { id = p.UserId, code = p.PartyCode, name = p.LegalName })
+                    .OrderBy(p => (p.DisplayName ?? p.LegalName))
+                    .Select(p => new { id = p.UserId, code = p.PartyCode, name = (p.DisplayName ?? p.LegalName) })
                     .ToListAsync(),
                 products = await _db.Products.AsNoTracking()
                     .Where(p => p.IsActive).OrderBy(p => p.ProductName)

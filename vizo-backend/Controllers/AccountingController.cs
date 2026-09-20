@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -160,7 +160,7 @@ public class AccountingController : ApiControllerBase
                     entryType = l.Entry.EntryType.TypeName,
                     reference = l.Entry.ReferenceNo,
                     narration = l.Description ?? l.Entry.Narration,
-                    party = l.PartyUser != null ? l.PartyUser.LegalName : null,
+                    party = l.PartyUser != null ? (l.PartyUser.DisplayName ?? l.PartyUser.LegalName) : null,
                     debit = l.DebitAmount,
                     credit = l.CreditAmount
                 })
@@ -324,7 +324,7 @@ public class AccountingController : ApiControllerBase
                         accountCode = l.Account.AccountCode,
                         accountName = l.Account.AccountName,
                         partyId = l.PartyUserId,
-                        partyName = l.PartyUser != null ? l.PartyUser.LegalName : null,
+                        partyName = l.PartyUser != null ? (l.PartyUser.DisplayName ?? l.PartyUser.LegalName) : null,
                         description = l.Description,
                         debit = l.DebitAmount,
                         credit = l.CreditAmount
@@ -542,7 +542,7 @@ public class AccountingController : ApiControllerBase
                 var term = q.Trim().ToLower();
                 rows = rows.Where(v => v.VoucherNo.ToLower().Contains(term) ||
                                        v.Narration.ToLower().Contains(term) ||
-                                       (v.PartyUser != null && v.PartyUser.LegalName.ToLower().Contains(term)));
+                                       (v.PartyUser != null && (v.PartyUser.DisplayName ?? v.PartyUser.LegalName).ToLower().Contains(term)));
             }
 
             var count = await rows.CountAsync();
@@ -573,7 +573,7 @@ public class AccountingController : ApiControllerBase
                     date = v.VoucherDate,
                     location = v.Location.LocationName,
                     partyId = v.PartyUserId,
-                    partyName = v.PartyUser != null ? v.PartyUser.LegalName : null,
+                    partyName = v.PartyUser != null ? (v.PartyUser.DisplayName ?? v.PartyUser.LegalName) : null,
                     cashBankAccount = v.CashBankAccount != null ? v.CashBankAccount.AccountName : null,
                     amount = v.Amount,
                     paymentMethod = v.Method.MethodKey,
@@ -627,7 +627,7 @@ public class AccountingController : ApiControllerBase
                     locationId = x.LocationId,
                     location = x.Location.LocationName,
                     partyId = x.PartyUserId,
-                    partyName = x.PartyUser != null ? x.PartyUser.LegalName : null,
+                    partyName = x.PartyUser != null ? (x.PartyUser.DisplayName ?? x.PartyUser.LegalName) : null,
                     cashBankAccountId = x.CashBankAccountId,
                     cashBankAccount = x.CashBankAccount != null ? x.CashBankAccount.AccountName : null,
                     amount = x.Amount,
@@ -689,7 +689,7 @@ public class AccountingController : ApiControllerBase
                     id = c.CollectionId,
                     receiptNo = c.ReceiptNo,
                     customerId = c.CustomerUserId,
-                    customerName = c.CustomerUser.LegalName,
+                    customerName = (c.CustomerUser.DisplayName ?? c.CustomerUser.LegalName),
                     collectedBy = c.CollectedByUser.User.FullName,
                     collectedOn = c.CollectedOn,
                     amount = c.Amount,
@@ -1448,7 +1448,7 @@ public class AccountingController : ApiControllerBase
                     entryNo = l.Entry.EntryNo,
                     entryType = l.Entry.EntryType.TypeName,
                     description = l.Description,
-                    party = l.PartyUser != null ? l.PartyUser.LegalName : null,
+                    party = l.PartyUser != null ? (l.PartyUser.DisplayName ?? l.PartyUser.LegalName) : null,
                     /* Signed the way a bank statement reads it: money into the
                        bank account is a debit in the ledger and a credit on the
                        statement, so a positive amount means both. */
@@ -1634,6 +1634,16 @@ public class AccountingController : ApiControllerBase
                     .Where(m => m.IsActive)
                     .Select(m => new { id = m.MethodId, key = m.MethodKey, name = m.MethodName, kind = m.MethodKind })
                     .ToListAsync(),
+
+                /* Money coming IN -- a receipt voucher, a collection from a
+                   customer -- is limited to the four the business actually
+                   takes: Cash, Credit, Meezan, Faysal. Money going out keeps
+                   the whole list above. See Models/PaymentMethod.Custom.cs. */
+                receivingMethods = await _db.PaymentMethods.AsNoTracking()
+                    .Where(m => m.IsActive && m.IsForReceiving)
+                    .OrderBy(m => m.MethodId)
+                    .Select(m => new { id = m.MethodId, key = m.MethodKey, name = m.MethodName, kind = m.MethodKind })
+                    .ToListAsync(),
                 locations = await _db.Locations.AsNoTracking()
                     .Where(l => l.IsActive).OrderBy(l => l.LocationName)
                     .Select(l => new { id = l.LocationId, code = l.LocationCode, name = l.LocationName })
@@ -1647,12 +1657,12 @@ public class AccountingController : ApiControllerBase
                    should not offer suppliers and a payment should not offer
                    customers, and without this the screen cannot tell them apart. */
                 parties = await _db.Parties.AsNoTracking()
-                    .Where(p => p.User.IsActive).OrderBy(p => p.LegalName)
+                    .Where(p => p.User.IsActive).OrderBy(p => (p.DisplayName ?? p.LegalName))
                     .Select(p => new
                     {
                         id = p.UserId,
                         code = p.PartyCode,
-                        name = p.LegalName,
+                        name = (p.DisplayName ?? p.LegalName),
                         type = p.User.RoleId == 6 ? "SUPPLIER"
                              : p.User.RoleId == 7 ? "BOTH" : "CUSTOMER"
                     })
@@ -1732,7 +1742,7 @@ public class AccountingController : ApiControllerBase
                         invoiceDate = i.InvoiceDate,
                         dueDate = i.DueDate,
                         partyId = i.CustomerUserId,
-                        partyName = i.CustomerUser.LegalName,
+                        partyName = (i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName),
                         total = i.TotalAmount,
                         paid = i.VoucherAllocations
                             .Where(a => a.Voucher.Status.StatusKey == Posted)
@@ -1772,7 +1782,7 @@ public class AccountingController : ApiControllerBase
                         invoiceDate = i.InvoiceDate,
                         dueDate = i.DueDate,
                         partyId = i.SupplierUserId,
-                        partyName = i.SupplierUser.LegalName,
+                        partyName = (i.SupplierUser.DisplayName ?? i.SupplierUser.LegalName),
                         total = i.TotalAmount,
                         paid = i.VoucherAllocations
                             .Where(a => a.Voucher.Status.StatusKey == Posted)
@@ -1946,7 +1956,7 @@ public class AccountingController : ApiControllerBase
             /* -- C6 -- the rep who looks after this customer is told, because
                "have they paid yet" is a question they get asked. */
             var partyName = v.PartyUserId is null ? null : await _db.Parties.AsNoTracking()
-                .Where(pa => pa.UserId == v.PartyUserId).Select(pa => pa.LegalName).FirstOrDefaultAsync();
+                .Where(pa => pa.UserId == v.PartyUserId).Select(pa => (pa.DisplayName ?? pa.LegalName)).FirstOrDefaultAsync();
             var repId = v.PartyUserId is null ? null : await _db.Parties.AsNoTracking()
                 .Where(pa => pa.UserId == v.PartyUserId).Select(pa => pa.SalesPersonUserId).FirstOrDefaultAsync();
 

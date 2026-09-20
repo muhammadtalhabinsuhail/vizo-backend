@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Authorization;
+﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
@@ -38,21 +38,30 @@ public class DispatchController : ApiControllerBase
     //  THE QUEUE
     // ══════════════════════════════════════════════════════════════════
 
-    /// <summary>Orders that are packed and still have no delivery booked.</summary>
+    /// <summary>
+    /// Orders that have gone out and still have no courier booked against them.
+    ///
+    /// It used to read "packed": PACKED was the old pre-chain status the
+    /// retired /packing screen wrote, and migration 21 removed it along with
+    /// the three chain steps the owner took out. The queue now sits AFTER the
+    /// dispatch step rather than before it -- pressing Dispatched on the order
+    /// is what takes the stock off the shelf, and this screen is where the
+    /// bilty, the parcels and the COD are recorded once the goods are on a van.
+    /// </summary>
     [HttpGet]
     public async Task<IActionResult> GetDispatchQueue([FromQuery] int? locationId, [FromQuery] string? q)
     {
         try
         {
             var rows = _db.SalesOrders.AsNoTracking()
-                .Where(o => o.Status.StatusKey == "PACKED" && !o.Deliveries.Any());
+                .Where(o => o.Status.StatusKey == "DISPATCHED" && !o.Deliveries.Any());
 
             if (locationId is not null) rows = rows.Where(o => o.LocationId == locationId);
             if (!string.IsNullOrWhiteSpace(q))
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(o => o.OrderNo.ToLower().Contains(term) ||
-                                       o.CustomerUser.LegalName.ToLower().Contains(term));
+                                       (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName).ToLower().Contains(term));
             }
 
             var items = await rows
@@ -62,7 +71,7 @@ public class DispatchController : ApiControllerBase
                     id = o.OrderId,
                     orderNo = o.OrderNo,
                     customerId = o.CustomerUserId,
-                    customerName = o.CustomerUser.LegalName,
+                    customerName = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     customerPhone = o.CustomerUser.User.Phone,
                     address = o.CustomerUser.AddressLine,
                     city = o.CustomerUser.City.CityName,
@@ -118,7 +127,11 @@ public class DispatchController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Books a delivery for a packed order and moves it to DISPATCHED.
+    /// Books the courier for an order that has already been dispatched.
+    ///
+    /// It used to move the order to DISPATCHED itself, from the old PACKED
+    /// status. That step belongs to the chain now (and is where the stock
+    /// leaves), so this action books the delivery and leaves the status alone.
     ///
     /// The channel picked here is what later decides who may confirm arrival, so
     /// it is validated against the DeliveryChannel table rather than accepted as
@@ -137,10 +150,12 @@ public class DispatchController : ApiControllerBase
                 .FirstOrDefaultAsync(o => o.OrderId == id);
 
             if (order is null) return NotFound(new { message = $"No order with id {id}." });
-            if (order.Status.StatusKey != "PACKED")
+            if (order.Status.StatusKey != "DISPATCHED")
                 return BadRequest(new
                 {
-                    message = $"{order.OrderNo} is {order.Status.StatusName}. Only a packed order can be dispatched."
+                    message = $"{order.OrderNo} is {order.Status.StatusName}. " +
+                              "Mark the order Dispatched on the order screen first -- that is where the " +
+                              "stock comes off the shelf -- then book the courier here."
                 });
             if (order.Deliveries.Any())
                 return BadRequest(new { message = $"{order.OrderNo} already has a delivery booked." });
@@ -165,9 +180,8 @@ public class DispatchController : ApiControllerBase
                 return BadRequest(new { message = "COD cannot be negative." });
 
             var booked = await _db.DeliveryStatuses.FirstOrDefaultAsync(s => s.StatusKey == "BOOKED");
-            var dispatched = await _db.OrderStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DISPATCHED");
-            if (booked is null || dispatched is null)
-                return BadRequest(new { message = "BOOKED / DISPATCHED statuses are not configured." });
+            if (booked is null)
+                return BadRequest(new { message = "The BOOKED delivery status is not configured." });
 
             await using var tx = await _db.Database.BeginTransactionAsync();
 
@@ -197,7 +211,8 @@ public class DispatchController : ApiControllerBase
             };
             _db.Deliveries.Add(delivery);
 
-            order.StatusId = dispatched.StatusId;
+            /* The order is already DISPATCHED -- the chain moved it, and took
+               the stock with it. Nothing to change here but the paperwork. */
             await _db.SaveChangesAsync();
             await tx.CommitAsync();
 

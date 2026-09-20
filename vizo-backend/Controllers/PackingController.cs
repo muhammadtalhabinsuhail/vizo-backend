@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Authorization;
+﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
@@ -30,7 +30,35 @@ public class PackingController : ApiControllerBase
         PushNotificationService push)
         : base(db, cfg, logger, env) => _push = push;
 
-    /* The two states that mean "this needs packing". */
+    /* ═══════════════════════════════════════════════════════════════════
+       THIS SCREEN IS RETIRED -- 22 September 2026.
+
+       It was the pre-chain way of working: a queue of confirmed orders, a
+       Pack button that took the stock off the shelf and a PACKED status that
+       sat off to one side of the ten-step chain built on 3 September. The two
+       never met, which is why stock left the building through this screen and
+       through nowhere else -- an order could be invoiced, dispatched and
+       delivered through the chain without a single piece moving.
+
+       The owner shortened the chain on 22 September and asked for the stock to
+       come off at DISPATCHED, which is now where it happens
+       (SalesController.SetOrderStatus). Two screens taking the same goods off
+       the same shelf is how a count goes wrong, so this one stops:
+
+         · PROCESSING and PACKED were deleted by migration 21, so the queue
+           below is empty and Pack cannot find a status to write.
+         · The nav entry and the /packing page are gone from the front end.
+         · The endpoints are left in place, refusing politely and saying where
+           the work moved to, because a 404 tells somebody with an old tab open
+           nothing at all.
+       ═══════════════════════════════════════════════════════════════════ */
+    private const string Retired =
+        "The packing screen has been retired. Stock now comes off the shelf when the order " +
+        "is marked Dispatched, and the order screen asks which place it is going out of.";
+
+    /* The states that used to mean "this needs packing". Both are gone from
+       the database, so this matches nothing -- kept so the query still reads
+       as what it was. */
     private static readonly string[] Queue = { "CONFIRMED", "PROCESSING" };
 
     // ══════════════════════════════════════════════════════════════════
@@ -50,7 +78,7 @@ public class PackingController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(o => o.OrderNo.ToLower().Contains(term) ||
-                                       o.CustomerUser.LegalName.ToLower().Contains(term));
+                                       (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName).ToLower().Contains(term));
             }
 
             var items = await rows
@@ -60,7 +88,7 @@ public class PackingController : ApiControllerBase
                     id = o.OrderId,
                     orderNo = o.OrderNo,
                     customerId = o.CustomerUserId,
-                    customerName = o.CustomerUser.LegalName,
+                    customerName = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     city = o.CustomerUser.City.CityName,
                     locationId = o.LocationId,
                     location = o.Location.LocationName,
@@ -136,6 +164,12 @@ public class PackingController : ApiControllerBase
     [HttpPost("{id:int}/pack")]
     public async Task<IActionResult> Pack(int id)
     {
+        /* Retired -- see the note at the top of this file. Refused here rather
+           than left to fail deeper down, where it would come back as "No PACKED
+           status is configured" and read like a broken installation. */
+        return BadRequest(new { message = Retired });
+
+#pragma warning disable CS0162 // unreachable: kept as the record of what it did
         try
         {
             var order = await _db.SalesOrders
@@ -248,5 +282,6 @@ public class PackingController : ApiControllerBase
         {
             return Fail(ex, $"pack order {id}");
         }
+#pragma warning restore CS0162
     }
 }

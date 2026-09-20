@@ -1,4 +1,4 @@
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
 
 namespace vizo_backend.Documents;
@@ -84,7 +84,7 @@ public static class DocumentBuilder
                 x.TaxAmount, x.TotalAmount, x.Notes,
                 status = x.Status.StatusName,
                 location = x.Location.LocationName,
-                supplier = x.SupplierUser.LegalName,
+                supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                 supplierCode = x.SupplierUser.PartyCode,
                 supplierAddress = x.SupplierUser.AddressLine,
                 supplierCity = x.SupplierUser.City.CityName,
@@ -153,7 +153,7 @@ public static class DocumentBuilder
                 status = x.Status.StatusName,
                 method = x.Method.MethodName,
                 poNo = x.Po != null ? x.Po.PoNo : null,
-                supplier = x.SupplierUser.LegalName,
+                supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                 supplierCode = x.SupplierUser.PartyCode,
                 supplierAddress = x.SupplierUser.AddressLine,
                 supplierCity = x.SupplierUser.City.CityName,
@@ -219,7 +219,7 @@ public static class DocumentBuilder
                 status = x.Status.StatusName,
                 location = x.Location.LocationName,
                 poNo = x.Po != null ? x.Po.PoNo : null,
-                supplier = x.SupplierUser.LegalName,
+                supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                 supplierCode = x.SupplierUser.PartyCode,
                 supplierCity = x.SupplierUser.City.CityName,
                 receivedBy = x.ReceivedByUser.User.FullName,
@@ -296,7 +296,7 @@ public static class DocumentBuilder
                 status = x.Status.StatusName,
                 location = x.Location.LocationName,
                 invoiceNo = x.Pi.InvoiceNo,
-                supplier = x.SupplierUser.LegalName,
+                supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                 supplierCode = x.SupplierUser.PartyCode,
                 supplierCity = x.SupplierUser.City.CityName,
                 createdBy = x.CreatedByUser.User.FullName,
@@ -385,7 +385,7 @@ public static class DocumentBuilder
                 invoiceDate = x.Invoice != null ? (DateOnly?)x.Invoice.InvoiceDate : null,
                 orderNo = x.Invoice != null && x.Invoice.Order != null ? x.Invoice.Order.OrderNo : null,
                 refundMethod = x.RefundMethod.MethodName,
-                customer = x.CustomerUser.LegalName,
+                customer = (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
                 customerCode = x.CustomerUser.PartyCode,
                 customerAddress = x.CustomerUser.AddressLine,
                 customerCity = x.CustomerUser.City.CityName,
@@ -620,7 +620,7 @@ public static class DocumentBuilder
                 status = x.Status.StatusName,
                 method = x.Method.MethodName,
                 location = x.Location.LocationName,
-                party = x.PartyUser != null ? x.PartyUser.LegalName : null,
+                party = x.PartyUser != null ? (x.PartyUser.DisplayName ?? x.PartyUser.LegalName) : null,
                 partyCode = x.PartyUser != null ? x.PartyUser.PartyCode : null,
                 partyCity = x.PartyUser != null ? x.PartyUser.City.CityName : null,
                 account = x.CashBankAccount != null ? x.CashBankAccount.AccountName : null,
@@ -706,7 +706,7 @@ public static class DocumentBuilder
                     l.LineNo,
                     code = l.Account.AccountCode,
                     account = l.Account.AccountName,
-                    party = l.PartyUser != null ? l.PartyUser.LegalName : null,
+                    party = l.PartyUser != null ? (l.PartyUser.DisplayName ?? l.PartyUser.LegalName) : null,
                     l.Description, l.DebitAmount, l.CreditAmount
                 }).ToList()
             })
@@ -834,7 +834,8 @@ public static class DocumentBuilder
             .Where(x => x.UserId == partyId)
             .Select(x => new
             {
-                x.PartyCode, x.LegalName, x.AddressLine, x.CreditLimit, x.CreditDays, x.OpeningBalance,
+                x.PartyCode, x.LegalName, display = x.DisplayName ?? x.LegalName,
+                x.AddressLine, x.CreditLimit, x.CreditDays, x.OpeningBalance,
                 city = x.City.CityName,
                 phone = x.User.Phone,
                 ntn = x.Ntn
@@ -910,7 +911,7 @@ public static class DocumentBuilder
             Title: "Account Statement",
             DocNo: p.PartyCode,
             StatusName: null,
-            Counterparty: new DocumentPdf.Party("Statement For", p.LegalName, Lines(
+            Counterparty: new DocumentPdf.Party("Statement For", p.display, Lines(
                 p.PartyCode, p.AddressLine, p.city,
                 p.phone is null ? null : $"Phone {p.phone}",
                 p.ntn is null ? null : $"NTN {p.ntn}")),

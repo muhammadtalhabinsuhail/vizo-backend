@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -58,7 +58,7 @@ public class PurchasesController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(p => p.PoNo.ToLower().Contains(term) ||
-                                       p.SupplierUser.LegalName.ToLower().Contains(term));
+                                       (p.SupplierUser.DisplayName ?? p.SupplierUser.LegalName).ToLower().Contains(term));
             }
 
             var items = await rows
@@ -68,7 +68,7 @@ public class PurchasesController : ApiControllerBase
                     id = p.PoId,
                     poNo = p.PoNo,
                     supplierId = p.SupplierUserId,
-                    supplierName = p.SupplierUser.LegalName,
+                    supplierName = (p.SupplierUser.DisplayName ?? p.SupplierUser.LegalName),
                     location = p.Location.LocationName,
                     poDate = p.PoDate,
                     expectedDate = p.ExpectedDate,
@@ -118,7 +118,7 @@ public class PurchasesController : ApiControllerBase
                     id = x.PoId,
                     poNo = x.PoNo,
                     supplierId = x.SupplierUserId,
-                    supplierName = x.SupplierUser.LegalName,
+                    supplierName = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                     supplierCode = x.SupplierUser.PartyCode,
                     supplierPhone = x.SupplierUser.User.Phone,
                     locationId = x.LocationId,
@@ -261,7 +261,7 @@ public class PurchasesController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(g => g.GrnNo.ToLower().Contains(term) ||
-                                       g.SupplierUser.LegalName.ToLower().Contains(term));
+                                       (g.SupplierUser.DisplayName ?? g.SupplierUser.LegalName).ToLower().Contains(term));
             }
 
             var items = await rows
@@ -273,7 +273,7 @@ public class PurchasesController : ApiControllerBase
                     poId = g.PoId,
                     poNo = g.Po != null ? g.Po.PoNo : null,
                     supplierId = g.SupplierUserId,
-                    supplierName = g.SupplierUser.LegalName,
+                    supplierName = (g.SupplierUser.DisplayName ?? g.SupplierUser.LegalName),
                     location = g.Location.LocationName,
                     receiptDate = g.ReceiptDate,
                     deliveryNoteNo = g.DeliveryNoteNo,
@@ -342,7 +342,7 @@ public class PurchasesController : ApiControllerBase
                     poId = x.PoId,
                     poNo = x.Po != null ? x.Po.PoNo : null,
                     supplierId = x.SupplierUserId,
-                    supplierName = x.SupplierUser.LegalName,
+                    supplierName = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                     locationId = x.LocationId,
                     location = x.Location.LocationName,
                     receiptDate = x.ReceiptDate,
@@ -403,7 +403,7 @@ public class PurchasesController : ApiControllerBase
                 var term = q.Trim().ToLower();
                 rows = rows.Where(i => i.InvoiceNo.ToLower().Contains(term) ||
                                        i.SupplierInvoiceNo.ToLower().Contains(term) ||
-                                       i.SupplierUser.LegalName.ToLower().Contains(term));
+                                       (i.SupplierUser.DisplayName ?? i.SupplierUser.LegalName).ToLower().Contains(term));
             }
 
             var items = await rows
@@ -414,7 +414,7 @@ public class PurchasesController : ApiControllerBase
                     invoiceNo = i.InvoiceNo,
                     supplierInvoiceNo = i.SupplierInvoiceNo,
                     supplierId = i.SupplierUserId,
-                    supplierName = i.SupplierUser.LegalName,
+                    supplierName = (i.SupplierUser.DisplayName ?? i.SupplierUser.LegalName),
                     poId = i.PoId,
                     poNo = i.Po != null ? i.Po.PoNo : null,
                     invoiceDate = i.InvoiceDate,
@@ -464,7 +464,7 @@ public class PurchasesController : ApiControllerBase
                     invoiceNo = x.InvoiceNo,
                     supplierInvoiceNo = x.SupplierInvoiceNo,
                     supplierId = x.SupplierUserId,
-                    supplierName = x.SupplierUser.LegalName,
+                    supplierName = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                     supplierCode = x.SupplierUser.PartyCode,
                     poId = x.PoId,
                     poNo = x.Po != null ? x.Po.PoNo : null,
@@ -534,7 +534,7 @@ public class PurchasesController : ApiControllerBase
                     invoiceNo = i.InvoiceNo,
                     supplierInvoiceNo = i.SupplierInvoiceNo,
                     supplierId = i.SupplierUserId,
-                    supplierName = i.SupplierUser.LegalName,
+                    supplierName = (i.SupplierUser.DisplayName ?? i.SupplierUser.LegalName),
                     invoiceDate = i.InvoiceDate,
                     dueDate = i.DueDate,
                     total = i.TotalAmount,
@@ -589,7 +589,7 @@ public class PurchasesController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(r => r.ReturnNo.ToLower().Contains(term) ||
-                                       r.SupplierUser.LegalName.ToLower().Contains(term));
+                                       (r.SupplierUser.DisplayName ?? r.SupplierUser.LegalName).ToLower().Contains(term));
             }
 
             var items = await rows
@@ -601,7 +601,7 @@ public class PurchasesController : ApiControllerBase
                     piId = r.PiId,
                     invoiceNo = r.Pi.InvoiceNo,
                     supplierId = r.SupplierUserId,
-                    supplierName = r.SupplierUser.LegalName,
+                    supplierName = (r.SupplierUser.DisplayName ?? r.SupplierUser.LegalName),
                     location = r.Location.LocationName,
                     returnDate = r.ReturnDate,
                     reason = r.Reason,
@@ -641,7 +641,7 @@ public class PurchasesController : ApiControllerBase
                     piId = x.PiId,
                     invoiceNo = x.Pi.InvoiceNo,
                     supplierId = x.SupplierUserId,
-                    supplierName = x.SupplierUser.LegalName,
+                    supplierName = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                     location = x.Location.LocationName,
                     returnDate = x.ReturnDate,
                     reason = x.Reason,
@@ -692,8 +692,8 @@ public class PurchasesController : ApiControllerBase
             {
                 suppliers = await _db.Parties.AsNoTracking()
                     .Where(p => (p.User.RoleId == 6 || p.User.RoleId == 7) && p.User.IsActive)
-                    .OrderBy(p => p.LegalName)
-                    .Select(p => new { id = p.UserId, code = p.PartyCode, name = p.LegalName })
+                    .OrderBy(p => (p.DisplayName ?? p.LegalName))
+                    .Select(p => new { id = p.UserId, code = p.PartyCode, name = (p.DisplayName ?? p.LegalName) })
                     .ToListAsync(),
                 locations = await _db.Locations.AsNoTracking()
                     .Where(l => l.IsActive).OrderBy(l => l.LocationName)

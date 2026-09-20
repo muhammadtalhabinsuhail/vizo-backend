@@ -1,4 +1,4 @@
-namespace vizo_backend.Services;
+﻿namespace vizo_backend.Services;
 
 /// <summary>
 /// The order lifecycle, and who is allowed to move it.
@@ -8,16 +8,26 @@ namespace vizo_backend.Services;
 ///   1  DRAFT                    sales writes it
 ///   2  SUBMITTED                sales sends it in           -> admin must decide
 ///   3  CONFIRMED                admin says yes              (or DECLINED)
-///   4  INVOICED                 sales OR admin bills it
-///   5  SEEN_BY_WAREHOUSE        warehouse keeper has picked it up
-///   6  TO_ORDER_DEPT            warehouse keeper has the stock moving
-///   7  AT_ORDER_DEPT            order dept has it in hand
-///   8  PACKAGING                order dept is packing it
-///   9  DISPATCHED               order dept sends it out
-///  10  DELIVERED                sales confirms it arrived
+///   4  INVOICED                 accounts bills it           ("Invoiced/Edit")
+///   5  AT_ORDER_DEPT            order dept is working on it ("Processing in
+///                               Order Dept")
+///   6  DISPATCHED               it leaves -- AND THE STOCK LEAVES WITH IT
+///   7  DELIVERED                sales confirms it arrived
 ///
-/// The warehouse keeper's two steps -- 5 and 6 -- open only once the order is
-/// INVOICED, and they are the only two moves that role will ever be offered.
+/// SEVEN STEPS, NOT TEN. "Seen by Warehouse", "On way to Order Dept" and
+/// "Packaging" were removed on 22 September at the owner's instruction: three
+/// separate presses that said nothing the one before them had not already
+/// said, and the orders sitting in them had been there for days. The two
+/// warehouse steps went with them, so the warehouse keeper no longer moves an
+/// order at all -- /warehouse is a picking list to read, not a queue to click
+/// through.
+///
+/// DISPATCHED IS WHERE THE STOCK COMES OFF THE SHELF. Nothing in the chain used
+/// to move stock at any step (the old /packing screen did, on its own status,
+/// off to one side), so everything sold through the chain was still counted as
+/// being on a shelf. Now the person dispatching is asked WHICH place it is
+/// going out of, and that place is what the goods are taken from -- see
+/// SalesController.SetOrderStatus.
 ///
 /// ─────────────────────────── AND WHO MOVES IT ──────────────────────────────
 ///
@@ -38,10 +48,10 @@ public static class OrderWorkflow
     public const string Confirmed    = "CONFIRMED";
     public const string Declined     = "DECLINED";
     public const string Invoiced     = "INVOICED";
-    public const string SeenByWarehouse = "SEEN_BY_WAREHOUSE";
-    public const string ToOrderDept  = "TO_ORDER_DEPT";
+    /* The key is unchanged -- every row in "SalesOrder" and every line of
+       history points at it. Only the words people read changed: it is
+       "Processing in Order Dept" now (migration 21). */
     public const string AtOrderDept  = "AT_ORDER_DEPT";
-    public const string Packaging    = "PACKAGING";
     public const string Dispatched   = "DISPATCHED";
     public const string Delivered    = "DELIVERED";
 
@@ -58,8 +68,7 @@ public static class OrderWorkflow
     /// <summary>The chain, in order. Step number is index + 1.</summary>
     public static readonly IReadOnlyList<string> Chain = new[]
     {
-        Draft, Submitted, Confirmed, Invoiced, SeenByWarehouse,
-        ToOrderDept, AtOrderDept, Packaging, Dispatched, Delivered
+        Draft, Submitted, Confirmed, Invoiced, AtOrderDept, Dispatched, Delivered
     };
 
     /// <summary>Where a status sits in the chain, or null if it is off it.</summary>
@@ -106,22 +115,18 @@ public static class OrderWorkflow
            whatever the order says once they are done with it. */
         (Confirmed,   Invoiced,    new[] { RoleAccountant }),
 
-        /* The warehouse keeper, and ONLY after the order has been invoiced.
-           Two moves, in order: acknowledge it, then send it. That is the whole
-           of what this role may do to an order -- AllowedTargets returns these
-           and nothing else, and the screen offers nothing else because it asks
-           this table rather than deciding for itself.
+        /* The order department takes it from the invoice, and there is one
+           step in between rather than four. Deliberately NOT from CONFIRMED:
+           picking stock against an order the office has not yet billed is how
+           goods leave with no invoice behind them. */
+        (Invoiced,    AtOrderDept, new[] { RoleOrderDept }),
 
-           Deliberately NOT from CONFIRMED. Picking stock against an order the
-           office has not yet billed is how goods leave without an invoice
-           behind them. */
-        (Invoiced,        SeenByWarehouse, new[] { RoleWarehouse }),
-        (SeenByWarehouse, ToOrderDept,     new[] { RoleWarehouse }),
-
-        // The order department takes it from there.
-        (ToOrderDept, AtOrderDept, new[] { RoleOrderDept }),
-        (AtOrderDept, Packaging,   new[] { RoleOrderDept }),
-        (Packaging,   Dispatched,  new[] { RoleOrderDept }),
+        /* SENDING IT OUT. The owner named three roles for this one, because it
+           is the step that takes the stock off the shelf and somebody has to be
+           able to do it when the order desk is out: "accountant role and order
+           department role and super admin role". Whoever presses it is asked
+           which place it is going out of. */
+        (AtOrderDept, Dispatched,  new[] { RoleOrderDept, RoleAccountant }),
 
         // Sales confirms the customer actually got it -- they are the one who
         // will hear about it if the customer did not.
@@ -215,6 +220,16 @@ public static class OrderWorkflow
         roleKey is RoleAdmin or RoleAccountant;
 
     /// <summary>
+    /// May this role send an order out -- and therefore take the stock off a
+    /// shelf? The owner's three: the order desk, accounts and the owner.
+    ///
+    /// Asked by the status endpoint before it moves anything, and by the screen
+    /// before it draws the "where is this going out of?" dialog.
+    /// </summary>
+    public static bool MayDispatch(string roleKey) =>
+        roleKey is RoleAdmin or RoleAccountant or RoleOrderDept;
+
+    /// <summary>
     /// May this role change an order's lines and prices as it stands, with no
     /// approved change request behind them?
     ///
@@ -251,10 +266,10 @@ public static class OrderWorkflow
                    cannot do: their first move opens at Invoiced, and the
                    invoice is now the back office's to cut. So the accountant is
                    on this list, and the words say what is actually waited on.
-                   The keeper is kept on it as a heads-up -- knowing an order is
-                   coming is worth something even when there is nothing to
-                   press yet. */
-                new[] { RoleAdmin, RoleAccountant, RoleWarehouse, RoleSales },
+                   The order desk and the keeper are kept on it as a heads-up --
+                   knowing an order is coming is worth something even when there
+                   is nothing to press yet. */
+                new[] { RoleAdmin, RoleAccountant, RoleOrderDept, RoleWarehouse, RoleSales },
                 $"Order confirmed by {actor}",
                 $"{orderNo} -- {customer}. Waiting for accounts to invoice it."),
 
@@ -265,43 +280,26 @@ public static class OrderWorkflow
 
             /* The owner asked to be told, and so does the accountant who did it
                (their copy is suppressed by exceptUserId, so this reaches the
-               other one). The keeper is here because THIS is the step that puts
-               the order in their queue -- the invoice is cut and the stock can
-               be picked. */
+               other one). The order desk and the warehouse are both here
+               because this is the step that puts the order in front of them --
+               the invoice is cut and the stock can be picked. */
             Invoiced => (NotificationKinds.InvoiceRaised,
-                new[] { RoleAdmin, RoleAccountant, RoleWarehouse },
+                new[] { RoleAdmin, RoleAccountant, RoleOrderDept, RoleWarehouse },
                 $"Order invoiced by {actor}",
-                $"{orderNo} -- {customer} has been invoiced. The warehouse can pick it."),
+                $"{orderNo} -- {customer} has been invoiced. The order department can pick it."),
 
-            /* The keeper has the order in hand. The owner wants to know work
-               has started; the rep wants to be able to tell the customer. The
-               rep is added by the caller through alsoUserIds. */
-            SeenByWarehouse => (NotificationKinds.OrderPacked,
-                new[] { RoleAdmin },
-                $"Order picked up by {actor}",
-                $"{orderNo} -- {customer}. The warehouse has it and is preparing the stock."),
-
-            /* This one the ORDER DEPARTMENT needs, because it is the moment
-               something starts heading towards them. */
-            ToOrderDept => (NotificationKinds.TransferSent,
-                new[] { RoleAdmin, RoleOrderDept },
-                $"Stock sent by {actor}",
-                $"{orderNo} -- {customer}. Stock is on its way to the order department."),
-
-            AtOrderDept => (NotificationKinds.TransferReceived,
-                new[] { RoleAdmin, RoleWarehouse },
-                $"Stock received by {actor}",
-                $"{orderNo} -- {customer}. The order department has the stock."),
-
-            Packaging => (NotificationKinds.OrderPacked,
+            /* The order desk has it and is working on it. The rep wants to be
+               able to tell the customer; the rep is added by the caller through
+               alsoUserIds. */
+            AtOrderDept => (NotificationKinds.OrderPacked,
                 new[] { RoleAdmin, RoleSales },
-                $"Packing started by {actor}",
-                $"{orderNo} -- {customer} is being packed."),
+                $"Order taken up by {actor}",
+                $"{orderNo} -- {customer} is being processed in the order department."),
 
             Dispatched => (NotificationKinds.OrderDispatched,
                 new[] { RoleAdmin, RoleSales, RoleAccountant },
                 $"Order dispatched by {actor}",
-                $"{orderNo} -- {customer} has left."),
+                $"{orderNo} -- {customer} has left, and the stock is off the shelf."),
 
             Delivered => (NotificationKinds.OrderDelivered,
                 new[] { RoleAdmin, RoleAccountant },

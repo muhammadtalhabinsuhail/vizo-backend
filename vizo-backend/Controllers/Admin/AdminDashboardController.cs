@@ -1,4 +1,4 @@
-using System.Security.Claims;
+﻿using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -90,7 +90,7 @@ public class AdminDashboardController : AdminControllerBase
                 {
                     id = o.OrderId,
                     orderNo = o.OrderNo,
-                    customerName = o.CustomerUser.LegalName,
+                    customerName = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     customerInitials = "",
                     salesPerson = o.SalesPersonUser != null ? o.SalesPersonUser.User.FullName : "-",
                     total = o.TotalAmount,
@@ -151,7 +151,7 @@ public class AdminDashboardController : AdminControllerBase
                        says "several orders" for those. */
                     invoiceNo = r.Invoice != null ? r.Invoice.InvoiceNo : null,
                     orderNo = r.Invoice != null && r.Invoice.Order != null ? r.Invoice.Order.OrderNo : null,
-                    customerName = r.CustomerUser.LegalName,
+                    customerName = (r.CustomerUser.DisplayName ?? r.CustomerUser.LegalName),
                     raisedBy = r.CreatedByUser.FullName,
                     returnDate = r.ReturnDate,
                     status = r.Status.StatusKey,

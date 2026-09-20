@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Authorization;
+﻿using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using vizo_backend.Models;
@@ -52,7 +52,7 @@ public class DeliveryController : ApiControllerBase
                 var term = q.Trim().ToLower();
                 rows = rows.Where(d => d.DeliveryNo.ToLower().Contains(term) ||
                                        (d.TrackingNo != null && d.TrackingNo.ToLower().Contains(term)) ||
-                                       d.Order.CustomerUser.LegalName.ToLower().Contains(term));
+                                       (d.Order.CustomerUser.DisplayName ?? d.Order.CustomerUser.LegalName).ToLower().Contains(term));
             }
 
             var items = await rows
@@ -66,7 +66,7 @@ public class DeliveryController : ApiControllerBase
                     invoiceId = d.InvoiceId,
                     invoiceNo = d.Invoice != null ? d.Invoice.InvoiceNo : null,
                     customerId = d.Order.CustomerUserId,
-                    customerName = d.Order.CustomerUser.LegalName,
+                    customerName = (d.Order.CustomerUser.DisplayName ?? d.Order.CustomerUser.LegalName),
                     customerPhone = d.Order.CustomerUser.User.Phone,
                     destination = d.Order.CustomerUser.City.CityName,
                     channelId = d.ChannelId,

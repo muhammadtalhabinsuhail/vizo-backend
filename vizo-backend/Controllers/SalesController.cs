@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Authorization;
@@ -87,7 +87,7 @@ public class SalesController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(o => o.OrderNo.ToLower().Contains(term) ||
-                                       o.CustomerUser.LegalName.ToLower().Contains(term));
+                                       (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName).ToLower().Contains(term));
             }
 
             var total = await rows.CountAsync();
@@ -100,7 +100,7 @@ public class SalesController : ApiControllerBase
                     id = o.OrderId,
                     orderNo = o.OrderNo,
                     customerId = o.CustomerUserId,
-                    customerName = o.CustomerUser.LegalName,
+                    customerName = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     customerType = o.CustomerUser.Category.CategoryName,
                     city = o.CustomerUser.City.CityName,
                     location = o.Location.LocationName,
@@ -256,7 +256,7 @@ public class SalesController : ApiControllerBase
                     id = x.OrderId,
                     orderNo = x.OrderNo,
                     customerId = x.CustomerUserId,
-                    customerName = x.CustomerUser.LegalName,
+                    customerName = (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
                     customerCode = x.CustomerUser.PartyCode,
                     customerPhone = x.CustomerUser.User.Phone,
                     customerAltPhone = x.CustomerUser.AltPhone,
@@ -518,7 +518,7 @@ public class SalesController : ApiControllerBase
                that buzzes a phone. */
             var customerName = await _db.Parties.AsNoTracking()
                 .Where(pa => pa.UserId == order.CustomerUserId)
-                .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
+                .Select(pa => (pa.DisplayName ?? pa.LegalName)).FirstOrDefaultAsync() ?? "a customer";
             var takenBy = CurrentUserName();
 
             if (overLimit)
@@ -604,7 +604,8 @@ public class SalesController : ApiControllerBase
             !await _db.Parties.AnyAsync(p => p.UserId == body.CustomerId
                                           && (p.CreatedByUserId == onlyMine || p.SalesPersonUserId == onlyMine)))
             return "That customer is not yours. You can only sell to accounts you opened or have been assigned.";
-        if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
+        if (body.LocationId is int wantedPlace &&
+            !await _db.Locations.AnyAsync(l => l.LocationId == wantedPlace))
             return "Pick a valid location.";
         if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
             return "Pick a valid payment method.";
@@ -624,6 +625,23 @@ public class SalesController : ApiControllerBase
         return null;
     }
 
+    /// <summary>
+    /// Where an order sits before anybody has said which place it is going out
+    /// of: the location marked default, or the first active one if nobody has
+    /// marked any. Never the claim shelf.
+    ///
+    /// This exists because "Selling from" came off the order form. The column
+    /// is NOT NULL and every screen joins to it, so the row still needs a
+    /// place; dispatch overwrites it with the true one.
+    /// </summary>
+    private async Task<int> DefaultLocationId() =>
+        await _db.Locations.AsNoTracking()
+            .Where(l => l.IsActive && !l.ExcludeFromSellable)
+            .OrderByDescending(l => l.IsDefault)
+            .ThenBy(l => l.LocationId)
+            .Select(l => l.LocationId)
+            .FirstAsync();
+
     private async Task<SalesOrder> SaveOrder(OrderRequest body, int statusId,
         decimal subtotal, decimal discount, decimal tax, decimal total, string? holdReason)
     {
@@ -634,8 +652,17 @@ public class SalesController : ApiControllerBase
             /* "ORD", not "SO" -- see the class comment. */
             OrderNo = await NextNumber("ORD"),
             CustomerUserId = body.CustomerId,
-            LocationId = body.LocationId,
-            SalesPersonUserId = body.SalesPersonUserId ?? await CurrentEmployeeId(),
+            /* Somewhere to hang the order until dispatch names the real place.
+               The company default (Karachi Order Department) rather than a
+               guess, and every screen that shows it says "not dispatched yet"
+               until it changes. */
+            LocationId = body.LocationId ?? await DefaultLocationId(),
+            /* ALWAYS THE PERSON SIGNED IN. The form's "Sales rep" dropdown is
+               gone, and a value sent by anything else is ignored: the owner's
+               rule is that the order belongs to whoever wrote it, and accounts
+               and the owner read that name off the order to know whose customer
+               it is. */
+            SalesPersonUserId = await CurrentEmployeeId(),
             OrderDate = body.OrderDate ?? Today(),
             DeliveryDate = body.DeliveryDate,
             StatusId = statusId,
@@ -963,7 +990,10 @@ public class SalesController : ApiControllerBase
             await using var tx = await _db.Database.BeginTransactionAsync();
 
             order.CustomerUserId = body.CustomerId;
-            order.LocationId = body.LocationId;
+            /* An edit does not move the goods. The place is set when the order
+               is dispatched and left alone here unless the caller really means
+               to change it. */
+            order.LocationId = body.LocationId ?? order.LocationId;
             order.DeliveryDate = body.DeliveryDate;
             order.MethodId = body.MethodId;
             order.Notes = body.Notes;
@@ -1004,7 +1034,7 @@ public class SalesController : ApiControllerBase
             if (invoice is not null)
             {
                 invoice.CustomerUserId = body.CustomerId;
-                invoice.LocationId = body.LocationId;
+                invoice.LocationId = body.LocationId ?? order.LocationId;
                 invoice.MethodId = body.MethodId;
                 invoice.Subtotal = subtotal;
                 invoice.DiscountAmount = discount;
@@ -1055,7 +1085,7 @@ public class SalesController : ApiControllerBase
 
             var custName = await _db.Parties.AsNoTracking()
                 .Where(pa => pa.UserId == order.CustomerUserId)
-                .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
+                .Select(pa => (pa.DisplayName ?? pa.LegalName)).FirstOrDefaultAsync() ?? "a customer";
 
             await _push.NotifyRolesAsync(
                 new[] { "super-admin", "accountant" },
@@ -1127,7 +1157,7 @@ public class SalesController : ApiControllerBase
             var no = order.OrderNo;
             var custName = await _db.Parties.AsNoTracking()
                 .Where(pa => pa.UserId == order.CustomerUserId)
-                .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
+                .Select(pa => (pa.DisplayName ?? pa.LegalName)).FirstOrDefaultAsync() ?? "a customer";
             var repId = order.SalesPersonUserId;
 
             await using var tx = await _db.Database.BeginTransactionAsync();
@@ -1178,7 +1208,11 @@ public class SalesController : ApiControllerBase
 
             var order = await _db.SalesOrders.AsNoTracking()
                 .Where(o => o.OrderId == id)
-                .Select(o => new { o.OrderNo, o.SalesPersonUserId, o.CustomerUser.LegalName, o.TotalAmount })
+                .Select(o => new
+                {
+                    o.OrderNo, o.SalesPersonUserId, o.TotalAmount,
+                    customerName = o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName
+                })
                 .FirstOrDefaultAsync();
             if (order is null) return NotFound(new { message = $"No order with id {id}." });
 
@@ -1210,7 +1244,7 @@ public class SalesController : ApiControllerBase
                 NotificationKinds.OrderCreated,
                 $"Permission asked by {CurrentUserName()}",
                 $"{CurrentUserName(false)} wants to {kind.ToLowerInvariant()} {order.OrderNo} "
-                    + $"({order.LegalName}, PKR {order.TotalAmount:N0}). Reason: {body.Reason.Trim()}",
+                    + $"({order.customerName}, PKR {order.TotalAmount:N0}). Reason: {body.Reason.Trim()}",
                 url: "/dashboard",
                 severe: true);
 
@@ -1239,7 +1273,7 @@ public class SalesController : ApiControllerBase
                     id = r.RequestId,
                     orderId = r.OrderId,
                     orderNo = r.Order.OrderNo,
-                    customer = r.Order.CustomerUser.LegalName,
+                    customer = (r.Order.CustomerUser.DisplayName ?? r.Order.CustomerUser.LegalName),
                     total = r.Order.TotalAmount,
                     orderStatus = r.Order.Status.StatusName,
                     kind = r.Kind,
@@ -1412,6 +1446,93 @@ public class SalesController : ApiControllerBase
                     message = "This order has already been invoiced. Raise a sales return instead of cancelling it."
                 });
 
+            /* ─────────── DISPATCHED IS WHERE THE STOCK LEAVES ───────────────
+
+               Until 22 September nothing in the chain ever moved stock: an
+               order could be invoiced, dispatched and delivered and the shelf
+               count would not have changed by a single piece. 26 of 31 order
+               invoices were in that state, which is why Stock in Hand read
+               high and the low-stock warnings fired late.
+
+               So this step asks the one question the chain never asked -- WHICH
+               PLACE is it going out of -- and takes the goods off that shelf.
+               The place is not a detail: the same order could be served out of
+               Karachi or Lahore, and guessing would move stock that never
+               existed at one end and leave it sitting at the other.
+
+               Claim Stock can never be the answer. It is the damaged shelf, and
+               nothing is sold off it (ExcludeFromSellable).                   */
+            var dispatchLines = new List<SalesOrderItem>();
+            Location? dispatchFrom = null;
+
+            if (status.StatusKey == OrderWorkflow.Dispatched &&
+                current.StatusKey != OrderWorkflow.Dispatched)
+            {
+                if (!OrderWorkflow.MayDispatch(role))
+                    return StatusCode(403, new
+                    {
+                        message = "Only the order department, the accountant or the Super Admin can dispatch an order."
+                    });
+
+                if (body.LocationId is null)
+                    return BadRequest(new
+                    {
+                        message = "Say which place this order is going out of before dispatching it.",
+                        needsLocation = true
+                    });
+
+                dispatchFrom = await _db.Locations
+                    .FirstOrDefaultAsync(l => l.LocationId == body.LocationId);
+
+                if (dispatchFrom is null || !dispatchFrom.IsActive)
+                    return BadRequest(new { message = "Pick a place that is still open." });
+                if (dispatchFrom.ExcludeFromSellable)
+                    return BadRequest(new
+                    {
+                        message = $"{dispatchFrom.LocationName} holds goods that are not for sale. " +
+                                  "Dispatch from a warehouse, an order department or a shop."
+                    });
+
+                dispatchLines = await _db.SalesOrderItems
+                    .Where(l => l.OrderId == id).ToListAsync();
+
+                if (dispatchLines.Count == 0)
+                    return BadRequest(new { message = $"{order.OrderNo} has no lines, so there is nothing to send." });
+
+                /* CHECK EVERY LINE BEFORE MOVING ANY OF THEM, so a short line
+                   on row five does not leave rows one to four already taken off
+                   the shelf and the order half-dispatched. */
+                var shortages = new List<object>();
+                foreach (var want in dispatchLines)
+                {
+                    var onHand = await _db.StockBalances
+                        .Where(s => s.ProductId == want.ProductId && s.LocationId == dispatchFrom.LocationId)
+                        .Select(s => (int?)s.Quantity).FirstOrDefaultAsync() ?? 0;
+
+                    if (onHand < want.Quantity)
+                    {
+                        var p = await _db.Products.AsNoTracking()
+                            .FirstOrDefaultAsync(x => x.ProductId == want.ProductId);
+                        shortages.Add(new
+                        {
+                            sku = p?.Sku,
+                            name = p?.ProductName ?? $"Product {want.ProductId}",
+                            needed = want.Quantity,
+                            onHand,
+                            shortBy = want.Quantity - onHand
+                        });
+                    }
+                }
+
+                if (shortages.Count > 0)
+                    return BadRequest(new
+                    {
+                        message = $"{dispatchFrom.LocationName} is short on {shortages.Count} " +
+                                  $"{(shortages.Count == 1 ? "item" : "items")}, so {order.OrderNo} cannot go out from there.",
+                        shortages
+                    });
+            }
+
             /* ─────────── MOVING TO "INVOICED" MUST PRODUCE AN INVOICE ───────────
 
                It did not. This action only ever wrote a status id, so pressing
@@ -1481,6 +1602,43 @@ public class SalesController : ApiControllerBase
             order.StatusId = status.StatusId;
             if (body.StatusKey != OrderWorkflow.CreditHold) order.CreditHoldReason = null;
 
+            /* The goods, off the shelf that was named. The order's own location
+               is set to it as well: it is the truthful answer to "where did
+               this go out of", and the order form no longer asks for one when
+               the order is written -- nobody knows on the day it is taken. */
+            var unitsOut = 0;
+            if (dispatchFrom is not null)
+            {
+                var saleOut = await _db.MovementTypes.FirstOrDefaultAsync(m => m.TypeKey == "SALE");
+                if (saleOut is null)
+                    return BadRequest(new { message = "No SALE movement type is configured." });
+
+                order.LocationId = dispatchFrom.LocationId;
+
+                foreach (var sold in dispatchLines)
+                {
+                    var bal = await _db.StockBalances
+                        .FirstOrDefaultAsync(s => s.ProductId == sold.ProductId &&
+                                                  s.LocationId == dispatchFrom.LocationId);
+                    if (bal is null) continue;      // checked above; belt and braces
+
+                    bal.Quantity -= sold.Quantity;
+                    unitsOut += sold.Quantity;
+
+                    _db.StockMovements.Add(new StockMovement
+                    {
+                        ProductId = sold.ProductId,
+                        LocationId = dispatchFrom.LocationId,
+                        MovementTypeId = saleOut.MovementTypeId,
+                        MovedAt = Now(),
+                        ReferenceNo = order.OrderNo,
+                        Quantity = -sold.Quantity,
+                        BalanceAfter = bal.Quantity,
+                        UserId = CurrentUserId()
+                    });
+                }
+            }
+
             /* Leaving SUBMITTED means the decision has been made, so the
                six-hourly nudge has nothing left to chase. Arriving at it starts
                that clock, with this move's own notification as the first
@@ -1494,6 +1652,10 @@ public class SalesController : ApiControllerBase
                 ? $"{current.StatusName} -> {status.StatusName}"
                 : $"{current.StatusName} -> {status.StatusName}. {body.Reason.Trim()}";
 
+            if (dispatchFrom is not null)
+                detail += $" Sent out of {dispatchFrom.LocationName}; {unitsOut} " +
+                          $"{(unitsOut == 1 ? "unit" : "units")} off the shelf.";
+
             await Log(body.StatusKey == OrderWorkflow.Cancelled ? "ORDER_CANCELLED" : "ORDER_STATUS_CHANGED",
                 "SalesOrder", order.OrderNo, detail,
                 body.StatusKey is OrderWorkflow.Cancelled or OrderWorkflow.Declined ? 2 : 1);
@@ -1502,7 +1664,7 @@ public class SalesController : ApiControllerBase
                workflow's business rather than a switch statement here. */
             var custName = await _db.Parties.AsNoTracking()
                 .Where(pa => pa.UserId == order.CustomerUserId)
-                .Select(pa => pa.LegalName).FirstOrDefaultAsync() ?? "a customer";
+                .Select(pa => (pa.DisplayName ?? pa.LegalName)).FirstOrDefaultAsync() ?? "a customer";
 
             var (kind, roles, purpose, line) = OrderWorkflow.Announcement(
                 status.StatusKey, order.OrderNo, custName, CurrentUserName());
@@ -1539,11 +1701,16 @@ public class SalesController : ApiControllerBase
                 nextForMe = OrderWorkflow.NextFor(role, status.StatusKey),
                 invoiceId = billedInvoice?.InvoiceId,
                 invoiceNo = billedInvoice?.InvoiceNo,
+                dispatchedFrom = dispatchFrom?.LocationName,
+                unitsOut,
                 invoicePdfUrl = bill?.PdfUrl,
                 /* What Print should open -- see BillViewUrl. */
                 invoiceViewUrl = bill?.ShareUrl,
                 alreadyInvoiced,
-                message = billedInvoice is null
+                message = dispatchFrom is not null
+                    ? $"{order.OrderNo} dispatched from {dispatchFrom.LocationName}. " +
+                      $"{unitsOut} {(unitsOut == 1 ? "unit is" : "units are")} off that shelf."
+                    : billedInvoice is null
                     ? $"{order.OrderNo} is now {status.StatusName.ToLowerInvariant()}."
                     : alreadyInvoiced
                         ? $"{order.OrderNo} was already invoiced as {billedInvoice.InvoiceNo}. The bill is ready to print."
@@ -1580,11 +1747,13 @@ public class SalesController : ApiControllerBase
     {
         try
         {
-            /* Invoiced, and anything the keeper has already acknowledged but
-               not yet sent. Not CONFIRMED any more: picking stock against an
-               order the office has not billed is how goods leave with no
-               invoice behind them. */
-            var ready = new[] { OrderWorkflow.Invoiced, OrderWorkflow.SeenByWarehouse };
+            /* Invoiced, and nothing else. Not CONFIRMED -- picking stock
+               against an order the office has not billed is how goods leave
+               with no invoice behind them -- and there is no "seen by
+               warehouse" state any more (migration 21 removed it), so this is a
+               list to pick from rather than a queue to click through. The order
+               moves on when the order desk takes it up. */
+            var ready = new[] { OrderWorkflow.Invoiced };
 
             var rows = _db.SalesOrders.AsNoTracking()
                 .Where(o => ready.Contains(o.Status.StatusKey));
@@ -1612,7 +1781,7 @@ public class SalesController : ApiControllerBase
                 {
                     id = o.OrderId,
                     orderNo = o.OrderNo,
-                    customerName = o.CustomerUser.LegalName,
+                    customerName = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     city = o.CustomerUser.City.CityName,
                     locationId = o.LocationId,
                     location = o.Location.LocationName,
@@ -1746,7 +1915,7 @@ public class SalesController : ApiControllerBase
                     id = o.OrderId,
                     orderNo = o.OrderNo,
                     customerId = o.CustomerUserId,
-                    customerName = o.CustomerUser.LegalName,
+                    customerName = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
                     customerCode = o.CustomerUser.PartyCode,
                     customerPhone = o.CustomerUser.User.Phone,
                     customerAltPhone = o.CustomerUser.AltPhone,
@@ -1943,7 +2112,7 @@ public class SalesController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(i => i.InvoiceNo.ToLower().Contains(term) ||
-                                       i.CustomerUser.LegalName.ToLower().Contains(term) ||
+                                       (i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName).ToLower().Contains(term) ||
                                        (i.WalkInName != null && i.WalkInName.ToLower().Contains(term)));
             }
 
@@ -1959,7 +2128,7 @@ public class SalesController : ApiControllerBase
                     orderId = i.OrderId,
                     orderNo = i.Order != null ? i.Order.OrderNo : null,
                     customerId = i.CustomerUserId,
-                    customerName = i.IsWalkIn && i.WalkInName != null ? i.WalkInName : i.CustomerUser.LegalName,
+                    customerName = i.IsWalkIn && i.WalkInName != null ? i.WalkInName : (i.CustomerUser.DisplayName ?? i.CustomerUser.LegalName),
                     customerPhone = i.IsWalkIn ? i.WalkInPhone : i.CustomerUser.User.Phone,
                     isWalkIn = i.IsWalkIn,
                     location = i.Location.LocationName,
@@ -2026,8 +2195,8 @@ public class SalesController : ApiControllerBase
                     orderId = x.OrderId,
                     orderNo = x.Order != null ? x.Order.OrderNo : null,
                     customerId = x.CustomerUserId,
-                    accountName = x.CustomerUser.LegalName,
-                    customerName = x.IsWalkIn && x.WalkInName != null ? x.WalkInName : x.CustomerUser.LegalName,
+                    accountName = (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
+                    customerName = x.IsWalkIn && x.WalkInName != null ? x.WalkInName : (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
                     customerCode = x.CustomerUser.PartyCode,
                     customerPhone = x.IsWalkIn ? x.WalkInPhone : x.CustomerUser.User.Phone,
                     address = x.CustomerUser.AddressLine,
@@ -2296,7 +2465,7 @@ public class SalesController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(r => r.ReturnNo.ToLower().Contains(term) ||
-                                       r.CustomerUser.LegalName.ToLower().Contains(term));
+                                       (r.CustomerUser.DisplayName ?? r.CustomerUser.LegalName).ToLower().Contains(term));
             }
 
             var items = await rows
@@ -2308,7 +2477,7 @@ public class SalesController : ApiControllerBase
                     invoiceId = r.InvoiceId,
                     invoiceNo = r.Invoice != null ? r.Invoice.InvoiceNo : null,
                     customerId = r.CustomerUserId,
-                    customerName = r.CustomerUser.LegalName,
+                    customerName = (r.CustomerUser.DisplayName ?? r.CustomerUser.LegalName),
                     location = r.Location.LocationName,
                     returnDate = r.ReturnDate,
                     reason = r.Reason,
@@ -2422,7 +2591,7 @@ public class SalesController : ApiControllerBase
                             ? x.CustomerUser.SalesPersonUser.User.FullName
                             : null,
                     customerId = x.CustomerUserId,
-                    customerName = x.CustomerUser.LegalName,
+                    customerName = (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
                     customerPhone = x.CustomerUser.User.Phone,
                     locationId = x.LocationId,
                     location = x.Location.LocationName,
@@ -2691,7 +2860,7 @@ public class SalesController : ApiControllerBase
                 {
                     id = p.UserId,
                     code = p.PartyCode,
-                    name = p.LegalName,
+                    name = (p.DisplayName ?? p.LegalName),
                     city = p.City.CityName,
                     phone = p.User.Phone,
                     repId = p.SalesPersonUserId,
@@ -2787,7 +2956,7 @@ public class SalesController : ApiControllerBase
                 {
                     id = p.UserId,
                     code = p.PartyCode,
-                    name = p.LegalName,
+                    name = (p.DisplayName ?? p.LegalName),
                     city = p.City.CityName,
                     phone = p.User.Phone,
                     address = p.AddressLine,
@@ -2961,6 +3130,19 @@ public class SalesController : ApiControllerBase
                     .Where(m => m.IsActive)
                     .Select(m => new { id = m.MethodId, key = m.MethodKey, name = m.MethodName, kind = m.MethodKind })
                     .ToListAsync(),
+
+                /* MONEY COMING IN has its own short list -- Cash, Credit,
+                   Meezan, Faysal -- because that is what the business actually
+                   takes and a longer list is four more ways to file a payment
+                   under the wrong heading. Marked in the database
+                   ("PaymentMethod"."IsForReceiving", migration 21) rather than
+                   listed in code, so the owner can add a bank without a deploy.
+                   Money going OUT still uses the full list above. */
+                receivingMethods = await _db.PaymentMethods.AsNoTracking()
+                    .Where(m => m.IsActive && m.IsForReceiving)
+                    .OrderBy(m => m.MethodId)
+                    .Select(m => new { id = m.MethodId, key = m.MethodKey, name = m.MethodName, kind = m.MethodKind })
+                    .ToListAsync(),
                 conditions = await _db.ReturnConditions.AsNoTracking()
                     .Select(c => new { id = c.ConditionId, key = c.ConditionKey, name = c.ConditionName, isResalable = c.IsResalable })
                     .ToListAsync(),
@@ -3008,12 +3190,12 @@ public class SalesController : ApiControllerBase
                              && p.PartyCode != WalkInPartyCode)
                     .Where(p => mineOnly == null
                              || p.CreatedByUserId == mineOnly || p.SalesPersonUserId == mineOnly)
-                    .OrderBy(p => p.LegalName)
+                    .OrderBy(p => (p.DisplayName ?? p.LegalName))
                     .Select(p => new
                     {
                         id = p.UserId,
                         code = p.PartyCode,
-                        name = p.LegalName,
+                        name = (p.DisplayName ?? p.LegalName),
                         displayName = p.DisplayName,
                         city = p.City.CityName,
                         phone = p.User.Phone,
@@ -3042,6 +3224,17 @@ public class SalesController : ApiControllerBase
                         packing = p.Packing,
                         salePrice = p.SalePrice,
                         costPrice = p.CostPrice,
+                        /* THE PICTURE, because that is how an order is actually
+                           taken: the rep shows the shopkeeper a photo and the
+                           shopkeeper points at it. A picker that lists code and
+                           name only makes them scroll looking for words they do
+                           not use. */
+                        imageUrl = p.ImageUrl,
+                        /* The margin base. Margin on an order line is over what
+                           the piece cost to land -- cost + duty -- the same
+                           arithmetic as the product screen, so the two cannot
+                           tell different stories about the same item. */
+                        dutyPrice = p.DutyPrice,
                         taxRatePercent = p.TaxRatePercent,
                         totalStock = p.StockBalances.Sum(s => (int?)s.Quantity) ?? 0,
                         /* Stock at the till the operator is standing at, when the
@@ -3256,7 +3449,11 @@ public class SalesController : ApiControllerBase
 
             var customer = await _db.Parties.AsNoTracking()
                 .Where(p => p.UserId == body.CustomerId)
-                .Select(p => new { p.UserId, p.LegalName, p.PartyCode })
+                .Select(p => new
+                {
+                    p.UserId, p.PartyCode,
+                    name = p.DisplayName ?? p.LegalName
+                })
                 .FirstOrDefaultAsync();
             if (customer is null) return BadRequest(new { message = "Pick a valid customer." });
             if (customer.PartyCode == WalkInPartyCode)
@@ -3330,7 +3527,7 @@ public class SalesController : ApiControllerBase
                 if (!bought.TryGetValue(l.ProductId, out var sold) || sold.qty <= 0)
                     return BadRequest(new
                     {
-                        message = $"{customer.LegalName} has never been billed for {name}, so it cannot come back."
+                        message = $"{customer.name} has never been billed for {name}, so it cannot come back."
                     });
 
                 var already = backAlready.TryGetValue(l.ProductId, out var r) ? r : 0;
@@ -3416,7 +3613,7 @@ public class SalesController : ApiControllerBase
 
             await Log("SALES_RETURN_CREATED", "SalesReturn", ret.ReturnNo,
                 $"{wanted.Count} {(wanted.Count == 1 ? "item" : "items")}, {units} units, {credit:N0} " +
-                $"from {customer.LegalName} into {location.LocationName}. {ret.Reason}", 2);
+                $"from {customer.name} into {location.LocationName}. {ret.Reason}", 2);
 
             /* THE RETURN NOTE. A credit note of its own, NOT a second invoice:
                the order keeps the one bill it was billed on, and what comes
@@ -3438,7 +3635,7 @@ public class SalesController : ApiControllerBase
                 new[] { "super-admin", "accountant", "order-dept" },
                 NotificationKinds.ReturnRequested,
                 $"Sales return by {CurrentUserName()}",
-                $"{ret.ReturnNo} -- {customer.LegalName} returned {units} " +
+                $"{ret.ReturnNo} -- {customer.name} returned {units} " +
                 $"{(units == 1 ? "unit" : "units")} across {wanted.Count} " +
                 $"{(wanted.Count == 1 ? "item" : "items")}, PKR {credit:N0} credited. " +
                 $"Stock is back at {location.LocationName}.",
@@ -3452,7 +3649,7 @@ public class SalesController : ApiControllerBase
                 totalAmount = credit,
                 units,
                 location = location.LocationName,
-                customerName = customer.LegalName,
+                customerName = customer.name,
                 pdfUrl = note?.PdfUrl,
                 viewUrl = ReturnNoteUrl(ret.ReturnId, note?.PdfUrl, note?.Deliverable ?? false),
                 message = $"Return {ret.ReturnNo} saved. {units} {(units == 1 ? "unit is" : "units are")} " +
@@ -3674,7 +3871,7 @@ public class SalesController : ApiControllerBase
                 invoiceNo = inv.InvoiceNo,
                 isWalkIn = inv.IsWalkIn,
                 customerName = inv.WalkInName ?? await _db.Parties.Where(p => p.UserId == customerId)
-                    .Select(p => p.LegalName).FirstAsync(),
+                    .Select(p => (p.DisplayName ?? p.LegalName)).FirstAsync(),
                 customerPhone = inv.WalkInPhone ?? await _db.Users.Where(u => u.UserId == customerId)
                     .Select(u => u.Phone).FirstOrDefaultAsync(),
                 subtotal, discount, tax, total,
@@ -3858,7 +4055,7 @@ public class SalesController : ApiControllerBase
                 location = x.Location.LocationName,
                 statusName = x.Status.StatusName,
                 x.IsWalkIn,
-                customerName = x.IsWalkIn && x.WalkInName != null ? x.WalkInName : x.CustomerUser.LegalName,
+                customerName = x.IsWalkIn && x.WalkInName != null ? x.WalkInName : (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
                 customerCode = x.IsWalkIn ? null : x.CustomerUser.PartyCode,
                 customerAddress = x.IsWalkIn ? null : x.CustomerUser.AddressLine,
                 customerCity = x.IsWalkIn ? null : x.CustomerUser.City.CityName,
@@ -4179,12 +4376,24 @@ public class SalesController : ApiControllerBase
     public record OrderLineRequest(
         int ProductId, int Qty, decimal Rate, decimal DiscountPercent, decimal TaxPercent) : ILine;
 
+    /* LocationId is NULLABLE, and SalesPersonUserId is IGNORED.
+
+       Neither belongs on the order form any more. "Selling from" asked, on the
+       day the order was taken, a question nobody can answer until the goods
+       actually go out -- it is asked at dispatch instead, which is also where
+       the stock leaves (SetOrderStatus). "Sales rep" let a rep file an order
+       under somebody else's name; the order is now always recorded against
+       whoever is signed in. Both fields are still read on the way in so an old
+       client does not break, and both are overruled. */
     public record OrderRequest(
-        int CustomerId, int LocationId, int? SalesPersonUserId,
+        int CustomerId, int? LocationId, int? SalesPersonUserId,
         DateOnly? OrderDate, DateOnly? DeliveryDate, DateOnly? DueDate, int MethodId,
         string? Notes, bool SaveAsDraft, bool RaiseInvoice, List<OrderLineRequest> Lines);
 
-    public record StatusRequest(string StatusKey, string? Reason);
+    /* LocationId is the answer to "which place is this going out of", asked
+       only when the target is DISPATCHED -- that is the step that takes the
+       stock off a shelf, and the shelf has to be named. Null everywhere else. */
+    public record StatusRequest(string StatusKey, string? Reason, int? LocationId = null);
 
     public record ChangeRequestBody(string Kind, string Reason);
     public record DecideChangeBody(bool Approve, string? Note);

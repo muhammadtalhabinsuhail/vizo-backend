@@ -160,7 +160,39 @@ public class PartyDocumentsController : ApiControllerBase
                     message = "The reader did not answer."
                 });
 
-            return Ok(Shape(answer!, cities.Select(c => (c.CityId, c.CityName)).ToList(), problems));
+            var shaped = Shape(answer!, cities.Select(c => (c.CityId, c.CityName)).ToList(), problems);
+            if (shaped is null)
+            {
+                /* THE ANSWER WAS NOT JSON THIS COULD READ.
+
+                   It happens: a model truncates its own reply at the token
+                   limit, or wraps it in ``` fences, or writes a sentence
+                   instead. Until this was tested against a blurred card it
+                   took the whole endpoint down with a JsonReaderException and
+                   a stack trace on the screen. The salesperson is told to try
+                   again or type it in -- which is what they would do anyway,
+                   and the photographs are already safely uploaded. */
+                _logger.LogWarning("Gemini answered with something that is not usable JSON: {Answer}",
+                    answer!.Length <= 500 ? answer : answer[..500] + "…");
+
+                return Ok(new
+                {
+                    configured = true,
+                    problems = new[]
+                    {
+                        new
+                        {
+                            image = "all",
+                            reason = "unreadable-answer",
+                            message = "The documents could not be read clearly. Take the pictures again in better light, or type the details in."
+                        }
+                    },
+                    fields = (object?)null,
+                    message = "The reader's answer could not be understood."
+                });
+            }
+
+            return Ok(shaped);
         }
         catch (Exception ex)
         {
@@ -345,9 +377,27 @@ public class PartyDocumentsController : ApiControllerBase
     /// Turns the reader's JSON into the shape the form fills itself from --
     /// and applies the owner's rules about which field is built from what.
     /// </summary>
-    private object Shape(string json, IReadOnlyList<(int CityId, string CityName)> cities, List<object> problems)
+    private object? Shape(string json, IReadOnlyList<(int CityId, string CityName)> cities, List<object> problems)
     {
-        using var doc = JsonDocument.Parse(json);
+        /* Models wrap JSON in ``` fences, prefix it with a sentence, or stop
+           mid-string when they hit the token limit. Take the outermost braces
+           and try; null means "not usable", and the caller says so politely
+           rather than throwing a parser exception at the screen. */
+        var start = json.IndexOf('{');
+        var end = json.LastIndexOf('}');
+        if (start < 0 || end <= start) return null;
+
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(json[start..(end + 1)]);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        using var parsed = doc;
         var root = doc.RootElement;
 
         string Str(string name) =>

@@ -22,23 +22,16 @@
 
 
 ───────────────────────────────────────────────────────────────────────────────
- S0.  TWO THINGS ARE WAITING ON YOU
+ S0.  ONE THING IS WAITING ON YOU
 ───────────────────────────────────────────────────────────────────────────────
 
- 1  A READER KEY, or the new customer screen only takes pictures.
+ 1  ASSIGN YOUR CUSTOMERS TO A SALESMAN. Still open from 21 September and
+    still the most urgent thing in this file: two of your four reps have no
+    accounts assigned and cannot raise an order at all. changa.txt B1.
 
-    Photographing a CNIC and a shop card and having the form fill itself needs
-    something that can read a photograph. Nothing on this system can today:
-    "Gemini:ApiKey" in appsettings.json is empty.
+ (The reader key arrived on 22 September and is in -- see S6 and changa.txt
+ C1. The AI reports came on with it.)
 
-    The screen is built and behaves properly without it -- it says so on the
-    first page, the pictures are still taken and filed and the PDF is still
-    made -- but every box is typed by hand until a key is set. It is free and
-    takes two minutes: changa.txt C1.
-
- 2  ASSIGN YOUR CUSTOMERS TO A SALESMAN. Still open from 21 September, still
-    the most urgent thing in this file: two of your four reps have no accounts
-    assigned and cannot raise an order at all. changa.txt B1.
 
 
 ───────────────────────────────────────────────────────────────────────────────
@@ -317,18 +310,35 @@
  S8.  THINGS I FOUND AND DID NOT CHANGE
 ───────────────────────────────────────────────────────────────────────────────
 
- S8.1  THE CAMERA AND THE READER ARE BOTH UNPROVEN ON REAL HARDWARE
+ S8.1  THE READER IS PROVED; THE CAMERA IS NOT
 
-       The test browser has no camera and there is no reader key, so what I
-       could prove is: the camera dialog opens, asks, and says the right thing
-       when it is refused; the upload path works; the reader endpoint answers
-       "not configured" and the screen behaves as it should when it does.
+       THE READER WORKS. With your key in, sample documents were put through
+       the real endpoint and every rule you gave came back right: the name
+       without the father's name, the display name as
+       "name - shop - location", the address off the CARD and not the CNIC,
+       both phone numbers, the city matched to ours, and a blurred card
+       reported as "not clear -- take it again" rather than half-filling the
+       form. Roughly 20-25 seconds for three pictures.
 
-       WHAT NOBODY HAS DONE YET is take a photograph of a real CNIC with a
-       real phone and see what comes back. Please do that on one shop before
-       your reps rely on it. The prompt is one file
-       (PartyDocumentsController.Prompt) and it is meant to be argued with --
-       if it reads a name wrongly, that is the place to say so.
+       TWO THINGS THAT TESTING TURNED UP, both fixed:
+
+         · The flash models answer 503 "high demand" often. Three tries at one
+           model failed outright at one point, and the same pictures read
+           perfectly a minute later. It now tries the model twice and then
+           moves to another one rather than giving up.
+         · A model that truncates its own JSON -- which a blurred photograph
+           made happen -- used to take the endpoint down with a parser error on
+           the screen. It now says "take the pictures again in better light, or
+           type the details in", and the photographs are already saved either
+           way.
+
+       WHAT IS STILL UNPROVEN: a real CNIC, photographed with a real phone
+       camera. The test browser has no camera, so only the "camera refused"
+       path has run, and the documents used were drawn for the test. Please put
+       ONE real shop through the screen before your reps rely on it. If it
+       reads something wrongly, the prompt that governs every field is one
+       method -- PartyDocumentsController.Prompt -- and it is meant to be
+       argued with.
 
  S8.2  ORDERS BEFORE TODAY STILL HAVE NOT MOVED THEIR STOCK
 
@@ -1602,3 +1612,30 @@
    app/(app)/inventory/products/[id]/history/
 
 ═══════════════════════════════════════════════════════════════════════════════
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ ONE FILE LEAVES YOUR WORKING COPY — 20 SEP
+═══════════════════════════════════════════════════════════════════════════════
+
+ vizo-backend/appsettings.Development.json IS NO LONGER IN THE REPOSITORY.
+
+ It was tracked, but .gitignore has listed it as "local overrides only" for a
+ while -- git had simply carried on tracking what it already tracked. It is
+ untracked now (git rm --cached; the file itself was not deleted here).
+
+ WHAT THIS MEANS FOR YOU: git will remove it from your working copy on your
+ next pull. It only held the two default logging levels, so nothing is lost
+ unless you had put your own settings in it. IF YOU DID, COPY IT SOMEWHERE
+ FIRST. It will then be yours alone and no pull will touch it again.
+
+ WHY: the document reader needs a Google API key, and GitHub's secret scanning
+ refuses any push that carries one -- the push was blocked outright. The owner
+ asked for it to be gitignored rather than committed. So the key sits in that
+ local file here, appsettings.json carries an empty Gemini:ApiKey, and on
+ Railway it is the environment variable Gemini__ApiKey.
+
+ With no key the reader is simply off: GET /api/parties/documents/reader
+ answers configured:false and the new-customer screen asks for the details to
+ be typed in. Photographs still upload and customers still save.
+

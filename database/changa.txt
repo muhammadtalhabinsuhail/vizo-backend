@@ -11,41 +11,88 @@
  C.  22 SEPTEMBER — ONE KEY, TWO MIGRATIONS, AND A WORD TO YOUR ORDER DESK
 ───────────────────────────────────────────────────────────────────────────────
 
- C1  GET A READER KEY, OR THE NEW CUSTOMER SCREEN ONLY TAKES PICTURES
+ C1  THE READER WORKS — AND THE KEY IS NOT IN THE REPOSITORY
 
-     Photographing a CNIC and a business card and having the form fill itself
-     needs something that can read a photograph. Nothing on this system can
-     today: "Gemini:ApiKey" in appsettings.json is an empty string.
+     You gave the key on 22 September and it is in use on this machine, but
+     NOT in appsettings.json with the database password and the Cloudinary
+     secrets. Two reasons, and the second is yours:
 
-     It is free and it takes two minutes:
+         GITHUB REFUSES THE PUSH. Its secret scanning recognises a Google API
+         key and blocks any commit carrying one --
+         "GCP API Key Bound to a Service Account ... appsettings.json".
 
-        1. open  https://aistudio.google.com/apikey  and sign in with a Google
-           account (vizo.com.pk@gmail.com is the obvious one)
-        2. press "Create API key" and copy it
-        3. put it in backend/vizo-backend/appsettings.json:
+         AND YOU SAID SO. "why are you trying to push api key on repo,
+         .gitignore plz". Done.
 
-               "Gemini": { "ApiKey": "AIza….", "Model": "gemini-2.0-flash", … }
+     WHERE IT IS NOW, on this machine:
 
-           or, on the API host, as the environment variable
+         backend/vizo-backend/appsettings.Development.json
 
-               Gemini__ApiKey = AIza….
+     That file was in .gitignore already but git was still tracking it -- it
+     had been committed before the ignore rule was written, and git keeps
+     tracking what it already tracks. It is untracked now, so the ignore is
+     real and the file stays on this computer. It holds the logging settings
+     and this:
 
-        4. restart the API
+         "Gemini": { "ApiKey": "AQ.Ab8RN6..." }
 
-     The free tier is generous -- a few hundred documents a day -- and reading
-     one customer is two pictures. Nothing else in the app needs the key; the
-     AI reports have been waiting for it since September and will start
-     working at the same time.
+     ASP.NET reads appsettings.json first and then this one on top, so the
+     empty ApiKey in the committed file is replaced by the real one whenever
+     the API runs here. Nothing to remember and nothing to type.
 
-     UNTIL IT IS SET, the new-customer screen says so on its first page, still
-     takes and files the photographs, still makes the one PDF, and the
-     salesperson types the details. Nothing is broken; it is just manual.
+     ON THE SERVER there is no such file -- it is not in the repository, which
+     is the point. So set it at Railway -> Variables, the way App__WebBaseUrl
+     already is:
 
-     WHAT GOES TO GOOGLE when it is on: the CNIC and business-card photographs
-     of the shop you are opening, and nothing else. No prices, no customers,
-     no ledger. Google's API terms say paid-tier data is not used for
-     training; the free tier is used for improving their models. If that
-     matters to you, use a paid key -- it is the same key field.
+         Gemini__ApiKey = AQ.Ab8RN6...
+
+     The double underscore is ASP.NET's own way of writing Gemini:ApiKey.
+     Until you do, the new-customer screen still takes and saves the
+     photographs, and the salesperson types the details in instead of having
+     them filled. Nothing breaks; it is just slower.
+
+     ONE THING FOR TALHA: appsettings.Development.json will disappear from his
+     working copy on his next pull, because it is no longer in the repository.
+     If he had his own overrides in it he should keep a copy first. convey.txt
+     says the same.
+
+     WHAT WAS PROVED, with your key, through the real screen's API:
+
+       · the CNIC name came back WITHOUT the father's name
+       · the display name came back as
+         "Imran Yousuf Mansoori - MANSOORI COMMUNICATION - Nayabad Market"
+       · the address came off the BUSINESS CARD, not the CNIC
+       · both phone numbers came off the CNIC, in the shapes they were printed
+       · the city was matched to "Karachi - Pakistan"
+       · a deliberately blurred card came back as "That picture is not clear
+         enough to read. Take it again." and the screen went back to it
+
+     It takes about 20-25 seconds for three pictures. That is the model, not
+     the app.
+
+     TWO THINGS TESTING CHANGED:
+
+     1. THE MODEL NAME YOU HAD IS RETIRED. "gemini-2.0-flash" answers 404 now.
+        It is "gemini-flash-latest", the name Google keeps pointing at the
+        current model. Two more are listed as fallbacks, because the flash
+        models answer 503 "high demand" often enough to matter -- if the first
+        is busy the next is tried instead of telling the salesperson to type it
+        all in by hand.
+
+     2. A BLURRED PHOTOGRAPH USED TO BREAK THE SCREEN. The model answered with
+        JSON it had cut off halfway, and the reply came back as a programming
+        error. It now says "take the pictures again in better light, or type
+        the details in", and the pictures are saved either way.
+
+     WHAT GOES TO GOOGLE: the CNIC and business-card photographs of the shop
+     being opened, and nothing else. No prices, no customers, no ledger. On a
+     free key Google may use that data to improve their models; a paid key is
+     excluded. Same key field either way.
+
+     THE AI REPORTS COME ON WITH IT. /reports/ask, the sales-drop explanation,
+     dead-stock advice and the nightly insight all use this key and have been
+     dark since September. They will start writing once the Railway variable
+     is set.
 
  C2  BOTH MIGRATIONS ARE ALREADY RUN — on Neon only
 

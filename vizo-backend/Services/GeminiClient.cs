@@ -51,7 +51,34 @@ public class GeminiClient
     }
 
     private string? ApiKey => _cfg["Gemini:ApiKey"];
-    private string Model => _cfg["Gemini:Model"] ?? "gemini-2.0-flash";
+    private string Model => _cfg["Gemini:Model"] ?? "gemini-flash-latest";
+
+    /// <summary>
+    /// The models to fall back to when the first one is busy, in order.
+    ///
+    /// Google answers 503 "experiencing high demand" on the flash models often
+    /// enough to matter: three attempts at the SAME model failed outright
+    /// while this was being tested, and a minute later it read a business card
+    /// perfectly. A salesperson standing in a shop with a customer's CNIC in
+    /// their hand should not be the one who finds that out, so a busy model
+    /// hands over to the next rather than giving up.
+    ///
+    /// Override with Gemini:FallbackModels as a comma-separated list.
+    /// </summary>
+    private IReadOnlyList<string> Models
+    {
+        get
+        {
+            var list = new List<string> { Model };
+            var configured = _cfg["Gemini:FallbackModels"];
+            foreach (var m in (configured ?? "gemini-flash-lite-latest,gemini-3.1-flash-lite")
+                         .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (!list.Contains(m, StringComparer.OrdinalIgnoreCase)) list.Add(m);
+            }
+            return list;
+        }
+    }
     private int TimeoutSeconds => int.TryParse(_cfg["Gemini:TimeoutSeconds"], out var t) ? t : 30;
 
     /// <summary>
@@ -199,7 +226,11 @@ public class GeminiClient
             generationConfig = new
             {
                 temperature = 0,                 // transcription, not writing
-                maxOutputTokens = 2048,
+                /* Room to spare. The reply is small, but a model that runs out
+                   of tokens mid-string returns broken JSON, and broken JSON
+                   from a blurred photograph is how this endpoint first fell
+                   over. */
+                maxOutputTokens = 4096,
                 /* Ask for JSON and get JSON -- without this the model wraps it
                    in ```json fences half the time and the parse is a guess. */
                 responseMimeType = "application/json"
@@ -214,21 +245,48 @@ public class GeminiClient
                the salesperson types it all in for nothing. */
             client.Timeout = TimeSpan.FromSeconds(Math.Max(TimeoutSeconds, 60));
 
-            var url = $"https://generativelanguage.googleapis.com/v1beta/models/{Model}:generateContent";
-            using var req = new HttpRequestMessage(HttpMethod.Post, url);
-            req.Headers.Add("x-goog-api-key", ApiKey);
-            req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+            var payload = JsonSerializer.Serialize(body);
 
-            using var res = await client.SendAsync(req, ct);
-            var raw = await res.Content.ReadAsStringAsync(ct);
+            /* TWO GOES AT EACH MODEL, THEN THE NEXT MODEL.
 
-            if (!res.IsSuccessStatusCode)
+               A 429 or a 5xx means "busy, ask again"; a 400 or a 403 is our
+               fault or the key's and asking again would only be slower, so
+               those stop everything at once. A model that is 404 -- Google
+               retires these names faster than anybody redeploys -- moves
+               straight on to the next in the list. */
+            foreach (var model in Models)
             {
-                _logger.LogWarning("Gemini vision returned {Status}: {Body}", (int)res.StatusCode, Trim(raw));
-                return null;
+                var url = $"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent";
+
+                for (var attempt = 1; attempt <= 2; attempt++)
+                {
+                    using var req = new HttpRequestMessage(HttpMethod.Post, url);
+                    req.Headers.Add("x-goog-api-key", ApiKey);
+                    req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+
+                    using var res = await client.SendAsync(req, ct);
+                    var raw = await res.Content.ReadAsStringAsync(ct);
+
+                    if (res.IsSuccessStatusCode)
+                    {
+                        if (!string.Equals(model, Model, StringComparison.OrdinalIgnoreCase))
+                            _logger.LogInformation("Gemini vision answered on the fallback model {Model}.", model);
+                        return ReadFirstText(raw);
+                    }
+
+                    var status = (int)res.StatusCode;
+                    _logger.LogWarning("Gemini vision {Model} returned {Status} (attempt {Attempt}): {Body}",
+                        model, status, attempt, Trim(raw));
+
+                    if (status is 400 or 401 or 403) return null;    // ours to fix, not theirs
+                    if (status == 404) break;                        // this name is gone; try the next
+                    if (attempt == 2) break;                         // busy twice; try the next model
+                    await Task.Delay(TimeSpan.FromSeconds(1), ct);
+                }
             }
 
-            return ReadFirstText(raw);
+            _logger.LogWarning("Gemini vision: every model was busy or missing.");
+            return null;
         }
         catch (TaskCanceledException)
         {

@@ -197,7 +197,7 @@ A short record of what was built. Full reasoning, warnings and decisions are in
 - **26 past orders still have not moved their stock**; **nothing posts a sale to the ledger**;
   **six exports still stop at 50 rows**.
 
-`api 1667625` · `web f0941e5` (and the documents work in the commits after them)
+`api 1667625`, `api 29972d1` · `web 3e36a26`, `web 6053504`
 
 ---
 

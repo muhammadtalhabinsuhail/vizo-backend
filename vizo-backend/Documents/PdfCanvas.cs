@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text;
 
 namespace vizo_backend.Documents;
@@ -33,6 +33,21 @@ public sealed class PdfCanvas
 
     private readonly List<StringBuilder> _pages = new();
     private StringBuilder _c;
+
+    /* ─────────────────────────── IMAGES ───────────────────────────
+
+       A JPEG goes into a PDF almost unchanged: the file's own compressed bytes
+       become the stream of an image XObject with /Filter /DCTDecode, and the
+       page draws it with a transformation matrix. No decoding, no re-encoding
+       and no library -- which is the same reason this file writes PDFs by hand
+       rather than pulling in QuestPDF or PDFsharp.
+
+       JPEG ONLY, deliberately. PNG needs its own Flate stream, a predictor and
+       a separate alpha channel, which is a lot of code for a format nobody
+       here produces: the customer documents are camera photographs, and they
+       are fetched from Cloudinary with f_jpg so whatever the phone took comes
+       back as a baseline JPEG.                                              */
+    private readonly List<(int Page, string Name, byte[] Bytes, int PxWidth, int PxHeight, bool Grey)> _images = new();
 
     public PdfCanvas()
     {
@@ -179,6 +194,85 @@ public sealed class PdfCanvas
         return total * size / 1000.0;
     }
 
+    /// <summary>
+    /// Draws a JPEG at (x, y) -- bottom-left, like everything else on the page
+    /// -- <paramref name="w"/> wide and <paramref name="h"/> high in points.
+    ///
+    /// Returns false when the bytes are not a JPEG this can read, rather than
+    /// throwing: a customer's document set must still print when one photo in
+    /// it is a PNG somebody renamed.
+    /// </summary>
+    public bool Jpeg(double x, double y, double w, double h, byte[]? jpeg)
+    {
+        if (jpeg is null || jpeg.Length < 4) return false;
+        var size = JpegSize(jpeg);
+        if (size is null) return false;
+
+        var name = $"Im{_images.Count}";
+        _images.Add((_pages.IndexOf(_c), name, jpeg, size.Value.Width, size.Value.Height, size.Value.Grey));
+
+        /* q/Q so the matrix does not leak into whatever is drawn next. The
+           matrix IS the size: a unit square is scaled to w x h and moved. */
+        _c.Append("q ")
+          .Append(N(w)).Append(" 0 0 ").Append(N(h)).Append(' ')
+          .Append(N(x)).Append(' ').Append(N(y)).Append(" cm /")
+          .Append(name).Append(" Do Q\n");
+        return true;
+    }
+
+    /// <summary>
+    /// Pixel size and colour of a JPEG, read from its SOF marker.
+    ///
+    /// The PDF has to declare /Width, /Height and /ColorSpace, and they must
+    /// match the compressed data exactly -- a wrong number here does not
+    /// stretch the picture, it makes the file unopenable. Progressive JPEGs
+    /// (SOF2) are fine: every viewer reads them, and only the marker id
+    /// differs. The two that are not fine are arithmetic-coded (SOF9+) and
+    /// CMYK, and both are refused above by returning null.
+    /// </summary>
+    /// <summary>
+    /// The pixel size of a JPEG, for a caller that needs to work out how big
+    /// to draw it before it draws it. Null when the bytes are not a JPEG this
+    /// file can embed.
+    /// </summary>
+    public static (int Width, int Height)? JpegPixels(byte[]? jpeg)
+    {
+        if (jpeg is null || jpeg.Length < 4) return null;
+        var size = JpegSize(jpeg);
+        return size is null ? null : (size.Value.Width, size.Value.Height);
+    }
+
+    private static (int Width, int Height, bool Grey)? JpegSize(byte[] b)
+    {
+        if (b[0] != 0xFF || b[1] != 0xD8) return null;      // not a JPEG at all
+
+        var i = 2;
+        while (i + 9 < b.Length)
+        {
+            if (b[i] != 0xFF) { i++; continue; }            // resync on padding
+            var marker = b[i + 1];
+            i += 2;
+            if (marker is 0xD8 or 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+            if (i + 1 >= b.Length) return null;
+
+            var length = (b[i] << 8) | b[i + 1];
+            /* SOF0 baseline, SOF1 extended, SOF2 progressive. Everything from
+               SOF9 up is arithmetic coding, which DCTDecode will not take. */
+            if (marker is 0xC0 or 0xC1 or 0xC2)
+            {
+                if (i + 8 >= b.Length) return null;
+                var height = (b[i + 3] << 8) | b[i + 4];
+                var width = (b[i + 5] << 8) | b[i + 6];
+                var components = b[i + 7];
+                if (width <= 0 || height <= 0) return null;
+                if (components is not (1 or 3)) return null;   // CMYK: not ours to guess at
+                return (width, height, components == 1);
+            }
+            i += length;
+        }
+        return null;
+    }
+
     /* ───────────────────────── encoding ───────────────────────── */
 
     /// <summary>
@@ -256,6 +350,15 @@ public sealed class PdfCanvas
             offsets.Add(buf.Position);
             Write(body);
         }
+        /* An image stream is the only thing in this file that is not text, so
+           it is the only thing written straight out as bytes. */
+        void ObjBytes(string head, byte[] data, string tail)
+        {
+            offsets.Add(buf.Position);
+            Write(head);
+            buf.Write(data, 0, data.Length);
+            Write(tail);
+        }
 
         /* The four high bytes on the second line are the marker the spec asks
            for so a transfer program treats the file as binary. Written as
@@ -263,25 +366,55 @@ public sealed class PdfCanvas
         Write("%PDF-1.4\n%\u00E2\u00E3\u00CF\u00D3\n");
 
         var pageCount = _pages.Count;
-        // page object i -> 5 + 2i, its content stream -> 6 + 2i
-        var kids = string.Join(" ", Enumerable.Range(0, pageCount).Select(i => $"{5 + 2 * i} 0 R"));
+
+        /* Objects 1-4 are fixed. Then one per image, then two per page. The
+           numbering used to be worked out inline (5 + 2i); with images in
+           front of the pages it is worked out once, here, because an object
+           number that disagrees with the xref table is a file no reader will
+           open. */
+        var firstImage = 5;
+        var firstPage = firstImage + _images.Count;
+        var kids = string.Join(" ", Enumerable.Range(0, pageCount).Select(i => $"{firstPage + 2 * i} 0 R"));
 
         Obj(1, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
         Obj(2, $"2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {pageCount} >>\nendobj\n");
         Obj(3, "3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n");
         Obj(4, "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n");
 
+        for (var n = 0; n < _images.Count; n++)
+        {
+            var img = _images[n];
+            var objNo = firstImage + n;
+            ObjBytes(
+                $"{objNo} 0 obj\n<< /Type /XObject /Subtype /Image " +
+                $"/Width {img.PxWidth} /Height {img.PxHeight} " +
+                $"/ColorSpace /{(img.Grey ? "DeviceGray" : "DeviceRGB")} " +
+                $"/BitsPerComponent 8 /Filter /DCTDecode /Length {img.Bytes.Length} >>\nstream\n",
+                img.Bytes,
+                "\nendstream\nendobj\n");
+        }
+
         for (var i = 0; i < pageCount; i++)
         {
-            var pageNo = 5 + 2 * i;
-            var streamNo = 6 + 2 * i;
+            var pageNo = firstPage + 2 * i;
+            var streamNo = pageNo + 1;
             var content = _pages[i].ToString();
             var length = latin1.GetByteCount(content);
+
+            /* Only the images this page actually draws go in its resources. */
+            var onThisPage = _images
+                .Select((img, n) => (img, n))
+                .Where(t => t.img.Page == i)
+                .Select(t => $"/{t.img.Name} {firstImage + t.n} 0 R")
+                .ToList();
+            var xobjects = onThisPage.Count == 0
+                ? ""
+                : $" /XObject << {string.Join(" ", onThisPage)} >>";
 
             Obj(pageNo,
                 $"{pageNo} 0 obj\n<< /Type /Page /Parent 2 0 R " +
                 $"/MediaBox [0 0 {N(A4Width)} {N(A4Height)}] " +
-                "/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> " +
+                $"/Resources << /Font << /F1 3 0 R /F2 4 0 R >>{xobjects} >> " +
                 $"/Contents {streamNo} 0 R >>\nendobj\n");
 
             Obj(streamNo, $"{streamNo} 0 obj\n<< /Length {length} >>\nstream\n{content}endstream\nendobj\n");

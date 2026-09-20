@@ -2,17 +2,380 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
- Last written 21 September 2026, after four things you asked for: the In Transit
- location deleted, every customer dropdown cut down to the rep's own accounts,
- billing (now "Invoiced/Edit") taken off sales and given to accounts, and the
- sales return rebuilt around the CUSTOMER instead of one invoice.
+ Last written 22 September 2026, after the order and customer work: the chain
+ cut from ten steps to seven, stock finally coming off the shelf when an order
+ is dispatched, an order screen with pictures and margins, four ways to take
+ money, display names everywhere, and a new customer opened from photographs
+ of the CNIC, the shop card and the affidavit.
 
- Sections R0–R9 below are that work. Sections P0–P11 after them are the
- 20 September product work, and sections 1–9 after those are 17 September.
- All of it is still current unless a newer section says otherwise.
+ Sections S0-S9 below are that work. R0-R9 after them are 21 September,
+ P0-P11 are 20 September and 1-9 are 17 September. All of it still stands
+ unless a newer section says otherwise.
 
  WHAT MUST BE DONE BY HAND lives in its own file: changa.txt, beside this one.
  Read that first and this second.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART ZERO — 22 SEPTEMBER: THE ORDER CHAIN, AND OPENING A CUSTOMER
+═══════════════════════════════════════════════════════════════════════════════
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S0.  TWO THINGS ARE WAITING ON YOU
+───────────────────────────────────────────────────────────────────────────────
+
+ 1  A READER KEY, or the new customer screen only takes pictures.
+
+    Photographing a CNIC and a shop card and having the form fill itself needs
+    something that can read a photograph. Nothing on this system can today:
+    "Gemini:ApiKey" in appsettings.json is empty.
+
+    The screen is built and behaves properly without it -- it says so on the
+    first page, the pictures are still taken and filed and the PDF is still
+    made -- but every box is typed by hand until a key is set. It is free and
+    takes two minutes: changa.txt C1.
+
+ 2  ASSIGN YOUR CUSTOMERS TO A SALESMAN. Still open from 21 September, still
+    the most urgent thing in this file: two of your four reps have no accounts
+    assigned and cannot raise an order at all. changa.txt B1.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S1.  THE CHAIN IS SEVEN STEPS, AND DISPATCH FINALLY MOVES THE STOCK
+───────────────────────────────────────────────────────────────────────────────
+
+     Draft · Submitted · Confirmed · Invoiced/Edit ·
+     Processing in Order Dept · Dispatched · Delivered
+
+ "Seen by Warehouse", "On way to Order Dept" and "Packaging" are gone from the
+ workflow, from every screen and from the database. So are the two 2026
+ leftovers PROCESSING and PACKED, which were already dead.
+
+ SEVEN LIVE ORDERS WERE STANDING IN THE STEPS THAT WENT -- six at "On way to
+ Order Dept" and one at "Packaging". They are at "Processing in Order Dept"
+ now, and each one has a line in its own history saying the step it was in no
+ longer exists, so nobody finds an order that changed state overnight and
+ cannot explain it.
+
+ AND THE BIG ONE. Until today nothing in the chain ever took stock off a
+ shelf: an order could be invoiced, dispatched and delivered and the shelf
+ count would not have moved by a single piece. That was P0 in this file on
+ 20 September, and it was the largest correctness problem in the system.
+
+ Pressing Dispatched now asks WHICH PLACE the goods are going out of --
+ warehouses, order departments and shops, never Claim Stock -- and takes them
+ off that shelf:
+
+   · it refuses if that place is short, and says which items and by how many
+   · the order's own location is set to the place it really went out of
+   · a SALE movement is written per line, so the stock history explains itself
+   · the order desk, the accountant and you may do it; nobody else
+
+ WHAT THIS DOES NOT DO: the 26 past orders that were dispatched or delivered
+ without ever moving stock are still wrong. Fixing them is a one-off
+ correction script, it is ready to write, and I did not run it because it
+ changes the shelf count of every product on those orders. Say the word.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S2.  THE PACKING SCREEN IS RETIRED, AND DISPATCH MOVED BEHIND THE CHAIN
+───────────────────────────────────────────────────────────────────────────────
+
+ /packing was the pre-chain way of working: its own queue, its own PACKED
+ status, and -- until today -- THE ONLY PLACE IN THE WHOLE APPLICATION WHERE
+ STOCK EVER LEFT for a sale. It sat beside the ten-step chain built on
+ 3 September and the two never met.
+
+ With the stock coming off at Dispatched, two screens taking the same goods
+ off the same shelf is how a count goes wrong, so packing stops: the page, the
+ menu entry and the route are gone, and its API answers with a sentence saying
+ where the work moved to rather than a 404.
+
+ /dispatch now sits AFTER the dispatch step instead of before it. It is where
+ the courier, the bilty, the parcels and the COD are recorded once the goods
+ are on a van; it no longer changes the order's status, because the chain
+ already did.
+
+ THE WAREHOUSE SCREEN IS NOW A LIST, NOT A QUEUE. The keeper's two buttons
+ were the two steps that went. /warehouse still shows every invoiced order
+ with what is on it, what is on the shelf and the bill to check against --
+ which is what the keeper actually needs -- and the order desk moves the order
+ on when it takes it up.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S3.  TAKING AN ORDER: ONE SCREEN, PICTURES, AND A MARGIN
+───────────────────────────────────────────────────────────────────────────────
+
+ The three-step wizard is one page. It stopped asking three things:
+
+   "Selling from"   asked on the day the order was taken, which is before
+                    anybody knows. It is asked at dispatch now (S1).
+   "Sales rep"      a dropdown of everybody. The order is recorded against
+                    whoever is signed in, always -- and the API ignores
+                    anything a browser sends, so it cannot be worked around.
+                    You and the accountant still see whose order it is on the
+                    order itself and in every list.
+   Disc % / Tax %   per line. The rate IS the price agreed; the tax is the
+                    product's own rate and is applied without being asked for.
+
+ IN THEIR PLACE, per line: Qty · RATE · Margin · Margin %.
+
+ Margin and margin % are linked, and both move the rate, because the rate is
+ landed cost plus margin:
+
+     Titan AirPro: cost 720 (cost + duty), rate 1,280 -> margin 560
+     type 50 % -> margin 360, rate 1,080
+     type a margin of 200 -> 27.78 %, rate 920
+     type a rate of 900 -> margin 180, 25 %
+
+ It is the same arithmetic as the product screen, out of the same file, so the
+ two can never tell different stories about one item. A rate below what the
+ piece cost to land turns the line red and is still allowed -- clearance is
+ real.
+
+ AND THE PICTURES. The item picker leads with the photograph and every line on
+ the order carries its own, because that is how an order is actually taken:
+ the rep shows the shopkeeper a picture and the shopkeeper points at it.
+
+ The customer picker shows the DISPLAY name in full, not cut short, because
+ the display name is what tells four Ahmeds apart.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S4.  A CUSTOMER IS CALLED BY THEIR DISPLAY NAME NOW, EVERYWHERE
+───────────────────────────────────────────────────────────────────────────────
+
+ 128 places in the API were handing out the registered name. Orders, invoices,
+ returns, deliveries, claims, statements, reports, the dashboards, the
+ notifications -- all of them now read "display name, or the legal name when
+ there is none".
+
+ TWO PLACES KEEP THE LEGAL NAME, on purpose:
+
+   · the customer's own record, where both are shown -- it is the field you
+     typed, and the screen that edits it must show what it is editing
+   · printed documents, where the counterparty block carries the registered
+     name with the display name above it. A credit note that names a party
+     differently from the invoice it credits is an argument waiting to happen.
+
+ The company's own legal name on the letterhead is untouched -- that is the
+ "Company" table, a different thing entirely.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S5.  MONEY COMING IN: CASH, CREDIT, MEEZAN, FAYSAL
+───────────────────────────────────────────────────────────────────────────────
+
+ Four, everywhere money is received: the counter, the order form, the receipt
+ voucher and the collection dialog. Marked in the database
+ ("PaymentMethod"."IsForReceiving") rather than listed in code, so you can add
+ another bank without a deploy -- tick the column and it appears.
+
+ Nothing was deleted. Bank, Cheque, JazzCash, Easypaisa, Credit Note and Petty
+ Cash all still exist because eight months of history points at them, and
+ money going OUT -- an expense, a payment voucher -- still uses the full list.
+
+ (The owner wrote "Faisal"; the bank spells itself Faysal. The screen shows
+ whatever the database row says, so change that one row if you want the other
+ spelling.)
+
+ 🔴 AND A FINDING YOU SHOULD KNOW ABOUT: THE "RECORD PAYMENT" BUTTON ON AN
+ INVOICE HAS NEVER RECORDED ANYTHING.
+
+ Opening a sale invoice and pressing Record Payment produced a form, accepted
+ an amount and a method, said "Payment recorded" and closed. No collection, no
+ voucher, no journal line, nothing in any table. Anybody who used it believed
+ a payment had been taken.
+
+ You asked for that button to be taken off the sales panel, and it is -- only
+ the accountant and you see it now. But it also had to stop lying: it opens
+ the RECEIPT VOUCHER with that customer already chosen, which is the screen
+ that really posts the money against their open invoices.
+
+ The collection dialog on the order card has the same hole (it toasts and
+ writes nothing). It is only reachable from a widget nothing renders any more,
+ so nobody is losing money through it today, but it should either be wired up
+ or removed. Say which.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S6.  OPENING A CUSTOMER FROM THEIR PAPERWORK
+───────────────────────────────────────────────────────────────────────────────
+
+ /parties/new?type=customer is two pages now.
+
+ PAGE ONE -- the documents, one set at a time, in this order:
+
+     CNIC            front and back
+     Business card   front and back
+     Affidavit       page 1 and page 2
+
+ Each picture can be taken with the camera (it opens inside the page, back
+ camera on a phone, webcam on a laptop) or uploaded -- and Upload on a phone
+ is the one that offers the gallery, which is where the picture usually
+ already is. Every set has "Not available", and skipping all three goes
+ straight to the form with empty boxes, which is exactly what the old screen
+ was.
+
+ THE PICTURES GO UP AS THEY ARE TAKEN, to the images Cloudinary account. They
+ are not held in the browser: six photographs in a form is a save that fails
+ on a bad line with everything lost.
+
+ PAGE TWO -- the form, with whatever could be read already in the boxes:
+
+     Legal Name    the CNIC's own name, WITHOUT the father's name
+     Display Name  cnic name - shop name - shop location, the shop name and
+                   the location from the BUSINESS CARD
+     Category      Retailer by default
+     Industry      the shop's name with its location
+     Phone / Alt   from the CNIC; both when two are printed, in either
+                   03xxxxxxxxx or +923xxxxxxxxx form
+     Email         from the business card, any domain
+     Address       from the BUSINESS CARD, never the CNIC -- goods go to the
+                   shop, not to where the man sleeps
+     City          from the CNIC, matched to one of your eleven Pakistani
+                   cities (they are stored "Karachi - Pakistan", so the match
+                   is on what comes before the dash), and the province follows
+
+ ENGLISH ONLY. A CNIC prints every field in Urdu as well; the Urdu is ignored
+ rather than transliterated, because a transliteration is a guess dressed up
+ as a fact. Placeholder text like "xyz" is skipped.
+
+ NOTHING IS SAVED UNTIL THE SALESPERSON HAS READ IT. Every filled box is
+ editable, and what they save is what the database gets. The reader is a
+ typist with good eyes, not a source of truth.
+
+ A PICTURE THAT CANNOT BE READ is named. The screen goes back to that section
+ and says which: "not clear", "too much light", "part of the document is
+ outside the picture". It does not half-fill the form -- a name that is 80 %
+ right is worse than an empty box, because nobody re-reads a box that is
+ already filled.
+
+ THE ONE PDF. After the customer is created, every picture they gave is bound
+ into a single legal_documents.pdf -- a cover page with who they are and what
+ is in the set, then one page per photograph -- and stored on the documents
+ Cloudinary account with its link on the customer. Anybody who can open the
+ customer can download it.
+
+ EDITING NEVER RE-READS. Adding a picture to an existing customer files it and
+ rebuilds the PDF; it does not touch the details. Once a person has checked a
+ name, a machine does not get another go at it -- that was your instruction
+ and it is also the right way round.
+
+ THE CITY LIST ON THE CUSTOMER FORM IS PAKISTAN ONLY now. The Chinese cities
+ are still there for suppliers, which is what they were added for.
+
+ CATEGORY BY ROLE: a rep and the accountant may open a Retailer, a Wholesaler
+ or an Agent. Distributor and Manufacturer are yours alone. The list is cut on
+ the server, so it cannot be widened by editing the page.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S7.  WHAT I RAN AGAINST THE LIVE DATABASE, AND ONE MISTAKE
+───────────────────────────────────────────────────────────────────────────────
+
+ MIGRATION 21 -- run in full, on your say-so:
+   · the three steps removed, seven orders moved to "Processing in Order Dept"
+   · "IsForReceiving" added; Meezan and Faisal added; the four marked
+   · ORD-26-0171 and INV-26-8893 deleted, after checking that no return, no
+     payment, no delivery and no stock movement hung off either
+
+ MIGRATION 22 -- run in full: the eight columns that hold a customer's six
+ document pictures and the PDF they are bound into. Empty for all 26 existing
+ parties.
+
+ ONE TEST ORDER, raised and removed: ORD-26-0174, one Titan AirPro, taken
+ through the new form as a salesperson, moved to Dispatched out of Karachi
+ Warehouse to prove the stock comes off (270 -> 269), then deleted with its
+ unit put back and the order number wound back so your next order is
+ ORD-26-0174 with no gap.
+
+ ONE TEST CUSTOMER, created and removed: VZ-C-0018 "ZZ TEST DOCUMENTS
+ CUSTOMER", used to prove the documents PDF. Its "documents" pointed at an
+ existing product photograph, so nothing was uploaded for it. The PDF it
+ produced came back a real 5-page PDF of 693 KB with four photographs
+ embedded, served by Cloudinary. The customer is deleted; you are back to 26
+ parties. The PDF itself is still sitting in the documents account,
+ unreferenced -- deleting a file there needs Cloudinary's own API.
+
+ 🔴 AND THE MISTAKE. A check that was meant to be REFUSED -- "dispatch from a
+ shelf that is short" -- was not refused, because Shop 2 turned out to have
+ the stock. A real order, ORD-26-0163, was dispatched on paper: three units
+ came off Shop 2 and a notification went out saying it had left.
+
+ It was put straight back within the minute: the three units returned, the
+ movements deleted, the order back at "Processing in Order Dept" with the
+ location it had, the notifications removed, and a line in its history saying
+ exactly what happened. Nothing physically moved and nothing is out by a
+ piece. I am telling you because a status that changed and changed back is
+ the kind of thing somebody notices later and cannot explain.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S8.  THINGS I FOUND AND DID NOT CHANGE
+───────────────────────────────────────────────────────────────────────────────
+
+ S8.1  THE CAMERA AND THE READER ARE BOTH UNPROVEN ON REAL HARDWARE
+
+       The test browser has no camera and there is no reader key, so what I
+       could prove is: the camera dialog opens, asks, and says the right thing
+       when it is refused; the upload path works; the reader endpoint answers
+       "not configured" and the screen behaves as it should when it does.
+
+       WHAT NOBODY HAS DONE YET is take a photograph of a real CNIC with a
+       real phone and see what comes back. Please do that on one shop before
+       your reps rely on it. The prompt is one file
+       (PartyDocumentsController.Prompt) and it is meant to be argued with --
+       if it reads a name wrongly, that is the place to say so.
+
+ S8.2  ORDERS BEFORE TODAY STILL HAVE NOT MOVED THEIR STOCK
+
+       S1 fixes it going forward. The 26 past orders are still overstating
+       every product they carried. The correction is one script and it needs
+       your word, because it moves real shelf counts.
+
+ S8.3  NOTHING POSTS A SALE OR A RETURN TO THE LEDGER
+
+       Unchanged from 21 September (R7.1) and still the biggest accounting
+       gap: 39 invoices, 12 journal entries, all twelve seeded. Aged
+       receivables and the credit-limit check under-state by everything billed
+       through the app.
+
+ S8.4  THE SIX EXPORTS STILL STOP AT 50 ROWS
+
+       Orders, invoices, walk-in, parties, journal entries, vouchers and
+       expenses. One line each. Still waiting on your word.
+
+ S8.5  THE COLLECTION DIALOG WRITES NOTHING EITHER -- see S5.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ S9.  WHERE THE NEW THINGS LIVE
+───────────────────────────────────────────────────────────────────────────────
+
+ BACKEND
+   Services/OrderWorkflow.cs                  the seven steps, who may dispatch
+   Controllers/SalesController.cs             the dispatch step: the place, the
+                                              shortage check, the stock out
+   Controllers/PartyDocumentsController.cs    reading the documents, binding
+                                              the PDF
+   Services/GeminiClient.ReadImagesAsync      the only call that sends pictures
+   Documents/LegalDocsPdf.cs                  the customer's document set
+   Documents/PdfCanvas.Jpeg                   JPEG embedding, written for it
+   Models/PaymentMethod.Custom.cs             IsForReceiving
+   Models/Party.Custom.cs                     the six pictures and the PDF
+   database/21_order_chain_and_receiving.sql
+   database/22_customer_documents.sql
+
+ FRONTEND
+   app/(app)/sales/orders/new/page.tsx            the one-page order screen
+   components/sales/order-workflow.tsx            the "where from?" dialog
+   components/parties/customer-documents-step.tsx page one of a new customer
+   components/parties/document-capture.tsx        one photograph: camera+upload
+   app/(app)/parties/new/page.tsx                 the two pages together
+   lib/labels.ts, lib/nav-config.ts, proxy.ts     seven steps, no packing
 
 
 ═══════════════════════════════════════════════════════════════════════════════

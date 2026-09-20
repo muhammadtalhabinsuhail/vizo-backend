@@ -2,9 +2,119 @@
  CHANGA  —  what YOU have to change, by hand, outside the code
 ═══════════════════════════════════════════════════════════════════════════════
 
- Updated 21 September 2026 with the returns and rights work (section B, first).
- Section A is from 20 September and 1–4 from 17 September; both still stand.
+ Updated 22 September 2026 with the order-chain and new-customer work
+ (section C, first). Section B is 21 September, A is 20 September and 1-4 are
+ 17 September. All of them still stand.
 
+
+───────────────────────────────────────────────────────────────────────────────
+ C.  22 SEPTEMBER — ONE KEY, TWO MIGRATIONS, AND A WORD TO YOUR ORDER DESK
+───────────────────────────────────────────────────────────────────────────────
+
+ C1  GET A READER KEY, OR THE NEW CUSTOMER SCREEN ONLY TAKES PICTURES
+
+     Photographing a CNIC and a business card and having the form fill itself
+     needs something that can read a photograph. Nothing on this system can
+     today: "Gemini:ApiKey" in appsettings.json is an empty string.
+
+     It is free and it takes two minutes:
+
+        1. open  https://aistudio.google.com/apikey  and sign in with a Google
+           account (vizo.com.pk@gmail.com is the obvious one)
+        2. press "Create API key" and copy it
+        3. put it in backend/vizo-backend/appsettings.json:
+
+               "Gemini": { "ApiKey": "AIza….", "Model": "gemini-2.0-flash", … }
+
+           or, on the API host, as the environment variable
+
+               Gemini__ApiKey = AIza….
+
+        4. restart the API
+
+     The free tier is generous -- a few hundred documents a day -- and reading
+     one customer is two pictures. Nothing else in the app needs the key; the
+     AI reports have been waiting for it since September and will start
+     working at the same time.
+
+     UNTIL IT IS SET, the new-customer screen says so on its first page, still
+     takes and files the photographs, still makes the one PDF, and the
+     salesperson types the details. Nothing is broken; it is just manual.
+
+     WHAT GOES TO GOOGLE when it is on: the CNIC and business-card photographs
+     of the shop you are opening, and nothing else. No prices, no customers,
+     no ledger. Google's API terms say paid-tier data is not used for
+     training; the free tier is used for improving their models. If that
+     matters to you, use a paid key -- it is the same key field.
+
+ C2  BOTH MIGRATIONS ARE ALREADY RUN — on Neon only
+
+     backend/database/21_order_chain_and_receiving.sql
+     backend/database/22_customer_documents.sql
+
+     RUN AND VERIFIED on the live database on 22 September, because you said
+     to run them. ANY OTHER ENVIRONMENT needs them before the new API goes up
+     there. Both are safe to run twice.
+
+     What 21 did that people will SEE:
+       · the order chain is seven steps, not ten. "Seen by Warehouse", "On way
+         to Order Dept" and "Packaging" are gone, and "Received at Order Dept"
+         now reads "Processing in Order Dept"
+       · SEVEN LIVE ORDERS that were standing in the removed steps are now at
+         "Processing in Order Dept", each with a line in its own history
+         saying why
+       · money coming in is Cash, Credit, Meezan or Faisal -- everywhere money
+         is received. Nothing was deleted; the old methods still exist for
+         money going out
+       · ORD-26-0171 and INV-26-8893 are deleted, as you asked
+
+     What 22 did: eight columns on "Party" for a customer's six document
+     pictures and the PDF they are bound into. Empty for every existing
+     customer.
+
+ C3  TELL THE ORDER DESK THAT DISPATCH NOW TAKES THE STOCK OFF
+
+     This is the biggest change in the round and the one that will surprise
+     somebody. Pressing Dispatched asks WHICH PLACE the order is going out of
+     and takes the goods off that shelf there and then. If the shelf is short
+     it refuses and names what is missing.
+
+     Two things follow from that:
+
+       · THE PACKING SCREEN IS GONE. It was the only place stock used to leave
+         from, it ran on a status that no longer exists, and two screens
+         taking the same goods off the same shelf is how a count goes wrong.
+       · THE DISPATCH SCREEN NOW COMES AFTER the step instead of before it --
+         it is where the courier, the bilty and the COD are recorded once the
+         goods are on a van.
+
+     WHO CAN DISPATCH: the order department, the accountant and you.
+
+ C4  THE PAST ORDERS ARE STILL WRONG — one script, your word
+
+     26 orders were dispatched or delivered before today without ever moving
+     stock, so every product on them is still counted as being on a shelf. The
+     correction is one script; it changes real shelf counts, so it waits for
+     you. Say the word and I will show you the list before running anything.
+
+ C5  "RECORD PAYMENT" ON AN INVOICE NEVER RECORDED ANYTHING
+
+     Not a change for you to make -- a thing to know. That button produced a
+     form, said "Payment recorded" and wrote nothing at all, to any table, for
+     anybody who ever pressed it. If your accountant has been using it,
+     nothing they entered exists.
+
+     It is off the sales panel now, as you asked, and for the accountant and
+     you it opens the RECEIPT VOUCHER with the customer already chosen --
+     which is the screen that really posts money against their invoices.
+
+     NO ENVIRONMENT VARIABLES CHANGED in this round, apart from the reader key
+     in C1.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ 21 SEPTEMBER — still current
+═══════════════════════════════════════════════════════════════════════════════
 
 ───────────────────────────────────────────────────────────────────────────────
  B.  21 SEPTEMBER — FOUR THINGS, AND THE FIRST ONE IS URGENT

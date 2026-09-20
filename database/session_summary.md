@@ -161,6 +161,46 @@ A short record of what was built. Full reasoning, warnings and decisions are in
 
 ---
 
+## 10. The order chain, and opening a customer from their papers — 22 Sep
+
+- **Seven steps, not ten.** *Seen by Warehouse*, *On way to Order Dept* and *Packaging* removed
+  from the workflow, the screens and the database; *Received at Order Dept* is now **Processing in
+  Order Dept**. Seven live orders standing in the removed steps were moved, each with a line in
+  its own history.
+- **🔴 Dispatched finally moves the stock.** The step asks which place the order is going out of,
+  refuses if that shelf is short (naming the items), writes a SALE movement per line and sets the
+  order's location. This closes the biggest correctness problem in the system going forward; the
+  26 past orders still need a one-off correction (`changa.txt` C4).
+- **/packing retired** — it was the only place stock ever left from, on a status that no longer
+  exists. **/dispatch** moved behind the chain: it books the courier after the goods have gone.
+- **The order screen is one page** — no *Selling from*, no *Sales rep* (always the signed-in
+  person, enforced in the API), no discount or tax boxes. Per line: Qty · RATE · Margin ·
+  Margin %, linked through `lib/pricing.ts`, and product photographs in the picker and on every
+  line.
+- **Display names everywhere** — 128 places in the API. The legal name stays on the party's own
+  record and under the counterparty block on printed documents.
+- **Money in is Cash, Credit, Meezan, Faysal** — flagged in the database
+  (`PaymentMethod.IsForReceiving`), not listed in code. Money out keeps the whole table.
+- **Opening a customer is two pages**: the CNIC, the shop card and the affidavit photographed or
+  uploaded (camera in-page, or the phone's gallery), read by Gemini into the form — legal name
+  from the CNIC without the father's name, display name as *cnic - shop - location*, address from
+  the CARD, city matched to one of the eleven Pakistani cities — then the form, every box
+  editable. Six pictures on the images account, one `legal_documents.pdf` on the documents
+  account. Editing never re-reads.
+- **PdfCanvas can embed JPEGs now** (`/DCTDecode` XObjects), written for that PDF.
+
+### Found and not changed
+- **"Record Payment" on an invoice never wrote anything** — it toasted and closed. Now accounts
+  and the owner only, and it opens the receipt voucher, which really posts. `convey.txt` §S5.
+- **The camera and the reader are unproven on real hardware** — no camera in the test browser and
+  no API key yet. §S8.1.
+- **26 past orders still have not moved their stock**; **nothing posts a sale to the ledger**;
+  **six exports still stop at 50 rows**.
+
+`api 1667625` · `web f0941e5` (and the documents work in the commits after them)
+
+---
+
 ## Database migrations — all run on live Neon
 | File | Adds |
 |---|---|
@@ -170,6 +210,8 @@ A short record of what was built. Full reasoning, warnings and decisions are in
 | `18_sales_scope_returns_and_places.sql` | Sales permissions, `PdfDeliverable`, `Party.CreatedByUserId`, the Lahore pair |
 | `19_product_pricing.sql` | `DutyPrice`, `MarginPrice` (run). Section 2 drops `OpeningCost` — **not run yet**, after deploy |
 | `20_places_rights_and_returns.sql` | In Transit removed, billing and returns rights narrowed, `SalesReturn.InvoiceId` nullable, INVOICED renamed *Invoiced/Edit* |
+| `21_order_chain_and_receiving.sql` | Chain cut to seven steps, `PaymentMethod.IsForReceiving` + Meezan/Faisal, ORD-26-0171 and INV-26-8893 deleted |
+| `22_customer_documents.sql` | Eight columns on `Party` for the six document pictures and the bound PDF |
 
 Run these on any other environment (local copy, staging).
 
@@ -180,4 +222,7 @@ Run these on any other environment (local copy, staging).
   archives it.
 - **Reps with no assigned customers can no longer raise an order at all** — the picker is
   their own list now. Assign accounts at People → Customers. `changa.txt` §B1.
+- **Set `Gemini:ApiKey`** or the new customer screen only takes pictures and the form is typed by
+  hand. `changa.txt` §C1.
+- **Dispatch takes stock off the shelf now** and the packing screen is gone. `changa.txt` §C3.
 - `.env.example` still has a VAPID public key that does not match the server.

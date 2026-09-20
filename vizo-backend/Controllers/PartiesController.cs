@@ -247,6 +247,19 @@ public class PartiesController : ApiControllerBase
                     defaultLocationId = x.DefaultLocationId,
                     rating = x.Rating.ToString(),
                     notes = x.Notes,
+                    /* The documents, and the one PDF they are bound into.
+                       Null everywhere for an account opened before 22
+                       September, which is most of them. */
+                    documents = new
+                    {
+                        cnicFront = x.CnicFrontUrl,
+                        cnicBack = x.CnicBackUrl,
+                        cardFront = x.CardFrontUrl,
+                        cardBack = x.CardBackUrl,
+                        affidavitFront = x.AffidavitFrontUrl,
+                        affidavitBack = x.AffidavitBackUrl,
+                        pdfUrl = x.LegalDocsPdfUrl
+                    },
                     isActive = x.User.IsActive,
                     createdAt = x.User.CreatedAt,
                     orderCount = x.SalesOrders.Count,
@@ -593,6 +606,14 @@ public class PartiesController : ApiControllerBase
                 Ntn = body.Ntn,
                 Strn = body.Strn,
                 Cnic = body.Cnic,
+                /* Whatever was photographed on the way in. Blank when the
+                   salesperson said the documents were not available. */
+                CnicFrontUrl = Clean(body.CnicFrontUrl),
+                CnicBackUrl = Clean(body.CnicBackUrl),
+                CardFrontUrl = Clean(body.CardFrontUrl),
+                CardBackUrl = Clean(body.CardBackUrl),
+                AffidavitFrontUrl = Clean(body.AffidavitFrontUrl),
+                AffidavitBackUrl = Clean(body.AffidavitBackUrl),
                 CreditLimit = body.CreditLimit,
                 CreditDays = body.CreditDays,
                 HoldPolicyId = body.HoldPolicyId,
@@ -670,6 +691,25 @@ public class PartiesController : ApiControllerBase
             party.Ntn = body.Ntn;
             party.Strn = body.Strn;
             party.Cnic = body.Cnic;
+
+            /* A PICTURE SENT HERE REPLACES THE ONE ON FILE; ONE LEFT OUT
+               CHANGES NOTHING.
+
+               The edit screen only sends a photograph when somebody has just
+               taken one. If it sent nulls for the rest, opening a customer and
+               pressing Save would quietly wipe their documents -- and nothing
+               on that screen would have suggested it was about to.
+
+               Nothing is re-read on an edit either: the owner's rule is that
+               the details already in the database win, and a later photograph
+               is filed, not obeyed. */
+            party.CnicFrontUrl = Clean(body.CnicFrontUrl) ?? party.CnicFrontUrl;
+            party.CnicBackUrl = Clean(body.CnicBackUrl) ?? party.CnicBackUrl;
+            party.CardFrontUrl = Clean(body.CardFrontUrl) ?? party.CardFrontUrl;
+            party.CardBackUrl = Clean(body.CardBackUrl) ?? party.CardBackUrl;
+            party.AffidavitFrontUrl = Clean(body.AffidavitFrontUrl) ?? party.AffidavitFrontUrl;
+            party.AffidavitBackUrl = Clean(body.AffidavitBackUrl) ?? party.AffidavitBackUrl;
+
             party.CreditLimit = body.CreditLimit;
             party.CreditDays = body.CreditDays;
             party.HoldPolicyId = body.HoldPolicyId;
@@ -875,8 +915,19 @@ public class PartiesController : ApiControllerBase
         return null;
     }
 
+    /// <summary>Trimmed, or null when there was nothing but space.</summary>
+    private static string? Clean(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
+
     // ══════════════════════════ request bodies ══════════════════════════
 
+    /* THE SIX PHOTOGRAPHS ARE OPTIONAL AND THEY ARE LINKS.
+
+       The browser uploads each picture to Cloudinary as it is taken (through
+       /api/upload/image) and sends the URLs here with the rest of the form, so
+       a slow line never holds a six-photograph form hostage to one request.
+       Every one of them may be null: a shopkeeper with no affidavit -- or with
+       nothing at all -- is still a customer. See
+       backend/database/22_customer_documents.sql. */
     public record PartyRequest(
         string? PartyCode, string LegalName, string? DisplayName, string Type,
         string? Email, string? Phone, string? AltPhone, string? AddressLine,
@@ -884,7 +935,10 @@ public class PartiesController : ApiControllerBase
         string? Ntn, string? Strn, string? Cnic,
         decimal CreditLimit, int CreditDays, int HoldPolicyId, decimal OpeningBalance,
         int? SalesPersonUserId, int? DefaultLocationId, string? Rating, string? Notes,
-        bool IsActive);
+        bool IsActive,
+        string? CnicFrontUrl = null, string? CnicBackUrl = null,
+        string? CardFrontUrl = null, string? CardBackUrl = null,
+        string? AffidavitFrontUrl = null, string? AffidavitBackUrl = null);
 
     public record ActiveRequest(bool Value);
 

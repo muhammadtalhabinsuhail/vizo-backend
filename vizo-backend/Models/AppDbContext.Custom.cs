@@ -267,6 +267,18 @@ public partial class AppDbContext
 
         modelBuilder.Entity<Party>(entity =>
         {
+            /* The customer's documents -- six photographs and the PDF they are
+               bound into. See Models/Party.Custom.cs and
+               database/22_customer_documents.sql. */
+            entity.Property(e => e.CnicFrontUrl).HasMaxLength(500);
+            entity.Property(e => e.CnicBackUrl).HasMaxLength(500);
+            entity.Property(e => e.CardFrontUrl).HasMaxLength(500);
+            entity.Property(e => e.CardBackUrl).HasMaxLength(500);
+            entity.Property(e => e.AffidavitFrontUrl).HasMaxLength(500);
+            entity.Property(e => e.AffidavitBackUrl).HasMaxLength(500);
+            entity.Property(e => e.LegalDocsPdfUrl).HasMaxLength(500);
+            entity.Property(e => e.LegalDocsPdfId).HasMaxLength(255);
+
             /* Who opened the account, as opposed to which rep it is assigned
                to. SetNull rather than Cascade: deactivating the person who
                typed a customer in must not take the customer with them. */

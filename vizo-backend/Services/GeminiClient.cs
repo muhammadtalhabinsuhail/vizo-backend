@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
@@ -141,6 +141,103 @@ public class GeminiClient
                show; losing the commentary is a much smaller loss than losing
                the screen. */
             _logger.LogWarning(ex, "Gemini call failed.");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Reads PHOTOGRAPHS and returns whatever JSON the instruction asked for.
+    ///
+    /// This is the one place the "the model never calculates" rule bends, and
+    /// it is worth saying exactly how far. The model is not being asked to
+    /// work anything out or to judge anything: it is being asked to READ what
+    /// is printed on a CNIC and a shop card and type it back as JSON. Every
+    /// field it returns is shown to the salesperson in an editable box before
+    /// a customer is created, so nothing it gets wrong reaches the database
+    /// without a person looking at it.
+    ///
+    /// Two things it is told to do that matter:
+    ///   - ENGLISH ONLY. A CNIC carries the same name in Urdu and in English;
+    ///     the Urdu is ignored rather than transliterated.
+    ///   - SAY WHEN IT CANNOT READ. A blurred photograph or one shot into the
+    ///     light must come back as readable:false with a reason, so the screen
+    ///     can ask for another picture instead of inventing half a name.
+    ///
+    /// Returns null on any failure, like everything else here -- the caller
+    /// then offers the form empty and the salesperson types it in.
+    /// </summary>
+    public async Task<string?> ReadImagesAsync(
+        string instruction,
+        IReadOnlyList<(string MimeType, byte[] Bytes)> images,
+        CancellationToken ct = default)
+    {
+        if (!IsConfigured)
+        {
+            _logger.LogDebug("Gemini is not configured; not reading the documents.");
+            return null;
+        }
+        if (images.Count == 0) return null;
+
+        /* One user turn: the instruction, then the pictures in the order the
+           caller listed them. The instruction names them in that order. */
+        var parts = new List<object> { new { text = instruction.Trim() } };
+        foreach (var (mime, bytes) in images)
+        {
+            parts.Add(new
+            {
+                inline_data = new
+                {
+                    mime_type = string.IsNullOrWhiteSpace(mime) ? "image/jpeg" : mime,
+                    data = Convert.ToBase64String(bytes)
+                }
+            });
+        }
+
+        var body = new
+        {
+            contents = new[] { new { role = "user", parts = parts.ToArray() } },
+            generationConfig = new
+            {
+                temperature = 0,                 // transcription, not writing
+                maxOutputTokens = 2048,
+                /* Ask for JSON and get JSON -- without this the model wraps it
+                   in ```json fences half the time and the parse is a guess. */
+                responseMimeType = "application/json"
+            }
+        };
+
+        try
+        {
+            using var client = _http.CreateClient();
+            /* Pictures are slower than text: a CNIC pair can take fifteen
+               seconds on a bad line, and timing out at the usual thirty means
+               the salesperson types it all in for nothing. */
+            client.Timeout = TimeSpan.FromSeconds(Math.Max(TimeoutSeconds, 60));
+
+            var url = $"https://generativelanguage.googleapis.com/v1beta/models/{Model}:generateContent";
+            using var req = new HttpRequestMessage(HttpMethod.Post, url);
+            req.Headers.Add("x-goog-api-key", ApiKey);
+            req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+
+            using var res = await client.SendAsync(req, ct);
+            var raw = await res.Content.ReadAsStringAsync(ct);
+
+            if (!res.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Gemini vision returned {Status}: {Body}", (int)res.StatusCode, Trim(raw));
+                return null;
+            }
+
+            return ReadFirstText(raw);
+        }
+        catch (TaskCanceledException)
+        {
+            _logger.LogWarning("Gemini vision timed out.");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Gemini vision call failed.");
             return null;
         }
     }

@@ -616,7 +616,7 @@ public class SalesController : ApiControllerBase
         var wanted = body.Lines.Select(l => l.ProductId).Distinct().ToList();
         var known = await _db.Products.AsNoTracking()
             .Where(p => wanted.Contains(p.ProductId))
-            .Select(p => new { p.ProductId, p.ProductName, p.CostPrice, p.DutyPrice })
+            .Select(p => new { p.ProductId, p.ProductName, p.SalePrice })
             .ToDictionaryAsync(p => p.ProductId);
 
         /* Only a salesperson is held to the margin cap. The accountant edits an
@@ -636,45 +636,48 @@ public class SalesController : ApiControllerBase
             if (!known.TryGetValue(l.ProductId, out var product))
                 return $"Product {l.ProductId} does not exist.";
 
-            if (isSalesperson && ExceedsSalesMargin(l.Rate, product.CostPrice + product.DutyPrice, out var ceiling))
-                return $"{product.ProductName}: {l.Rate:0.00} is too high. A salesperson can add at most "
-                     + $"{MaxSalesMarginPercent}% over what the item cost to land ({product.CostPrice + product.DutyPrice:0.00}), "
-                     + $"so the highest rate is {ceiling:0.00}.";
+            if (isSalesperson && SalesRateOutOfRange(l.Rate, product.SalePrice, out var floor, out var ceiling))
+                return $"{product.ProductName}: {l.Rate:0.00} is not allowed. The rate is fixed at {floor:0.00}; "
+                     + $"a salesperson can add up to {MaxSalesMarginPercent}% margin on top of it, "
+                     + $"so the highest price is {ceiling:0.00}.";
         }
 
         return null;
     }
 
     /// <summary>
-    /// The most margin a salesperson may add to an item, in percent of what it
-    /// cost to land (cost + duty). The owner's rule, 21 September: a line starts
-    /// at zero margin and "salesperson cannot exceed margin percent above 10".
-    /// The order screen carries the same number (MAX_SALES_MARGIN_PERCENT in
-    /// orders/new/page.tsx), but this is the one that counts -- a limit that only
-    /// the browser knows about is a suggestion.
+    /// The most margin a salesperson may add to an item, in percent of its FIXED
+    /// RATE -- the selling price the Super Admin set. The owner's rules, 21
+    /// September: the rate on the order screen fills itself and cannot be edited;
+    /// the salesperson adds a margin on top; and "salesperson cannot exceed margin
+    /// percent above 10". The order screen carries the same number
+    /// (MAX_SALES_MARGIN_PERCENT in orders/new/page.tsx), but this is the one that
+    /// counts -- a rate that is only locked in the browser is a suggestion.
     /// </summary>
     private const decimal MaxSalesMarginPercent = 10m;
 
     /// <summary>
-    /// True when <paramref name="rate"/> is more than <see cref="MaxSalesMarginPercent"/>
-    /// over <paramref name="landedCost"/>. Never true when there is no landed
-    /// cost: with nothing to measure a percentage against, the rule has nothing
-    /// to say, and refusing every price on a product nobody has costed yet would
-    /// stop the rep taking the order at all.
+    /// True when a salesperson's <paramref name="rate"/> is outside what they are
+    /// allowed: below the fixed rate (it cannot be edited, and a margin cannot be
+    /// negative) or more than <see cref="MaxSalesMarginPercent"/> above it.
+    /// Never true when the item has no selling price on file: with nothing to
+    /// take a percentage of, refusing every price would stop the rep taking the
+    /// order at all.
     ///
-    /// Compared as a ceiling in money, one paisa of slack, not as a rounded
-    /// percentage. The screen works out its rate as landed cost plus a margin
-    /// rounded to the paisa, so a rate it built at exactly 10% can be a hair over
-    /// 10.00 once divided back -- and a rule that refuses what its own screen
-    /// produced is worse than no rule.
+    /// Compared as money with one paisa of slack, not as a rounded percentage.
+    /// The screen builds its price as the rate plus a margin rounded to the paisa,
+    /// so what it produces at exactly 10% can be a hair over 10.00 once divided
+    /// back -- and a rule that refuses what its own screen produced is worse than
+    /// no rule.
     /// </summary>
-    private static bool ExceedsSalesMargin(decimal rate, decimal landedCost, out decimal ceiling)
+    private static bool SalesRateOutOfRange(decimal rate, decimal fixedRate, out decimal floor, out decimal ceiling)
     {
+        floor = fixedRate;
         ceiling = 0m;
-        if (landedCost <= 0m) return false;
+        if (fixedRate <= 0m) return false;
 
-        ceiling = Money(landedCost * (1m + MaxSalesMarginPercent / 100m));
-        return rate > ceiling + 0.01m;
+        ceiling = Money(fixedRate * (1m + MaxSalesMarginPercent / 100m));
+        return rate < fixedRate - 0.01m || rate > ceiling + 0.01m;
     }
 
     /// <summary>

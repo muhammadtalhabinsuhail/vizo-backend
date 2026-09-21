@@ -105,15 +105,32 @@
      never showed them, and creating or changing one needs products.manage, which
      only you hold. Nothing they could see has changed.
 
- D5  THE SALESPERSON'S MARGIN
+ D5  THE SALESPERSON'S RATE AND MARGIN (revised the same day)
 
-     A line now STARTS at what the item cost to land (cost + duty) with margin 0,
-     instead of at the catalogue sale price. A salesperson can add up to 10% and no
-     more: typing more in the Margin %, the Margin, or the Rate box pulls it back
-     to 10% with a red note, and the API refuses the order too, saying the highest
-     rate they may set. The Accountant (editing at Invoiced/Edit) and you are not
-     held to it. An item with NO cost on file has nothing to measure a percentage
-     against and is not capped -- there is one such item today.
+     The order screen now works like this, as you described it:
+
+       RATE       fills itself with the selling price YOU set on the product, and
+                  cannot be edited.
+       MARGIN (in Rs.)  is added on top of the rate.
+       MARGIN %   is a percentage OF THE RATE: at Rs. 100, 10% adds Rs. 10.
+       FINAL PRICE  is shown under each line as "PKR 1,078 / piece" (rate + margin).
+
+     The two margin boxes follow each other, and the rate never moves -- typing a
+     margin used to re-work the rate from the landed cost, which is what made the
+     numbers jump. Example on the live data: the T9 earbuds sell at 980; 10% adds
+     98, so the piece is 1,078; Rs. 50 shows 5.1% and 1,030.
+
+     A salesperson can add at most 10% and cannot go below the rate. Typing more
+     pulls it back to 10% with a red note, and the API refuses any rate outside
+     980 to 1,078 for that item. The Accountant (editing at Invoiced/Edit) and you
+     are not held to it. An item with NO selling price on file has nothing to take
+     a percentage of and is not limited.
+
+     THIS REPLACES the first version, which started at the landed cost. It means
+     the salesperson's price is now anchored to the price YOU keep on each product,
+     so that price has to be right. Two things to know: the picker and the line show
+     that price, and a product whose price is below its own landed cost shows a red
+     "fixed rate is below what this piece cost to land" so you can spot it.
 
  D6  PICTURES: ONLY 3 OF YOUR 36 ACTIVE PRODUCTS HAVE ONE
 

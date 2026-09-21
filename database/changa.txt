@@ -2,9 +2,135 @@
  CHANGA  —  what YOU have to change, by hand, outside the code
 ═══════════════════════════════════════════════════════════════════════════════
 
- Updated 22 September 2026 with the order-chain and new-customer work
- (section C, first). Section B is 21 September, A is 20 September and 1-4 are
- 17 September. All of them still stand.
+ Updated with the latest session (section D, first): Railway, the Gemini free-
+ tier limit and the two live-data changes made. Section C is the order-chain and
+ new-customer work, B is 21 September, A is 20 September and 1-4 are 17
+ September. All of them still stand.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ D.  21 SEPTEMBER, LATER — RAILWAY, THE FREE-TIER LIMIT, AND WHAT IS ALREADY DONE
+───────────────────────────────────────────────────────────────────────────────
+
+ D1  RAILWAY: ONE NEW VARIABLE, AND NOTHING ELSE
+
+     You asked which credentials still have to be added on Railway. It is ONE:
+
+         Gemini__ApiKey      the Google AI Studio key
+
+     I checked, rather than assumed: the committed appsettings.json has exactly
+     one blank value, Gemini:ApiKey. Everything else the API reads -- the Neon
+     connection string, the JWT key, both Cloudinary accounts, the Gmail login,
+     the VAPID push keys -- is already in that file and travels with the code, so
+     Railway needs nothing more for them. (You already set App__WebBaseUrl.)
+
+     Vercel (the website) needs NO new variables.
+
+     Set it at Railway -> your API service -> Variables -> New Variable. The
+     double underscore is ASP.NET's way of writing Gemini:ApiKey. Redeploy after.
+
+     IF YOU DO NOT, nothing breaks. The customer screen still takes and saves the
+     photographs and the salesperson types the details in; the AI reports show
+     their figures and simply leave the written explanation off.
+
+     A NOTE ON "I HAVE PASTED THE KEY HERE". No key arrived with your message --
+     the text stopped at "Also, I have pasted Gemini key here". I used the key you
+     sent before, which is still in backend/vizo-backend/appsettings.Development.json
+     on this machine (gitignored, never pushed). If you meant a NEW key, put that
+     one in that file and on Railway instead.
+
+ D2  THE FREE KEY RUNS OUT, AND THIS IS THE ONE THING I WOULD DO SOMETHING ABOUT
+
+     While testing, the AI stopped answering half way through and Google said:
+
+         429  "You exceeded your current quota ...
+              generate_content_free_tier_requests, limit: 20"
+
+     A free key gets about TWENTY requests a day PER MODEL. This system asks three
+     models in turn (gemini-flash-latest, then two lighter ones), so roughly sixty
+     a day before everything AI goes quiet until the next day. Reading one
+     customer's papers costs one request, an AI report or a question costs one,
+     and the nightly summary one more. For a shop opening a few accounts a day and
+     glancing at a report or two, that is enough. On a day of testing, or a busy
+     one, it is not.
+
+     THE FIX IS NOT CODE: in Google AI Studio, attach a billing account to the
+     project ("Set up billing"). The same key then has paid limits, which are
+     far higher, and at this volume the cost is small.
+     A paid key is also excluded from Google using the photographs to train its
+     models, which the free tier is not.
+
+     WHAT THE APP DOES WHEN IT HITS THE LIMIT: it moves to the next model at once,
+     and if all three are spent it says "the reader did not answer, type it in".
+     Before today it did not even do that for the AI REPORTS -- see convey.txt.
+
+ D3  TWO DATABASE CHANGES ARE ALREADY MADE (migration 23, run on Neon)
+
+     You asked for them and they are done, with the figures to undo them in
+     23_undo_values.txt. Said plainly because they are changes to the live data:
+
+       ORDER DEPARTMENT LOST three rights: products.manage, purchases.view and
+       receipts.stock. It KEEPS stock.view, stock.transfer and stock.correct. A new
+       right, products.view ("See items"), was created and given to the Super Admin,
+       the Accountant and the Warehouse Keeper -- so nobody but the order desk
+       loses Items.
+
+       SALES TAX IS 0% ON EVERY PRODUCT. There was never a setting: each product
+       carries its own rate and every screen starts from it. 36 products were at
+       18% and TWO WERE AT 10%. I set all 38 to 0, reading "sales tax must be 0%"
+       as meaning all of it. If the two at 10% were meant to stay, they are in
+       23_undo_values.txt by product id.
+
+       Orders and invoices already issued keep the rate they were made at. Only
+       what NEW documents start at has changed.
+
+     NOBODY HAS TO SIGN OUT AND IN. The menu reads rights from the database on
+     every page load, and the API refuses the order desk by role. I tested it with
+     sign-in tokens minted BEFORE the change.
+
+ D4  WHAT THE ORDER DESK SEES NOW
+
+     Menu: Stock in Hand, Transfers, Stock Correction, Stock History -- and no
+     Items, Categories, Brands, or Purchases at all (and no Suppliers, which
+     shows what has been bought). Typing any of those addresses goes to
+     "Forbidden", and the API answers 403 to every call, including creating.
+
+     In Stock in Hand and the transfer and correction records, a product's name
+     used to be a link to its Item screen. For the order desk it now goes to that
+     product's STOCK HISTORY instead, which is what they were looking for and is
+     a page they may open.
+
+     ONE SIDE EFFECT YOU SHOULD KNOW ABOUT: the Accountant and the Warehouse Keeper
+     can no longer open Categories and Brands by typing the address. Their menus
+     never showed them, and creating or changing one needs products.manage, which
+     only you hold. Nothing they could see has changed.
+
+ D5  THE SALESPERSON'S MARGIN
+
+     A line now STARTS at what the item cost to land (cost + duty) with margin 0,
+     instead of at the catalogue sale price. A salesperson can add up to 10% and no
+     more: typing more in the Margin %, the Margin, or the Rate box pulls it back
+     to 10% with a red note, and the API refuses the order too, saying the highest
+     rate they may set. The Accountant (editing at Invoiced/Edit) and you are not
+     held to it. An item with NO cost on file has nothing to measure a percentage
+     against and is not capped -- there is one such item today.
+
+ D6  PICTURES: ONLY 3 OF YOUR 36 ACTIVE PRODUCTS HAVE ONE
+
+     Every product dropdown in the project now shows the picture large (about 110
+     to 145 pixels, was 40 to 48), and tapping one elsewhere in the app enlarges
+     it. But 33 products have no picture, so most rows show a grey placeholder.
+     Add them at Items -> the product -> Edit -> Image. The screen will not look
+     the way you are imagining until they are in.
+
+ D7  A PUSH NOTIFICATION MAY HAVE REACHED YOU FROM ME
+
+     To test the new-customer screen end to end I created one customer through the
+     real screen, signed in as Sara Khan. The system did what it does for a new
+     account and sent "Account opened by Sara" to you (Umer Memon) and to the AdvPOS System account.
+     The customer, its pictures and its PDF are all deleted, and I deleted the two
+     in-app notifications, but a push that had already gone to a phone cannot be
+     recalled. If somebody asks about "VZ-C-0018", that is what it was.
 
 
 ───────────────────────────────────────────────────────────────────────────────

@@ -318,6 +318,7 @@ public class SalesController : ApiControllerBase
                         productId = i.ProductId,
                         name = i.Product.ProductName,
                         sku = i.Product.Sku,
+                        imageUrl = i.Product.ImageUrl,
                         packing = i.Product.Packing,
                         qty = i.Quantity,
                         rate = i.UnitPrice,
@@ -610,6 +611,20 @@ public class SalesController : ApiControllerBase
         if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
             return "Pick a valid payment method.";
 
+        /* One read for every product on the order, instead of one per line: the
+           existence check below and the margin check both need it. */
+        var wanted = body.Lines.Select(l => l.ProductId).Distinct().ToList();
+        var known = await _db.Products.AsNoTracking()
+            .Where(p => wanted.Contains(p.ProductId))
+            .Select(p => new { p.ProductId, p.ProductName, p.CostPrice, p.DutyPrice })
+            .ToDictionaryAsync(p => p.ProductId);
+
+        /* Only a salesperson is held to the margin cap. The accountant edits an
+           order at Invoiced/Edit and the Super Admin may price anything -- the
+           same reasoning SalesScopeUserId() already uses for whose customers
+           and orders a person sees. */
+        var isSalesperson = SalesScopeUserId() is not null;
+
         foreach (var l in body.Lines)
         {
             if (l.Qty <= 0) return "Every line needs a quantity above zero.";
@@ -618,11 +633,48 @@ public class SalesController : ApiControllerBase
                 return "A line discount must be between 0 and 100 percent.";
             if (l.TaxPercent is < 0 or > 100)
                 return "A line tax rate must be between 0 and 100 percent.";
-            if (!await _db.Products.AnyAsync(p => p.ProductId == l.ProductId))
+            if (!known.TryGetValue(l.ProductId, out var product))
                 return $"Product {l.ProductId} does not exist.";
+
+            if (isSalesperson && ExceedsSalesMargin(l.Rate, product.CostPrice + product.DutyPrice, out var ceiling))
+                return $"{product.ProductName}: {l.Rate:0.00} is too high. A salesperson can add at most "
+                     + $"{MaxSalesMarginPercent}% over what the item cost to land ({product.CostPrice + product.DutyPrice:0.00}), "
+                     + $"so the highest rate is {ceiling:0.00}.";
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// The most margin a salesperson may add to an item, in percent of what it
+    /// cost to land (cost + duty). The owner's rule, 21 September: a line starts
+    /// at zero margin and "salesperson cannot exceed margin percent above 10".
+    /// The order screen carries the same number (MAX_SALES_MARGIN_PERCENT in
+    /// orders/new/page.tsx), but this is the one that counts -- a limit that only
+    /// the browser knows about is a suggestion.
+    /// </summary>
+    private const decimal MaxSalesMarginPercent = 10m;
+
+    /// <summary>
+    /// True when <paramref name="rate"/> is more than <see cref="MaxSalesMarginPercent"/>
+    /// over <paramref name="landedCost"/>. Never true when there is no landed
+    /// cost: with nothing to measure a percentage against, the rule has nothing
+    /// to say, and refusing every price on a product nobody has costed yet would
+    /// stop the rep taking the order at all.
+    ///
+    /// Compared as a ceiling in money, one paisa of slack, not as a rounded
+    /// percentage. The screen works out its rate as landed cost plus a margin
+    /// rounded to the paisa, so a rate it built at exactly 10% can be a hair over
+    /// 10.00 once divided back -- and a rule that refuses what its own screen
+    /// produced is worse than no rule.
+    /// </summary>
+    private static bool ExceedsSalesMargin(decimal rate, decimal landedCost, out decimal ceiling)
+    {
+        ceiling = 0m;
+        if (landedCost <= 0m) return false;
+
+        ceiling = Money(landedCost * (1m + MaxSalesMarginPercent / 100m));
+        return rate > ceiling + 0.01m;
     }
 
     /// <summary>
@@ -1516,6 +1568,7 @@ public class SalesController : ApiControllerBase
                         shortages.Add(new
                         {
                             sku = p?.Sku,
+                            imageUrl = p?.ImageUrl,
                             name = p?.ProductName ?? $"Product {want.ProductId}",
                             needed = want.Quantity,
                             onHand,
@@ -1805,6 +1858,7 @@ public class SalesController : ApiControllerBase
                         productId = l.ProductId,
                         name = l.Product.ProductName,
                         sku = l.Product.Sku,
+                        imageUrl = l.Product.ImageUrl,
                         packing = l.Product.Packing,
                         qty = l.Quantity,
                         /* What is actually on the shelf at the branch the order
@@ -2231,6 +2285,7 @@ public class SalesController : ApiControllerBase
                         productId = l.ProductId,
                         name = l.Product.ProductName,
                         sku = l.Product.Sku,
+                        imageUrl = l.Product.ImageUrl,
                         packing = l.Product.Packing,
                         qty = l.Quantity,
                         rate = l.UnitPrice,
@@ -2613,6 +2668,7 @@ public class SalesController : ApiControllerBase
                         productId = l.ProductId,
                         name = l.Product.ProductName,
                         sku = l.Product.Sku,
+                        imageUrl = l.Product.ImageUrl,
                         qty = l.Quantity,
                         rate = l.UnitPrice,
                         condition = l.Condition.ConditionKey,
@@ -2989,6 +3045,7 @@ public class SalesController : ApiControllerBase
                         productId = l.ProductId,
                         name = l.Product.ProductName,
                         sku = l.Product.Sku,
+                        imageUrl = l.Product.ImageUrl,
                         qty = l.Quantity
                     }).ToList()
                 })
@@ -3022,7 +3079,7 @@ public class SalesController : ApiControllerBase
             var ids = bought.Select(b => b.productId).ToList();
             var products = await _db.Products.AsNoTracking()
                 .Where(p => ids.Contains(p.ProductId))
-                .Select(p => new { p.ProductId, p.ProductName, p.Sku, p.Packing, p.SalePrice })
+                .Select(p => new { p.ProductId, p.ProductName, p.Sku, p.ImageUrl, p.Packing, p.SalePrice })
                 .ToDictionaryAsync(p => p.ProductId);
 
             var items = bought
@@ -3035,6 +3092,7 @@ public class SalesController : ApiControllerBase
                         productId = b.productId,
                         name = p?.ProductName ?? $"Product {b.productId}",
                         sku = p?.Sku ?? "",
+                        imageUrl = p?.ImageUrl,
                         packing = p?.Packing,
                         purchased = b.qty,
                         returned,
@@ -4078,6 +4136,7 @@ public class SalesController : ApiControllerBase
                     lineNo = (int)l.LineNo,
                     name = l.Product.ProductName,
                     sku = l.Product.Sku,
+                    imageUrl = l.Product.ImageUrl,
                     packing = l.Product.Packing,
                     qty = l.Quantity,
                     rate = l.UnitPrice,

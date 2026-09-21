@@ -30,6 +30,16 @@ namespace vizo_backend.Controllers;
 /// </summary>
 [Route("api/purchases")]
 [ApiController]
+/* NOT THE ORDER DESK'S. The owner: "order department cannot access any
+   purchases page ... order department can never see purchases".
+
+   By ROLE rather than by a permission, on purpose: "never" is a statement about
+   the job, and a permission can be ticked in Setup. This is ANDed with the
+   BackOffice policy above (which is why it names only the three roles that
+   policy admits and the order desk is not one of them), so nothing that
+   worked for the accountant, the warehouse keeper or the Super Admin changes.
+   The route guard in the web app's proxy.ts says the same thing. */
+[Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
 [Authorize(Policy = "BackOffice")]
 public class PurchasesController : ApiControllerBase
 {
@@ -140,6 +150,7 @@ public class PurchasesController : ApiControllerBase
                         lineNo = i.LineNo,
                         productId = i.ProductId,
                         sku = i.Product.Sku,
+                        imageUrl = i.Product.ImageUrl,
                         name = i.Product.ProductName,
                         packing = i.Product.Packing,
                         qty = i.Quantity,
@@ -359,6 +370,7 @@ public class PurchasesController : ApiControllerBase
                         lineNo = i.LineNo,
                         productId = i.ProductId,
                         sku = i.Product.Sku,
+                        imageUrl = i.Product.ImageUrl,
                         name = i.Product.ProductName,
                         qtyReceived = i.QtyReceived,
                         qtyDamaged = i.QtyDamaged,
@@ -488,6 +500,7 @@ public class PurchasesController : ApiControllerBase
                         lineNo = l.LineNo,
                         productId = l.ProductId,
                         sku = l.Product.Sku,
+                        imageUrl = l.Product.ImageUrl,
                         name = l.Product.ProductName,
                         qty = l.Quantity,
                         unitCost = l.UnitCost,
@@ -654,6 +667,7 @@ public class PurchasesController : ApiControllerBase
                         lineNo = l.LineNo,
                         productId = l.ProductId,
                         sku = l.Product.Sku,
+                        imageUrl = l.Product.ImageUrl,
                         name = l.Product.ProductName,
                         qty = l.Quantity,
                         unitCost = l.UnitCost,
@@ -716,7 +730,7 @@ public class PurchasesController : ApiControllerBase
                     .Where(p => p.IsActive).OrderBy(p => p.ProductName)
                     .Select(p => new
                     {
-                        id = p.ProductId, sku = p.Sku, name = p.ProductName,
+                        id = p.ProductId, sku = p.Sku, name = p.ProductName, imageUrl = p.ImageUrl,
                         costPrice = p.CostPrice, packing = p.Packing,
                         taxRatePercent = p.TaxRatePercent
                     })

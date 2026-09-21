@@ -71,6 +71,7 @@ public class ClaimsController : ApiControllerBase
                     productId = c.ProductId,
                     productName = c.Product.ProductName,
                     sku = c.Product.Sku,
+                    imageUrl = c.Product.ImageUrl,
                     qty = c.Quantity,
                     unitCost = c.UnitCost,
                     value = c.Quantity * c.UnitCost,
@@ -145,6 +146,7 @@ public class ClaimsController : ApiControllerBase
                     productId = x.ProductId,
                     productName = x.Product.ProductName,
                     sku = x.Product.Sku,
+                    imageUrl = x.Product.ImageUrl,
                     qty = x.Quantity,
                     unitCost = x.UnitCost,
                     reasonId = x.ReasonId,
@@ -564,7 +566,7 @@ public class ClaimsController : ApiControllerBase
                     .ToListAsync(),
                 products = await _db.Products.AsNoTracking()
                     .Where(p => p.IsActive).OrderBy(p => p.ProductName)
-                    .Select(p => new { id = p.ProductId, sku = p.Sku, name = p.ProductName, costPrice = p.CostPrice })
+                    .Select(p => new { id = p.ProductId, sku = p.Sku, name = p.ProductName, imageUrl = p.ImageUrl, costPrice = p.CostPrice })
                     .ToListAsync(),
 
                 /* The chase-and-write-off policy the claim screens quote back at

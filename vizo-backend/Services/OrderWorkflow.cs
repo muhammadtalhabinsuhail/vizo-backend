@@ -17,10 +17,13 @@
 /// SEVEN STEPS, NOT TEN. "Seen by Warehouse", "On way to Order Dept" and
 /// "Packaging" were removed on 22 September at the owner's instruction: three
 /// separate presses that said nothing the one before them had not already
-/// said, and the orders sitting in them had been there for days. The two
-/// warehouse steps went with them, so the warehouse keeper no longer moves an
-/// order at all -- /warehouse is a picking list to read, not a queue to click
-/// through.
+/// said, and the orders sitting in them had been there for days.
+///
+/// THE WAREHOUSE ROLE ITSELF IS GONE (this session). It never moved an order in
+/// this chain -- /warehouse was a picking list to read, not a queue to click
+/// through -- so removing it changes no rule here. Warehouse LOCATIONS remain:
+/// stock still sits at "Karachi Warehouse" and it is still a place a transfer
+/// can move goods to or from. What is gone is the job title and its screen.
 ///
 /// DISPATCHED IS WHERE THE STOCK COMES OFF THE SHELF. Nothing in the chain used
 /// to move stock at any step (the old /packing screen did, on its own status,
@@ -62,7 +65,6 @@ public static class OrderWorkflow
     public const string RoleAdmin     = "super-admin";
     public const string RoleSales     = "sales";
     public const string RoleOrderDept = "order-dept";
-    public const string RoleWarehouse = "warehouse-keeper";
     public const string RoleAccountant = "accountant";
 
     /// <summary>The chain, in order. Step number is index + 1.</summary>
@@ -266,10 +268,10 @@ public static class OrderWorkflow
                    cannot do: their first move opens at Invoiced, and the
                    invoice is now the back office's to cut. So the accountant is
                    on this list, and the words say what is actually waited on.
-                   The order desk and the keeper are kept on it as a heads-up --
-                   knowing an order is coming is worth something even when there
-                   is nothing to press yet. */
-                new[] { RoleAdmin, RoleAccountant, RoleOrderDept, RoleWarehouse, RoleSales },
+                   The order desk is kept on it as a heads-up -- knowing an order
+                   is coming is worth something even when there is nothing to
+                   press yet. */
+                new[] { RoleAdmin, RoleAccountant, RoleOrderDept, RoleSales },
                 $"Order confirmed by {actor}",
                 $"{orderNo} -- {customer}. Waiting for accounts to invoice it."),
 
@@ -280,11 +282,11 @@ public static class OrderWorkflow
 
             /* The owner asked to be told, and so does the accountant who did it
                (their copy is suppressed by exceptUserId, so this reaches the
-               other one). The order desk and the warehouse are both here
-               because this is the step that puts the order in front of them --
-               the invoice is cut and the stock can be picked. */
+               other one). The order desk is here because this is the step
+               that puts the order in front of it -- the invoice is cut and the
+               stock can be picked. */
             Invoiced => (NotificationKinds.InvoiceRaised,
-                new[] { RoleAdmin, RoleAccountant, RoleOrderDept, RoleWarehouse },
+                new[] { RoleAdmin, RoleAccountant, RoleOrderDept },
                 $"Order invoiced by {actor}",
                 $"{orderNo} -- {customer} has been invoiced. The order department can pick it."),
 

@@ -2,10 +2,11 @@
  CHANGA  —  what YOU have to change, by hand, outside the code
 ═══════════════════════════════════════════════════════════════════════════════
 
- Updated with the latest session (section D, first): Railway, the Gemini free-
- tier limit and the two live-data changes made. Section C is the order-chain and
- new-customer work, B is 21 September, A is 20 September and 1-4 are 17
- September. All of them still stand.
+ Updated with the latest session (section E, first): the warehouse role and
+ panel are deleted, purchase returns are removed. Section D is Railway, the
+ Gemini free-tier limit and two earlier live-data changes; C is the
+ order-chain and new-customer work, B is 21 September, A is 20 September and
+ 1-4 are 17 September. All of them still stand.
 
 
 ───────────────────────────────────────────────────────────────────────────────
@@ -148,6 +149,94 @@
      The customer, its pictures and its PDF are all deleted, and I deleted the two
      in-app notifications, but a push that had already gone to a phone cannot be
      recalled. If somebody asks about "VZ-C-0018", that is what it was.
+
+───────────────────────────────────────────────────────────────────────────────
+ E.  22 SEPTEMBER, LATER — THE WAREHOUSE ROLE IS GONE; PURCHASE RETURNS TOO
+───────────────────────────────────────────────────────────────────────────────
+
+ E1  THE WAREHOUSE ROLE AND ITS PANEL ARE DELETED — WAREHOUSES STAY AS PLACES
+
+     Your words: "completely delete role of Warehouse and all pages of
+     warehouse panel ... however warehouse would be used as a location for
+     transfers and stock will keep at warehouse so that data will remain in
+     system."
+
+     Done, and the two halves of that sentence are kept exactly separate:
+
+       GONE   the role "Warehouse Keeper" -- nobody can sign in as one, the
+              login screen no longer offers it, /warehouse answers "Forbidden"
+              to everyone, and the picking-list API behind it is deleted.
+
+       KEPT   "Karachi Warehouse" and "Lahore Warehouse" as LOCATIONS. Every
+              stock row, every past transfer, every past movement against them
+              is untouched. A transfer can still move goods to or from a
+              warehouse; dispatch can still send stock out of one. This was
+              never in question -- the role and the place are two different
+              things this system happened to spell the same way, and only one
+              of them was asked to go.
+
+     ONE ACCOUNT HELD THE ROLE: muhammadtalhabinsuhail@gmail.com (Talha) --
+     his own account for testing the role, not a real warehouse worker's. It is
+     now ORDER DEPARTMENT, at Karachi Order Department, because the order desk
+     is the role that already does the physical stock work in this chain
+     (Invoiced -> Processing in Order Dept -> Dispatched). If that is not where
+     you want him, Setup > Users changes it in two clicks -- nothing about the
+     removal depends on that particular choice.
+
+     NOBODY ELSE HAS TO SIGN OUT AND IN. Checked with a warehouse-keeper token
+     minted before the change: it is refused everywhere the role used to reach,
+     because the role name itself is gone from every check, not merely hidden
+     from a menu.
+
+ E2  PURCHASE RETURNS ARE REMOVED; SALES RETURNS ARE NOT
+
+     Your words: "completely remove purchase return scenario in the system
+     however sales return will remain exists in the system."
+
+     The screen, its "New return" button and the three API endpoints behind
+     them (list, one return, create) are gone. Sales Returns is untouched --
+     different menu, different controller, different rule (accountant and
+     Super Admin only), never went near this change.
+
+     WHAT WAS *NOT* TOUCHED, ON PURPOSE: nine real purchase returns already
+     exist in the database, the earliest from 28 April 2026, each with its own
+     posting to the ledger. That is accounting history, not test data, and I
+     did not drop it without being asked to -- dropping it would make the
+     ledger disagree with what was actually posted, and the database is
+     read-only by default for exactly this reason. So:
+
+       - the tables PurchaseReturn and PurchaseReturnItem still hold all nine
+       - a product's Stock History still folds them into its ledger correctly
+       - the Document Store can still print or share the PDF of one that
+         already exists
+       - only MAKING A NEW ONE, and the dedicated screen to browse them by
+         name, are gone
+
+     If you want the nine historical rows purged as well, say so plainly and it
+     is a second, separate script -- not something to bundle into a role
+     removal where a mistake is harder to spot.
+
+ E3  VERIFIED
+
+     API, with fresh tokens: the order desk (Talha and a long-standing
+     order-dept account) reaches Stock in Hand, Transfers, Stock Correction,
+     Stock History and is refused on Items, Categories, Brands and every
+     purchases endpoint, exactly as migration 23 already set up. The purchase-
+     return endpoints answer 404 for every role, including you. A token minted
+     as warehouse-keeper before this change is refused everywhere that role
+     used to reach.
+
+     Browser: the login screen shows four panels, not five. Setup > Roles no
+     longer lists Warehouse Keeper and shows Order Department at 4 users, 19
+     permissions (22 minus the three migration 23 already took). The sidebar
+     for every role tested shows no Warehouse item and no Purchase Returns
+     link. /warehouse and /purchases/returns both answer "Forbidden" or "page
+     not found".
+
+     Gate: backend 0 errors; frontend `tsc` clean, `eslint` 0 errors, same 3
+     pre-existing warnings as before (react-hooks/incompatible-library on
+     react-hook-form's watch(), one stale eslint-disable, one unused icon
+     import that predates this session).
 
 
 ───────────────────────────────────────────────────────────────────────────────

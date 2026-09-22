@@ -60,7 +60,7 @@ public class InventoryController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
 
     [HttpGet("products")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     public async Task<IActionResult> GetProducts(
         [FromQuery] string? q, [FromQuery] int? categoryId, [FromQuery] int? brandId,
         [FromQuery] string? status, [FromQuery] bool includeInactive = true,
@@ -187,7 +187,7 @@ public class InventoryController : ApiControllerBase
     }
 
     [HttpGet("products/{id:int}")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     public async Task<IActionResult> GetProduct(int id)
     {
         try
@@ -251,7 +251,7 @@ public class InventoryController : ApiControllerBase
     }
 
     [HttpPost("products")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> CreateProduct([FromBody] ProductRequest body)
     {
@@ -338,7 +338,7 @@ public class InventoryController : ApiControllerBase
     }
 
     [HttpPut("products/{id:int}")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> UpdateProduct(int id, [FromBody] ProductRequest body)
     {
@@ -416,7 +416,7 @@ public class InventoryController : ApiControllerBase
     /// inside the same transaction as the insert; see ResolveSku.
     /// </summary>
     [HttpPost("products/sku-preview")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> SkuPreview([FromBody] SkuPreviewRequest body)
     {
@@ -475,7 +475,7 @@ public class InventoryController : ApiControllerBase
     /// Also says whether the code is one of OUR SKUs printed as a barcode.
     /// </summary>
     [HttpGet("barcodes/lookup")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> LookupBarcode([FromQuery] string code, [FromQuery] int? excludeProductId)
     {
@@ -579,7 +579,7 @@ public class InventoryController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
 
     [HttpGet("categories")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> GetCategories()
     {
@@ -605,7 +605,7 @@ public class InventoryController : ApiControllerBase
     }
 
     [HttpPost("categories")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> CreateCategory([FromBody] CategoryRequest body)
     {
@@ -645,7 +645,7 @@ public class InventoryController : ApiControllerBase
     }
 
     [HttpPut("categories/{id:int}")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> UpdateCategory(int id, [FromBody] CategoryRequest body)
     {
@@ -681,7 +681,7 @@ public class InventoryController : ApiControllerBase
     }
 
     [HttpGet("brands")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> GetBrands()
     {
@@ -707,7 +707,7 @@ public class InventoryController : ApiControllerBase
     }
 
     [HttpPost("brands")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> CreateBrand([FromBody] BrandRequest body)
     {
@@ -750,7 +750,7 @@ public class InventoryController : ApiControllerBase
     }
 
     [HttpPut("brands/{id:int}")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> UpdateBrand(int id, [FromBody] BrandRequest body)
     {
@@ -794,7 +794,7 @@ public class InventoryController : ApiControllerBase
     /// would reject it anyway, but a clear message beats a 23503 in the log.
     /// </summary>
     [HttpDelete("categories/{id:int}")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> DeleteCategory(int id)
     {
@@ -842,7 +842,7 @@ public class InventoryController : ApiControllerBase
 
     /// <summary>Deletes a brand. Refuses while products still point at it.</summary>
     [HttpDelete("brands/{id:int}")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     [Authorize(Policy = "perm:products.manage")]
     public async Task<IActionResult> DeleteBrand(int id)
     {
@@ -1786,7 +1786,7 @@ public class InventoryController : ApiControllerBase
 
     /// <summary>The product catalogue on the current filter, as a spreadsheet.</summary>
     [HttpGet("products/export")]
-    [Authorize(Roles = "super-admin,accountant,warehouse-keeper")]
+    [Authorize(Roles = "super-admin,accountant")]
     public async Task<IActionResult> ExportProducts(
         [FromQuery] string? q, [FromQuery] int? categoryId, [FromQuery] int? brandId,
         [FromQuery] string? status, [FromQuery] bool includeInactive = true)

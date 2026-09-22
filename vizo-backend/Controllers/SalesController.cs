@@ -198,29 +198,6 @@ public class SalesController : ApiControllerBase
         CurrentRole() == OrderWorkflow.RoleSales ? CurrentUserId() : null;
 
     /// <summary>
-    /// The one place a warehouse keeper or an order-desk clerk works at, or
-    /// null for everybody else.
-    ///
-    /// "User"."PrimaryLocationId" has existed since the first schema and was
-    /// never read for anything. It is now the answer to "which warehouse" --
-    /// written when the account is created and enforced there, so a keeper
-    /// always has exactly one. Null for an account that predates the rule,
-    /// which reads as "show them everything" rather than as "show them
-    /// nothing": an empty queue is indistinguishable from no work.
-    /// </summary>
-    private async Task<int?> MyPlaceId()
-    {
-        var role = CurrentRole();
-        if (role != OrderWorkflow.RoleWarehouse && role != OrderWorkflow.RoleOrderDept)
-            return null;
-
-        return await _db.Users.AsNoTracking()
-            .Where(u => u.UserId == CurrentUserId())
-            .Select(u => u.PrimaryLocationId)
-            .FirstOrDefaultAsync();
-    }
-
-    /// <summary>
     /// May the caller open this invoice? Used by the endpoints that take an id
     /// straight off the URL -- a list that hides a row does not stop somebody
     /// asking for that row by number.
@@ -399,15 +376,6 @@ public class SalesController : ApiControllerBase
         {
             /* One validator, shared with UpdateOrder. Two copies of the same
                rules is two sets of rules the day somebody edits one. */
-            /* The keeper reads orders and moves two steps. They do not write
-               one. Refused here rather than merely hidden on the screen,
-               because a hidden button is not a rule. */
-            if (CurrentRole() == OrderWorkflow.RoleWarehouse)
-                return StatusCode(403, new
-                {
-                    message = "The warehouse does not take orders. Sales or the order desk raises one."
-                });
-
             var invalidOrder = await ValidateOrderRequest(body);
             if (invalidOrder is not null) return BadRequest(new { message = invalidOrder });
 
@@ -1782,113 +1750,6 @@ public class SalesController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
     //  THE WAREHOUSE KEEPER'S QUEUE
     // ══════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Every order the warehouse has to pick, with the items on it.
-    ///
-    /// The keeper's whole job is one step of the chain: an order the owner has
-    /// confirmed becomes stock on a trolley, and then it is on its way to the
-    /// order department. So this is deliberately not a filter on the orders
-    /// screen -- it is the queue, with the picking list already open, because
-    /// somebody standing at a shelf should not have to click into nine orders
-    /// to find out what to pull off it.
-    ///
-    /// CONFIRMED and INVOICED both qualify. Whether the invoice has been cut
-    /// yet is an office question; the goods are the same goods either way, and
-    /// making the floor wait on paperwork is how orders sit for a day.
-    /// </summary>
-    [HttpGet("warehouse/queue")]
-    [Authorize(Policy = "perm:orders.warehouse")]
-    public async Task<IActionResult> GetWarehouseQueue([FromQuery] int? locationId)
-    {
-        try
-        {
-            /* Invoiced, and nothing else. Not CONFIRMED -- picking stock
-               against an order the office has not billed is how goods leave
-               with no invoice behind them -- and there is no "seen by
-               warehouse" state any more (migration 21 removed it), so this is a
-               list to pick from rather than a queue to click through. The order
-               moves on when the order desk takes it up. */
-            var ready = new[] { OrderWorkflow.Invoiced };
-
-            var rows = _db.SalesOrders.AsNoTracking()
-                .Where(o => ready.Contains(o.Status.StatusKey));
-
-            /* THE KEEPER'S OWN WAREHOUSE, unless they asked for another.
-
-               There is one warehouse per city now, and a keeper belongs to
-               exactly one of them -- see AdminUsersController.ValidatePlace.
-               Without this the Karachi keeper opened the queue and saw Lahore's
-               orders sitting in it, which is not just noise: they would pick
-               stock that is four hundred miles away and mark it sent.
-
-               An explicit locationId still wins, so the owner can look at any
-               warehouse's queue from the same screen. Falls back to showing
-               everything when the account has no place set, which is what an
-               admin looking at this page should see. */
-            var mine = locationId ?? await MyPlaceId();
-            if (mine is not null)
-                rows = rows.Where(o => o.LocationId == mine);
-
-            var items = await rows
-                .OrderBy(o => o.OrderDate).ThenBy(o => o.OrderId)
-                .Take(100)
-                .Select(o => new
-                {
-                    id = o.OrderId,
-                    orderNo = o.OrderNo,
-                    customerName = (o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName),
-                    city = o.CustomerUser.City.CityName,
-                    locationId = o.LocationId,
-                    location = o.Location.LocationName,
-                    orderDate = o.OrderDate,
-                    deliveryDate = o.DeliveryDate,
-                    status = o.Status.StatusKey,
-                    statusName = o.Status.StatusName,
-                    total = o.TotalAmount,
-                    salesPerson = o.CreatedByUser.FullName,
-                    invoiceNo = _db.SalesInvoices
-                        .Where(i => i.OrderId == o.OrderId)
-                        .Select(i => i.InvoiceNo).FirstOrDefault(),
-                    /* The keeper is told to check the bill against what they
-                       are picking, so the invoice has to be reachable from the
-                       queue rather than two screens away. */
-                    invoiceId = _db.SalesInvoices
-                        .Where(i => i.OrderId == o.OrderId)
-                        .Select(i => (int?)i.InvoiceId).FirstOrDefault(),
-                    lines = o.SalesOrderItems.OrderBy(l => l.LineNo).Select(l => new
-                    {
-                        productId = l.ProductId,
-                        name = l.Product.ProductName,
-                        sku = l.Product.Sku,
-                        imageUrl = l.Product.ImageUrl,
-                        packing = l.Product.Packing,
-                        qty = l.Quantity,
-                        /* What is actually on the shelf at the branch the order
-                           is being served from. A picking list without this is
-                           a list of disappointments. */
-                        onHand = _db.StockBalances
-                            .Where(b => b.ProductId == l.ProductId && b.LocationId == o.LocationId)
-                            .Select(b => (int?)b.Quantity).FirstOrDefault() ?? 0
-                    }).ToList()
-                })
-                .ToListAsync();
-
-            return Ok(new
-            {
-                count = items.Count,
-                units = items.Sum(o => o.lines.Sum(l => l.qty)),
-                /* Short is the whole point of the screen: these are the orders
-                   the keeper cannot complete without moving stock first. */
-                short_ = items.Count(o => o.lines.Any(l => l.onHand < l.qty)),
-                items
-            });
-        }
-        catch (Exception ex)
-        {
-            return Fail(ex, "load the warehouse queue");
-        }
-    }
 
     /// <summary>
     /// The whole chain, and what this person may do with the order they are

@@ -1720,3 +1720,38 @@
       OTHER pictures in advpos/images/customer-documents (business_front_*,
       cnic-front_* and so on) are not mine and were left alone.
 
+═══════════════════════════════════════════════════════════════════════════════
+ 22 SEP, LATER — WAREHOUSE ROLE AND PURCHASE RETURNS REMOVED: WHAT ELSE MOVED
+═══════════════════════════════════════════════════════════════════════════════
+
+ Two mechanical fixes that fell out of the removal itself, not asked for:
+
+ 1. TWO MOCK DATA FILES WOULD NOT COMPILE ONCE THE ROLE WAS GONE.
+    data/mock.ts's demoUsers and data/settings.ts's rolePermissions are both
+    typed Record<RoleKey, ...>, so removing "warehouse-keeper" from the RoleKey
+    union broke both at compile time. Neither is read by a live screen (checked:
+    only shortcut-sheet.tsx and order-delivery-card.tsx import from
+    data/settings.ts, and neither touches roles or permissions) -- they are
+    legacy demo/reference data, per AGENTS.md's own description of that file.
+    Both had their warehouse-keeper entry deleted so the build passes; nothing
+    else in either file was touched.
+
+ 2. A DEAD PERMISSION-CATALOGUE ROW. data/settings.ts also listed
+    "orders.warehouse" in a decorative permissionCatalog array that nothing
+    imports. Removed alongside the permission itself for consistency, same
+    reasoning as above.
+
+ WHAT WAS DELIBERATELY LEFT ALONE:
+
+    - backend/database/02_seed.sql and 15_order_workflow.sql still show the
+      role being created. They are historical record of what was actually run
+      and are never re-applied -- migration 24 is the record of what undid it.
+    - PurchaseReturn / PurchaseReturnItem models, AppDbContext's mapping of
+      them, and everywhere they are READ (ProductHistoryController's stock
+      ledger, DocumentBuilder's PDF, NotificationKinds.PurchaseReturn) are
+      untouched. See changa.txt E2 for why: nine real historical returns exist
+      and dropping that would touch real accounting history, which is the
+      owner's call, not a side effect of a role/panel removal.
+    - AppDbContext.cs itself (Talha's file, by the standing rule) was not
+      opened at all for either change -- neither removal needed a DbSet or a
+      Fluent mapping touched.

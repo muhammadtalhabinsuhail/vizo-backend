@@ -1487,6 +1487,7 @@ public class SalesController : ApiControllerBase
                nothing is sold off it (ExcludeFromSellable).                   */
             var dispatchLines = new List<SalesOrderItem>();
             Location? dispatchFrom = null;
+            Dictionary<int, int>? dispatchQty = null;   // ProductId -> quantity actually being sent
 
             if (status.StatusKey == OrderWorkflow.Dispatched &&
                 current.StatusKey != OrderWorkflow.Dispatched)
@@ -1522,17 +1523,46 @@ public class SalesController : ApiControllerBase
                 if (dispatchLines.Count == 0)
                     return BadRequest(new { message = $"{order.OrderNo} has no lines, so there is nothing to send." });
 
+                /* THE PACKING SCREEN MAY SEND LESS THAN WAS ORDERED, NEVER MORE.
+
+                   body.Lines names only the lines being reduced; everything
+                   else dispatches in full. Validated against the order's own
+                   lines here rather than trusted, because a request built by
+                   hand could otherwise ask for more than the salesperson wrote
+                   down -- the one thing this is explicitly not allowed to do. */
+                dispatchQty = dispatchLines.ToDictionary(l => l.ProductId, l => l.Quantity);
+                if (body.Lines is not null)
+                {
+                    foreach (var over in body.Lines)
+                    {
+                        if (!dispatchQty.TryGetValue(over.ProductId, out var requested))
+                            return BadRequest(new { message = $"Product {over.ProductId} is not on {order.OrderNo}." });
+                        if (over.Qty <= 0)
+                            return BadRequest(new { message = "A dispatched quantity must be above zero." });
+                        if (over.Qty > requested)
+                            return BadRequest(new
+                            {
+                                message = $"Product {over.ProductId}: {over.Qty} is more than the {requested} " +
+                                          "the salesperson ordered. Reduce it, or leave it as ordered."
+                            });
+                        dispatchQty[over.ProductId] = over.Qty;
+                    }
+                }
+
                 /* CHECK EVERY LINE BEFORE MOVING ANY OF THEM, so a short line
                    on row five does not leave rows one to four already taken off
-                   the shelf and the order half-dispatched. */
+                   the shelf and the order half-dispatched. Checked against what
+                   is ACTUALLY being sent -- a deliberate reduction is not a
+                   stock shortage, and must never be reported as one. */
                 var shortages = new List<object>();
                 foreach (var want in dispatchLines)
                 {
+                    var sending = dispatchQty[want.ProductId];
                     var onHand = await _db.StockBalances
                         .Where(s => s.ProductId == want.ProductId && s.LocationId == dispatchFrom.LocationId)
                         .Select(s => (int?)s.Quantity).FirstOrDefaultAsync() ?? 0;
 
-                    if (onHand < want.Quantity)
+                    if (onHand < sending)
                     {
                         var p = await _db.Products.AsNoTracking()
                             .FirstOrDefaultAsync(x => x.ProductId == want.ProductId);
@@ -1541,9 +1571,9 @@ public class SalesController : ApiControllerBase
                             sku = p?.Sku,
                             imageUrl = p?.ImageUrl,
                             name = p?.ProductName ?? $"Product {want.ProductId}",
-                            needed = want.Quantity,
+                            needed = sending,
                             onHand,
-                            shortBy = want.Quantity - onHand
+                            shortBy = sending - onHand
                         });
                     }
                 }
@@ -1641,13 +1671,16 @@ public class SalesController : ApiControllerBase
 
                 foreach (var sold in dispatchLines)
                 {
+                    var sending = dispatchQty![sold.ProductId];
+
                     var bal = await _db.StockBalances
                         .FirstOrDefaultAsync(s => s.ProductId == sold.ProductId &&
                                                   s.LocationId == dispatchFrom.LocationId);
                     if (bal is null) continue;      // checked above; belt and braces
 
-                    bal.Quantity -= sold.Quantity;
-                    unitsOut += sold.Quantity;
+                    bal.Quantity -= sending;
+                    unitsOut += sending;
+                    sold.DispatchedQty = sending;
 
                     _db.StockMovements.Add(new StockMovement
                     {
@@ -1656,7 +1689,7 @@ public class SalesController : ApiControllerBase
                         MovementTypeId = saleOut.MovementTypeId,
                         MovedAt = Now(),
                         ReferenceNo = order.OrderNo,
-                        Quantity = -sold.Quantity,
+                        Quantity = -sending,
                         BalanceAfter = bal.Quantity,
                         UserId = CurrentUserId()
                     });
@@ -1705,15 +1738,62 @@ public class SalesController : ApiControllerBase
                         ? null : new[] { order.SalesPersonUserId.Value });
             }
 
+            /* THE PACKING SCREEN'S TWO CONSEQUENCES OF SENDING LESS THAN ORDERED.
+
+               Both run only for a real dispatch (dispatchFrom is not null), and
+               only look at the lines that were just moved -- dispatchLines
+               carries the DispatchedQty this same call just wrote. */
+            var shortLines = dispatchFrom is null
+                ? new List<SalesOrderItem>()
+                : dispatchLines.Where(l => l.DispatchedQty is int dq && dq < l.Quantity).ToList();
+
+            if (shortLines.Count > 0)
+            {
+                var names = await _db.Products.AsNoTracking()
+                    .Where(p => shortLines.Select(l => l.ProductId).Contains(p.ProductId))
+                    .ToDictionaryAsync(p => p.ProductId, p => p.ProductName);
+
+                var summary = string.Join("; ", shortLines.Select(l =>
+                    $"{names.GetValueOrDefault(l.ProductId, $"Product {l.ProductId}")}: sent {l.DispatchedQty} of {l.Quantity}"));
+
+                /* "the Salesperson, Super Admin, and Accountant" -- named in
+                   those words. The salesperson rides in alsoUserIds because
+                   NotifyRolesAsync reaches a ROLE, and a rep is not one. */
+                await _push.NotifyRolesAsync(
+                    new[] { OrderWorkflow.RoleAdmin, OrderWorkflow.RoleAccountant },
+                    NotificationKinds.DispatchShortage,
+                    $"{order.OrderNo} sent short",
+                    $"{custName} did not get everything on {order.OrderNo}. {summary}.",
+                    url: $"/sales/orders/{order.OrderId}",
+                    severe: true,
+                    alsoUserIds: order.SalesPersonUserId is null
+                        ? null : new[] { order.SalesPersonUserId.Value });
+            }
+
             /* The bill itself, rendered and pushed to Cloudinary. AFTER the
                status write and the notifications, and swallowing its own
                failure, because by this point the invoice row exists and the
                order has moved -- refusing the whole request because a document
                store was briefly unreachable would tell the operator the billing
                did not happen. One button rebuilds the PDF; the invoice number
-               cannot be un-issued. */
+               cannot be un-issued.
+
+               A DISPATCH REBUILDS IT WITH THE DISPATCH PAGE APPENDED, even when
+               nothing was short -- "when items are dispatched ... the sales
+               invoice for that order must be updated" was not conditioned on a
+               shortage. Every other status change still just ensures the plain
+               bill exists. */
             Bill? bill = null;
-            if (billedInvoice is not null)
+            if (dispatchFrom is not null)
+            {
+                var invoiceToUpdate = await _db.SalesInvoices.AsNoTracking()
+                    .Where(inv => inv.OrderId == id)
+                    .Select(inv => (int?)inv.InvoiceId)
+                    .FirstOrDefaultAsync();
+                if (invoiceToUpdate is not null)
+                    bill = await TryRebuildBillWithDispatch(invoiceToUpdate.Value, dispatchLines);
+            }
+            else if (billedInvoice is not null)
                 bill = await EnsureBill(billedInvoice.InvoiceId);
 
             return Ok(new
@@ -4228,16 +4308,36 @@ public class SalesController : ApiControllerBase
         }
     }
 
-    /// <summary>Renders, uploads and records the bill. Throws if any step fails.</summary>
-    private async Task<Bill> BuildBill(int invoiceId)
+    /// <summary>
+    /// Renders, uploads and records the bill. Throws if any step fails.
+    ///
+    /// <paramref name="manifest"/> and <paramref name="dispatchedOn"/> are set
+    /// only when this rebuild follows a dispatch -- they append the extra
+    /// "Dispatching" page (InvoicePdf.DrawDispatchPage) without touching a
+    /// single figure on the ordinary invoice pages, because the bill itself is
+    /// what the customer was actually charged and is never rewritten.
+    ///
+    /// <paramref name="destroyOld"/> removes the file this call replaces from
+    /// Cloudinary once the new one is safely stored. Only the dispatch path
+    /// asks for that -- see PdfStore.DestroyAsync for why every other caller
+    /// of this method deliberately does not.
+    /// </summary>
+    private async Task<Bill> BuildBill(
+        int invoiceId,
+        IReadOnlyList<InvoicePdf.DispatchLine>? manifest = null,
+        DateOnly? dispatchedOn = null,
+        bool destroyOld = false)
     {
         var data = await BillData(invoiceId)
             ?? throw new InvalidOperationException($"No invoice with id {invoiceId}.");
+        if (manifest is { Count: > 0 })
+            data = data with { DispatchManifest = manifest, DispatchedOn = dispatchedOn };
 
         var bytes = InvoicePdf.Render(data);
         var stored = await PdfStore.UploadAsync(_cfg, bytes, $"{data.InvoiceNo}.pdf", "invoices");
 
         var row = await _db.SalesInvoices.FirstAsync(i => i.InvoiceId == invoiceId);
+        var oldPublicId = row.PdfPublicId;
         row.PdfUrl = stored.Url;
         row.PdfPublicId = stored.PublicId;
         /* KEPT this time. The check was always made and always thrown away, so
@@ -4247,6 +4347,12 @@ public class SalesController : ApiControllerBase
         row.PdfDeliverable = stored.Deliverable;
         await _db.SaveChangesAsync();
 
+        /* The new file is confirmed stored and the row now points at it before
+           the old one is touched -- so a Cloudinary hiccup on the destroy call
+           can never leave the invoice with no PDF at all. */
+        if (destroyOld && !string.IsNullOrWhiteSpace(oldPublicId) && oldPublicId != stored.PublicId)
+            await PdfStore.DestroyAsync(_cfg, oldPublicId, _logger);
+
         if (!stored.Deliverable)
             _logger.LogWarning(
                 "Cloudinary stored {Invoice} but will not serve it ({Url}). PDF delivery is switched off on " +
@@ -4254,6 +4360,44 @@ public class SalesController : ApiControllerBase
                 data.InvoiceNo, stored.Url);
 
         return new Bill(stored.Url, stored.Deliverable ? stored.Url : ShareLink(data.InvoiceNo));
+    }
+
+    /// <summary>
+    /// Rebuilds an invoice's PDF with a "Dispatching" page appended, from the
+    /// order lines a dispatch just wrote DispatchedQty onto. Always called for
+    /// a dispatch, whether or not anything was short -- see BuildBill.
+    ///
+    /// A failure is logged and swallowed, the same reasoning as TryBuildBill:
+    /// by the time this runs the stock has already moved.
+    /// </summary>
+    private async Task<Bill?> TryRebuildBillWithDispatch(int invoiceId, IReadOnlyList<SalesOrderItem> dispatched)
+    {
+        try
+        {
+            var names = await _db.Products.AsNoTracking()
+                .Where(p => dispatched.Select(l => l.ProductId).Contains(p.ProductId))
+                .Select(p => new { p.ProductId, p.ProductName, p.Sku })
+                .ToDictionaryAsync(p => p.ProductId);
+
+            var manifest = dispatched
+                .Select(l =>
+                {
+                    names.TryGetValue(l.ProductId, out var p);
+                    return new InvoicePdf.DispatchLine(
+                        p?.ProductName ?? $"Product {l.ProductId}", p?.Sku,
+                        l.Quantity, l.DispatchedQty ?? l.Quantity);
+                })
+                .ToList();
+
+            return await BuildBill(invoiceId, manifest, Today(), destroyOld: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "The order was dispatched but its invoice's dispatch record could not be built (invoice {InvoiceId})",
+                invoiceId);
+            return null;
+        }
     }
 
     /// <param name="PdfUrl">Where the document is archived (Cloudinary).</param>
@@ -4316,7 +4460,25 @@ public class SalesController : ApiControllerBase
     /* LocationId is the answer to "which place is this going out of", asked
        only when the target is DISPATCHED -- that is the step that takes the
        stock off a shelf, and the shelf has to be named. Null everywhere else. */
-    public record StatusRequest(string StatusKey, string? Reason, int? LocationId = null);
+    /// <summary>
+    /// One line's worth of quantity ADJUSTMENT for a dispatch, keyed by product
+    /// rather than by order-item id -- the same convention OrderLineRequest
+    /// already uses, and the Packing screen already has the product id off the
+    /// order it loaded. Omitted lines dispatch in full; a line named here
+    /// dispatches exactly Qty, which may never exceed what was ordered.
+    /// </summary>
+    public record DispatchLineRequest(int ProductId, int Qty);
+
+    /// <param name="Lines">
+    /// Set only from the Packing screen, and only when at least one line is
+    /// being sent for less than the salesperson asked for. Every other caller
+    /// of this endpoint -- the order detail page's own Dispatch button
+    /// included -- leaves this null and gets the old behaviour: every line
+    /// dispatched in full.
+    /// </param>
+    public record StatusRequest(
+        string StatusKey, string? Reason, int? LocationId = null,
+        List<DispatchLineRequest>? Lines = null);
 
     public record ChangeRequestBody(string Kind, string Reason);
     public record DecideChangeBody(bool Approve, string? Note);

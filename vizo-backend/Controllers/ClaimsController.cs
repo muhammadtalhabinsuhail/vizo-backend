@@ -25,6 +25,14 @@ namespace vizo_backend.Controllers;
 /// </summary>
 [Route("api/claims")]
 [ApiController]
+/* NOT THE ORDER DESK'S, since 23 September. The owner: "remove Claims from
+   [the Order Department panel]. There is no need for a Claims page in the
+   Order Department panel." By role, ANDed with the BackOffice policy above --
+   the same pattern PurchasesController uses to close a screen to one role
+   while leaving it open to the others BackOffice already admits. proxy.ts's
+   /claims rule and migration 25 (which takes claims.view/receive/settle off
+   the order-dept role) say the same thing on the other two layers. */
+[Authorize(Roles = "super-admin,accountant")]
 [Authorize(Policy = "BackOffice")]
 public class ClaimsController : ApiControllerBase
 {

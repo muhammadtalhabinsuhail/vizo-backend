@@ -123,6 +123,21 @@ public static class OrderWorkflow
            goods leave with no invoice behind them. */
         (Invoiced,    AtOrderDept, new[] { RoleOrderDept }),
 
+        /* THE PACKING SCREEN DISPATCHES DIRECTLY FROM INVOICED, SKIPPING THE
+           STOP AT AT_ORDER_DEPT.
+
+           Added 23 September for the Packing page: its flow is pick an order,
+           adjust quantities, choose a courier, press Dispatch -- there is no
+           separate "I am now working on this" click in between, and asking for
+           one would just be a screen nobody presses before doing the real
+           thing anyway. AtOrderDept still exists and is still a legal stop
+           (an order can sit there, and the order detail page's dropdown still
+           offers it), but it is no longer the ONLY road to Dispatched. Same
+           two roles as the step already below this one, because "who may
+           dispatch" was already answered once and should not need answering
+           twice for the same order two lines apart. */
+        (Invoiced,    Dispatched,  new[] { RoleOrderDept, RoleAccountant }),
+
         /* SENDING IT OUT. The owner named three roles for this one, because it
            is the step that takes the stock off the shelf and somebody has to be
            able to do it when the order desk is out: "accountant role and order

@@ -1755,3 +1755,54 @@
     - AppDbContext.cs itself (Talha's file, by the standing rule) was not
       opened at all for either change -- neither removal needed a DbSet or a
       Fluent mapping touched.
+
+═══════════════════════════════════════════════════════════════════════════════
+ 23 SEP, LATER — PACKING SCREEN: WHAT WAS BUILT ON RATHER THAN REPLACED
+═══════════════════════════════════════════════════════════════════════════════
+
+ Two things worth flagging about how the dispatch action itself changed.
+
+ 1. INVOICED -> DISPATCHED IS NOW A DIRECT MOVE for the order desk and the
+    accountant (OrderWorkflow.Moves), where it used to require the
+    Invoiced -> AtOrderDept step first. The Packing screen's flow has no
+    "I am now working on this" click in the middle, and asking for one would
+    only be a screen nobody presses before doing the real thing. AtOrderDept
+    is still a legal status an order can sit at and the order detail page's
+    dropdown still offers it -- nothing that already used it breaks. The one
+    side effect: with two legal next moves from Invoiced (AtOrderDept and
+    Dispatched), OrderWorkflow.NextFor no longer offers a single one-click
+    "next step" button on the order detail page for that transition; the
+    dropdown still has both. The Packing screen is the intended way to reach
+    Dispatched now, and the one-click button was never built for it.
+
+ 2. THE INVOICE PDF'S OLD FILE IS NOW DESTROYED ON A DISPATCH REBUILD
+    (PdfStore.DestroyAsync), which is the ONE exception to a rule stated
+    plainly elsewhere in this codebase: DocumentArchive never deletes an old
+    file, because a link somebody was already sent must keep working. This
+    is safe here specifically because nobody would have been sent the PRE-
+    dispatch link on its own -- it only ever travelled attached to the
+    invoice row it replaces, and the row is updated in the same breath. If a
+    future document kind ever wants the same treatment, read that reasoning
+    in PdfStore.cs first; it is not the default for a reason.
+
+ SMALLER THINGS:
+
+    - "Sales Drop-down: names of all individuals assigned to the sales role"
+      is read literally: a ready order's credited SalesPersonUserId is
+      usually a rep but not always (an order keyed in on somebody's behalf
+      still carries who typed it in) -- found live, two of your current ready
+      orders are credited to the Super Admin and one to an order-dept clerk.
+      Those orders still show up in the Order box and their customer still
+      appears in the Customer box; only the Salesperson box itself is
+      narrowed to genuine sales-role people.
+    - A shop can have ready orders from more than one rep at once (Cellular
+      World KHI does, right now, from two). Picking that customer first
+      leaves the salesperson box open rather than guessing -- the order list
+      still shows every one of that customer's ready orders regardless of
+      who wrote them.
+    - The "dedicated tracking page" the request asked for is /delivery,
+      unchanged -- it already lists every dispatch by status, including the
+      one this screen's courier step just booked. A second, separate page
+      would only ever say the same thing from a different query and drift
+      from it over time. "Delivered" is that same page with the status
+      pre-set in the URL.

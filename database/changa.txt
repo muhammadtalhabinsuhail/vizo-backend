@@ -2,10 +2,11 @@
  CHANGA  —  what YOU have to change, by hand, outside the code
 ═══════════════════════════════════════════════════════════════════════════════
 
- Updated with the latest session (section E, first): the warehouse role and
- panel are deleted, purchase returns are removed. Section D is Railway, the
- Gemini free-tier limit and two earlier live-data changes; C is the
- order-chain and new-customer work, B is 21 September, A is 20 September and
+ Updated with the latest session (section F, first): the Order Department's
+ Packing screen and the loss of Claims. E is the warehouse role and panel
+ deleted and purchase returns removed; D is Railway, the Gemini free-tier
+ limit and two earlier live-data changes; C is the order-chain and
+ new-customer work, B is 21 September, A is 20 September and
  1-4 are 17 September. All of them still stand.
 
 
@@ -238,6 +239,110 @@
      react-hook-form's watch(), one stale eslint-disable, one unused icon
      import that predates this session).
 
+
+───────────────────────────────────────────────────────────────────────────────
+ F.  23 SEPTEMBER — THE ORDER DEPARTMENT'S OWN PANEL: PACKING, AND NO CLAIMS
+───────────────────────────────────────────────────────────────────────────────
+
+ F1  SIGNING IN AS THE ORDER DESK NOW OPENS PACKING
+
+     Your words: "Whenever a user with the Order Department role logs in, the
+     first page they should see is the Packing page. This means the Dashboard
+     page should not render post-login."
+
+     Done with one data change, nothing else: "Role"."HomePath" for order-dept
+     is now /packing, and both the login screen and the address bar's own "/"
+     already read that column -- Setup > Roles edits it by hand if you ever
+     want it back. Dashboard itself still exists; it is simply not where
+     signing in lands any more.
+
+ F2  CLAIMS IS GONE FOR THE ORDER DESK
+
+     "remove Claims from it. There is no need for a Claims page in the Order
+     Department panel."
+
+     Taken away on all three layers that could show it to them: the permission
+     (claims.view/receive/settle), the API (ClaimsController now refuses the
+     role outright), and the route guard. The Accountant and you keep it
+     unchanged. The order desk's own dashboard also lost its "Claims still
+     open" card and counter, since there is nothing behind either any more.
+
+ F3  THE PACKING SCREEN ITSELF
+
+     Three dropdowns that narrow each other down, in any direction you fill
+     them in:
+
+       Salesperson   every rep who currently has an order waiting to be
+                     packed -- not a full staff list, which is true every day
+                     and useful on none of them.
+       Customer      narrows to that rep's ready customers. Picked FIRST, it
+                     sets the salesperson above it -- but only when the shop
+                     has a ready order from exactly one rep. Cellular World
+                     KHI, for instance, has orders from two different people
+                     right now, so picking that shop leaves the salesperson
+                     box open rather than guessing which one you meant; the
+                     order list below still shows both.
+       Order         narrows to whichever of the two boxes above is filled in.
+                     Picking one directly sets both boxes above it from the
+                     order's own record. The box itself is large, shows a
+                     picture for each item, the order number, the customer, who
+                     wrote it, how many pieces, and the total -- never a bare
+                     ID.
+
+     Pick an order and its lines appear below: a picture, the name, how many
+     were ordered, and the PRICE -- which is deliberately your own selling
+     price on the item (what you set at Items, never whatever margin a rep
+     added on top). Proved against a real order that had a margin on it: the
+     order itself charged Rs. 3,680 a piece; the Packing screen showed Rs. 980,
+     your own price on that item.
+
+     The quantity is the one thing that can be typed into, and it can only go
+     DOWN from what was ordered -- typing more, or leaving the box blank, is
+     refused, both on the screen and by the API if it is ever asked for
+     directly. Reduce one and it is not a quiet edit:
+
+       - the salesperson, the accountant and you are all told, by name, which
+         item was short and by how much;
+       - the customer's invoice is rebuilt with an extra page appended --
+         "DISPATCH RECORD" -- showing every line's requested and dispatched
+         count and the shortfall, without a single figure on the original bill
+         being touched;
+       - the old copy of that invoice's PDF is removed from Cloudinary once the
+         new one is safely stored, so nothing orphaned is left sitting there.
+
+     Pressing "Next" is the real action -- this is the moment the goods
+     actually leave the shelf, deducting only what was actually sent, never the
+     full amount if it was reduced. Only once that has gone through does the
+     courier step appear: the same channel-and-courier form /dispatch has
+     always used, now reached from here. If booking the courier fails for any
+     reason, the order is already sent -- the screen says so and offers to try
+     booking again, rather than risking sending it twice.
+
+     A new "Delivered" link, next to Delivery, is the same screen pre-filtered
+     to what has already arrived -- one page, not two that could drift apart.
+
+ F4  VERIFIED
+
+     A real order with a genuine margin on it (base Rs. 980, charged Rs.
+     3,680) proved the price shown is yours, not the rep's. A live test order
+     (Sara's customer, 3 pieces) proved the whole chain: asking for more than
+     ordered is refused by the API; sending 2 of 3 deducted exactly 2 from the
+     shelf, recorded DispatchedQty, sent the shortage notice to the
+     salesperson, the accountant and the Super Admin, rebuilt the invoice to 2
+     pages with the dispatch record on the second, destroyed the old PDF from
+     Cloudinary (it now 404s) and kept the new one working; the courier was
+     then booked through the existing endpoint. Everything the test created --
+     the order, its invoice, the delivery, the stock movement, all 46
+     notifications, the new PDF, and the three document-series numbers -- was
+     removed afterwards, and the shelf is back at its original count.
+
+     Browser, as a real order-dept account: signing in and visiting "/" both
+     land on /packing; the sidebar has no Claims link and does have Packing and
+     Delivered; the three dropdowns cascade exactly as above; the quantity box
+     refuses more than was ordered; the screen works at a 375px phone width
+     with no horizontal scroll.
+
+     Gate: backend 0 errors; frontend `tsc` clean, `eslint` 0 errors.
 
 ───────────────────────────────────────────────────────────────────────────────
  C.  22 SEPTEMBER — ONE KEY, TWO MIGRATIONS, AND A WORD TO YOUR ORDER DESK

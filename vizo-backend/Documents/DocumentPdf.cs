@@ -80,10 +80,18 @@ public static class DocumentPdf
         string? Footnote,
         string? PreparedBy,
         string? EmptyMessage = null,
-        IReadOnlyList<Section>? More = null);
+        IReadOnlyList<Section>? More = null,
+        /* A document that needs a page of its own shape -- the daily expense
+           sheet, with its paid-from breakdown and two signatures -- hands its
+           renderer in here and keeps travelling the ordinary path: the
+           archive, Print/Download, the signed share link and the Document
+           Store all call Render(Data), so none of them had to learn about it. */
+        Func<byte[]>? Renderer = null);
 
     public static byte[] Render(Data d)
     {
+        if (d.Renderer is not null) return d.Renderer();
+
         var pdf = new PdfCanvas();
         var widths = Widths(d.Columns);
 

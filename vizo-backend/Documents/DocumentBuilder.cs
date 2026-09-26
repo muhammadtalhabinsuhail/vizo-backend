@@ -42,6 +42,9 @@ public static class DocumentBuilder
             ["journal-entry"] = "journal-entries",
             ["expense"] = "expenses",
             ["party-statement"] = "statements",
+            /* One day of expenses at one location, on one page of its own
+               shape -- see ExpenseSheetPdf. */
+            ["expense-sheet"] = "expense-sheets",
         };
 
     /// <summary>The file name a document is stored under.</summary>
@@ -69,6 +72,7 @@ public static class DocumentBuilder
         "journal-entry" => await JournalEntry(db, id),
         "expense" => await Expense(db, id),
         "party-statement" => await PartyStatement(db, id),
+        "expense-sheet" => await ExpenseSheetPdf.BuildAsync(db, id),
         _ => null
     };
 

@@ -144,6 +144,7 @@ public class SalesController : ApiControllerBase
                 })
                 .ToListAsync();
 
+            var noMoney = HideMoneyFromOrderDesk();
             var shaped = items.Select(o => new
             {
                 o.id, o.orderNo, o.customerId, o.customerName,
@@ -151,8 +152,10 @@ public class SalesController : ApiControllerBase
                 o.customerType, o.city, o.location, o.locationCode, o.salesPerson,
                 o.orderDate, o.deliveryDate, o.status, o.statusName, o.itemCount,
                 o.subtotal, o.discount, o.tax, o.total,
-                o.paymentMethod, o.paidAmount,
-                paymentStatus = o.paidAmount <= 0 ? "UNPAID"
+                o.paymentMethod,
+                paidAmount = noMoney ? 0m : o.paidAmount,
+                paymentStatus = noMoney ? null
+                              : o.paidAmount <= 0 ? "UNPAID"
                               : o.paidAmount >= o.total ? "PAID" : "PARTIAL",
                 o.creditHoldReason, o.notes, o.invoiceId, o.invoiceNo,
                 o.channel, o.carrier, o.trackingNo, o.deliveryState,
@@ -215,6 +218,16 @@ public class SalesController : ApiControllerBase
 
     private static ObjectResult NotYours(string what) =>
         new ObjectResult(new { message = $"This {what} was not created by you." }) { StatusCode = 403 };
+
+    /// <summary>
+    /// True for the Order Department. The owner, 26 September: the order desk
+    /// has "no money, accounts or purchases anywhere -- no collections,
+    /// vouchers, ledgers, customer balances or credit amounts ... no cost
+    /// prices". By ROLE, like SalesScopeUserId, so a permission ticked in Setup
+    /// cannot undo it. The screens they use (orders, invoices, the order form)
+    /// still answer -- with those figures zeroed or left out.
+    /// </summary>
+    private bool HideMoneyFromOrderDesk() => CurrentRole() == OrderWorkflow.RoleOrderDept;
 
     [HttpGet("orders/{id:int}")]
     public async Task<IActionResult> GetOrder(int id)
@@ -323,17 +336,25 @@ public class SalesController : ApiControllerBase
                 })
                 .ToListAsync();
 
+            /* The order desk sees the order and its lines -- never the
+               customer's limit, balance, or what has been collected (the owner,
+               26 September: no customer balances or credit amounts). */
+            var noMoney = HideMoneyFromOrderDesk();
             return Ok(new
             {
                 o.id, o.orderNo, o.customerId, o.customerName,
                 customerInitials = Initials(o.customerName),
                 o.customerCode, o.customerPhone, o.customerAltPhone, o.customerAddress,
-                o.customerType, o.city, o.creditLimit, o.creditDays, o.holdPolicy,
+                o.customerType, o.city,
+                creditLimit = noMoney ? 0m : o.creditLimit,
+                creditDays = noMoney ? 0 : o.creditDays,
+                holdPolicy = noMoney ? null : o.holdPolicy,
                 o.locationId, o.location, o.salesPerson,
                 o.orderDate, o.deliveryDate, o.status, o.statusName,
                 o.subtotal, o.discount, o.tax, o.total,
                 o.methodId, o.paymentMethod, o.paymentMethodName,
-                o.creditHoldReason, o.notes, o.createdBy, o.createdAt,
+                creditHoldReason = noMoney && o.creditHoldReason != null ? "Held on the customer's credit limit." : o.creditHoldReason,
+                o.notes, o.createdBy, o.createdAt,
                 o.invoiceId, o.invoiceNo, o.invoicePdfUrl,
                 /* The link the WhatsApp share should send. Derived, not stored,
                    so it is always right for the host answering this request. */
@@ -341,11 +362,12 @@ public class SalesController : ApiControllerBase
                 /* And the one Print bill should open, which is the same thing
                    until the day Cloudinary is allowed to serve a PDF. */
                 invoiceViewUrl = BillViewUrl(o.invoiceNo, o.invoicePdfUrl, o.invoiceDeliverable),
-                o.paidAmount,
-                balance = o.total - o.paidAmount,
-                paymentStatus = o.paidAmount <= 0 ? "UNPAID"
+                paidAmount = noMoney ? 0m : o.paidAmount,
+                balance = noMoney ? 0m : o.total - o.paidAmount,
+                paymentStatus = noMoney ? null
+                              : o.paidAmount <= 0 ? "UNPAID"
                               : o.paidAmount >= o.total ? "PAID" : "PARTIAL",
-                o.outstanding,
+                outstanding = noMoney ? 0m : o.outstanding,
                 o.channel, o.carrier, o.trackingNo, o.deliveryState,
                 o.dispatchedOn, o.deliveredOn,
                 o.lines,
@@ -593,6 +615,21 @@ public class SalesController : ApiControllerBase
            and orders a person sees. */
         var isSalesperson = SalesScopeUserId() is not null;
 
+        /* THE ORDER DESK TAKES ORDERS TOO (the owner, 26 September) -- for any
+           customer, on behalf of the salesperson the order belongs to, at the
+           same fixed rate with the same 0-10% margin a rep may add. So it is
+           held to the rep's cap, and it must say WHICH rep: the order is
+           credited to them, not to the clerk who keyed it in. */
+        var isOrderDesk = CurrentRole() == OrderWorkflow.RoleOrderDept;
+        if (isOrderDesk)
+        {
+            if (body.SalesPersonUserId is not int rep)
+                return "Pick the salesperson this order belongs to.";
+            if (!await _db.Employees.AnyAsync(e => e.UserId == rep && e.User.IsActive && e.User.Role.RoleKey == OrderWorkflow.RoleSales))
+                return "That salesperson does not exist or is not active.";
+        }
+        var marginCapped = isSalesperson || isOrderDesk;
+
         foreach (var l in body.Lines)
         {
             if (l.Qty <= 0) return "Every line needs a quantity above zero.";
@@ -604,7 +641,7 @@ public class SalesController : ApiControllerBase
             if (!known.TryGetValue(l.ProductId, out var product))
                 return $"Product {l.ProductId} does not exist.";
 
-            if (isSalesperson && SalesRateOutOfRange(l.Rate, product.SalePrice, out var floor, out var ceiling))
+            if (marginCapped && SalesRateOutOfRange(l.Rate, product.SalePrice, out var floor, out var ceiling))
                 return $"{product.ProductName}: {l.Rate:0.00} is not allowed. The rate is fixed at {floor:0.00}; "
                      + $"a salesperson can add up to {MaxSalesMarginPercent}% margin on top of it, "
                      + $"so the highest price is {ceiling:0.00}.";
@@ -685,7 +722,11 @@ public class SalesController : ApiControllerBase
                rule is that the order belongs to whoever wrote it, and accounts
                and the owner read that name off the order to know whose customer
                it is. */
-            SalesPersonUserId = await CurrentEmployeeId(),
+            SalesPersonUserId = CurrentRole() == OrderWorkflow.RoleOrderDept && body.SalesPersonUserId is int forRep
+                /* The order desk keys an order in FOR a salesperson (checked in
+                   ValidateOrderRequest); everybody else's order is their own. */
+                ? forRep
+                : await CurrentEmployeeId(),
             OrderDate = body.OrderDate ?? Today(),
             DeliveryDate = body.DeliveryDate,
             StatusId = statusId,
@@ -818,6 +859,16 @@ public class SalesController : ApiControllerBase
         }
 
         await _db.SaveChangesAsync();
+
+        /* THE BILL REACHES THE BOOKS IN THE SAME TRANSACTION (gap D7).
+           Dr Accounts Receivable with the customer on the line, Cr Sale, Cr
+           Output Tax if any -- Services/LedgerPosting.cs. Inside the
+           transaction on purpose: a bill that could not post (a closed month)
+           is refused whole rather than left billed and missing from the
+           customer's balance, which is exactly the state D7 found. */
+        var unposted = await LedgerPosting.PostSalesInvoiceAsync(_db, inv.InvoiceId, CurrentUserId());
+        if (unposted is not null) throw new InvalidOperationException(unposted);
+
         await tx.CommitAsync();
 
         return inv;
@@ -1090,6 +1141,16 @@ public class SalesController : ApiControllerBase
             if (key is not null) key.Status = "USED";   // the one-shot is spent
 
             await _db.SaveChangesAsync();
+
+            /* The invoice's entry follows the invoice (LedgerPosting explains
+               why in place). A closed month leaves the books alone and says so
+               in the log -- the edit itself still stands. */
+            if (invoice is not null)
+            {
+                var notMoved = await LedgerPosting.RepostSalesInvoiceAsync(_db, invoice.InvoiceId, CurrentUserId());
+                if (notMoved is not null) _logger.LogWarning("{Why}", notMoved);
+            }
+
             await tx.CommitAsync();
 
             await Log("ORDER_UPDATED", "SalesOrder", order.OrderNo,
@@ -2148,6 +2209,7 @@ public class SalesController : ApiControllerBase
                 })
                 .ToListAsync();
 
+            var noMoney = HideMoneyFromOrderDesk();
             var shaped = items.Select(i => new
             {
                 i.id, i.invoiceNo, i.orderId, i.orderNo, i.customerId, i.customerName,
@@ -2159,7 +2221,7 @@ public class SalesController : ApiControllerBase
                 i.pdfUrl, shareUrl = ShareLink(i.invoiceNo),
                 viewUrl = BillViewUrl(i.invoiceNo, i.pdfUrl, i.pdfDeliverable),
                 i.itemCount,
-                i.paid, balance = i.total - i.paid
+                paid = noMoney ? 0m : i.paid, balance = noMoney ? 0m : i.total - i.paid
             });
 
             return Ok(new { total, page, pageSize, items = shaped });
@@ -2264,7 +2326,8 @@ public class SalesController : ApiControllerBase
                 i.createdBy, i.pdfUrl, shareUrl = ShareLink(i.invoiceNo),
                 viewUrl = BillViewUrl(i.invoiceNo, i.pdfUrl, i.pdfDeliverable),
                 i.notes,
-                i.paid, balance = i.total - i.paid,
+                paid = HideMoneyFromOrderDesk() ? 0m : i.paid,
+                balance = HideMoneyFromOrderDesk() ? 0m : i.total - i.paid,
                 i.lines,
                 company = await LetterHead()
             });
@@ -2787,6 +2850,20 @@ public class SalesController : ApiControllerBase
             ret.DecidedAt = Now();
 
             await _db.SaveChangesAsync();
+
+            /* The books follow the decision. Approved or posted: the credit is
+               posted, once (a return raised before 26 September may not have
+               been). Rejected after posting: the entry is reversed by a mirror,
+               the way every reversal in this system works, so the customer's
+               statement shows the credit and its undoing rather than silently
+               losing both. */
+            var returnLedger = key == "REJECTED"
+                ? await LedgerPosting.ReverseSalesReturnAsync(_db, ret.ReturnId, CurrentUserId(), body.Reason)
+                : key is "APPROVED" or "POSTED"
+                    ? await LedgerPosting.PostSalesReturnAsync(_db, ret.ReturnId, CurrentUserId())
+                    : null;
+            if (returnLedger is not null) return BadRequest(new { message = returnLedger });
+
             await tx.CommitAsync();
 
             var detail = $"{was.StatusName} -> {target.StatusName}."
@@ -3109,6 +3186,10 @@ public class SalesController : ApiControllerBase
                the query it would be a method call EF cannot translate. */
             var mineOnly = SalesScopeUserId();
 
+            /* Read into a local for the same reason: the order desk's pickers
+               carry no limits, balances or cost (HideMoneyFromOrderDesk). */
+            var noMoney = HideMoneyFromOrderDesk();
+
             var commonTax = await _db.Products.AsNoTracking()
                 .Where(p => p.IsActive)
                 .GroupBy(p => p.TaxRatePercent)
@@ -3201,10 +3282,10 @@ public class SalesController : ApiControllerBase
                         displayName = p.DisplayName,
                         city = p.City.CityName,
                         phone = p.User.Phone,
-                        creditLimit = p.CreditLimit,
-                        creditDays = p.CreditDays,
+                        creditLimit = noMoney ? 0m : p.CreditLimit,
+                        creditDays = noMoney ? 0 : p.CreditDays,
                         holdPolicy = p.HoldPolicy.PolicyKey,
-                        outstanding = _db.JournalEntryLines
+                        outstanding = noMoney ? 0m : _db.JournalEntryLines
                             .Where(l => l.PartyUserId == p.UserId && l.Entry.StatusId == 2)
                             .Sum(l => (decimal?)(l.DebitAmount - l.CreditAmount)) ?? 0m
                     })
@@ -3225,7 +3306,7 @@ public class SalesController : ApiControllerBase
                         name = p.ProductName,
                         packing = p.Packing,
                         salePrice = p.SalePrice,
-                        costPrice = p.CostPrice,
+                        costPrice = noMoney ? 0m : p.CostPrice,
                         /* THE PICTURE, because that is how an order is actually
                            taken: the rep shows the shopkeeper a photo and the
                            shopkeeper points at it. A picker that lists code and
@@ -3236,7 +3317,7 @@ public class SalesController : ApiControllerBase
                            the piece cost to land -- cost + duty -- the same
                            arithmetic as the product screen, so the two cannot
                            tell different stories about the same item. */
-                        dutyPrice = p.DutyPrice,
+                        dutyPrice = noMoney ? 0m : p.DutyPrice,
                         taxRatePercent = p.TaxRatePercent,
                         totalStock = p.StockBalances.Sum(s => (int?)s.Quantity) ?? 0,
                         /* Stock at the till the operator is standing at, when the
@@ -3357,6 +3438,11 @@ public class SalesController : ApiControllerBase
             }
 
             await _db.SaveChangesAsync();
+
+            /* Posted with the bill, in its transaction -- see RaiseInvoiceForOrder. */
+            var unposted = await LedgerPosting.PostSalesInvoiceAsync(_db, inv.InvoiceId, CurrentUserId());
+            if (unposted is not null) return BadRequest(new { message = unposted });
+
             await tx.CommitAsync();
 
             await Log("INVOICE_CREATED", "SalesInvoice", inv.InvoiceNo, $"{total:N0}", 2);
@@ -3611,6 +3697,15 @@ public class SalesController : ApiControllerBase
                 });
             }
             await _db.SaveChangesAsync();
+
+            /* THE CREDIT REACHES THE BOOKS with the goods (gap D7): Dr Sales
+               Returns, Cr Accounts Receivable with the customer on the line --
+               Services/LedgerPosting.cs. Same transaction, so a return that
+               cannot post (a closed month) puts nothing back on the shelf
+               either. */
+            var returnUnposted = await LedgerPosting.PostSalesReturnAsync(_db, ret.ReturnId, CurrentUserId());
+            if (returnUnposted is not null) return BadRequest(new { message = returnUnposted });
+
             await tx.CommitAsync();
 
             await Log("SALES_RETURN_CREATED", "SalesReturn", ret.ReturnNo,
@@ -3842,6 +3937,17 @@ public class SalesController : ApiControllerBase
                 });
             }
             await _db.SaveChangesAsync();
+
+            /* THE COUNTER SALE REACHES THE BOOKS, in the same transaction.
+               Paid there and then: the sale AND its payment in one entry
+               (Dr AR / Cr Sale, Dr cash-or-bank of the method / Cr AR), so the
+               customer's statement shows the bill and "paid at the counter"
+               side by side and the walk-in account nets to nothing. On credit:
+               the sale only, and it waits on the shop's account like any bill. */
+            var counterUnposted = await LedgerPosting.PostSalesInvoiceAsync(_db, inv.InvoiceId, CurrentUserId(),
+                paidWithMethodKey: onCredit ? null : method.MethodKey);
+            if (counterUnposted is not null) return BadRequest(new { message = counterUnposted });
+
             await tx.CommitAsync();
 
             var who = body.IsWalkIn ? (inv.WalkInName ?? "walk-in") : "shop account";

@@ -650,7 +650,10 @@ public class CustomerLedgerController : ApiControllerBase
         string Str(string n) => acc.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString()! : "";
 
         var extra = new List<string>();
-        var catCity = string.Join("  ·  ", new[] { Str("category"), Str("city") }.Where(x => x.Length > 0));
+        /* "Hyderabad - Pakistan" is how the database spells a city; on a
+           statement a shop reads, "Hyderabad" is enough. */
+        var city = Str("city").Replace(" - Pakistan", "");
+        var catCity = string.Join(",  ", new[] { Str("category"), city }.Where(x => x.Length > 0));
         if (catCity.Length > 0) extra.Add(catCity);
         if (Str("phone").Length > 0) extra.Add($"Phone {Str("phone")}");
 
@@ -926,8 +929,8 @@ public class CustomerLedgerController : ApiControllerBase
             };
             var sample = JsonSerializer.SerializeToElement(new[]
             {
-                new { code = "ACR00707", name = "Example Traders Hyderabad", city = "Hyderabad", phone = "0300 1234567",
-                      category = "Retailer", opening = 38285m, limit = 0m }
+                new { code = "ACR00001", name = "Example Traders", city = "Karachi", phone = "0300 1234567",
+                      category = "Retailer", opening = 25000m, limit = 0m }
             });
             var bytes = XlsxWriter.FromJson("Customers", sample, columns);
             return File(bytes, XlsxWriter.ContentType, "customer-import-template.xlsx");
@@ -1190,7 +1193,7 @@ public class CustomerLedgerController : ApiControllerBase
         return result;
     }
 
-    /// <summary>"38,285", "(1,200)", "-500.50" and blank (zero) all read as money.</summary>
+    /// <summary>"12,500", "(1,200)", "-500.50" and blank (zero) all read as money.</summary>
     private static decimal ParseMoney(string? text, string what, List<string> errors)
     {
         var t = (text ?? "").Trim().Replace(",", "").Replace("Rs.", "", StringComparison.OrdinalIgnoreCase)

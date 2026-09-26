@@ -50,9 +50,9 @@ public static class LedgerStatementPdf
     private const double Bottom = 84;          // above the footer
 
     /* Column edges. Particulars takes what the four fixed columns leave. */
-    private const double DateW = 58;
-    private const double MoneyW = 72;
-    private const double BalanceW = 80;
+    private const double DateW = 54;
+    private const double MoneyW = 64;
+    private const double BalanceW = 74;
     private static double ParticularsW => Usable - DateW - MoneyW * 2 - BalanceW;
 
     public sealed record Item(string Name, decimal Qty, decimal Rate, decimal Amount);
@@ -77,13 +77,14 @@ public static class LedgerStatementPdf
         decimal TotalCredit,
         decimal Closing,
         string ClosingLabel,
-        string? Footnote);
+        string? Footnote,
+        bool ItemColumns = true);
 
     public static byte[] Render(Data d)
     {
         var pdf = new PdfCanvas();
         var y = DrawFirstHead(pdf, d);
-        y = DrawTableHead(pdf, y);
+        y = DrawTableHead(pdf, y, d.ItemColumns);
 
         var n = 0;
         foreach (var line in d.Lines)
@@ -95,14 +96,14 @@ public static class LedgerStatementPdf
             {
                 pdf.NewPage();
                 y = DrawContinuationHead(pdf, d);
-                y = DrawTableHead(pdf, y);
+                y = DrawTableHead(pdf, y, d.ItemColumns);
                 n = 0;
             }
             y = DrawRow(pdf, line, y, n++ % 2 == 1, () =>
             {
                 pdf.NewPage();
                 var top = DrawContinuationHead(pdf, d);
-                return DrawTableHead(pdf, top);
+                return DrawTableHead(pdf, top, d.ItemColumns);
             });
         }
 
@@ -186,17 +187,22 @@ public static class LedgerStatementPdf
         return bandBottom - 22;
     }
 
-    private static double DrawTableHead(PdfCanvas pdf, double y)
+    private static double DrawTableHead(PdfCanvas pdf, double y, bool itemColumns)
     {
         const double h = 19;
         pdf.Rect(Left, y - h, Usable, h, NavySoft);
         var ty = y - h + 6.5;
         pdf.Text(Left + 5, ty, "DATE", 7.2, White, bold: true);
         pdf.Text(Left + DateW + 5, ty, "PARTICULARS", 7.2, White, bold: true);
-        var itemsRight = Left + DateW + ParticularsW - 6;
-        pdf.TextRight(itemsRight - 96, ty, "QTY", 6.4, OnNavy, bold: true);
-        pdf.TextRight(itemsRight - 48, ty, "RATE", 6.4, OnNavy, bold: true);
-        pdf.TextRight(itemsRight, ty, "AMOUNT", 6.4, OnNavy, bold: true);
+        if (itemColumns)
+        {
+            /* The item block under a sale: qty, rate and amount sit at the
+               right of PARTICULARS, where the old statement had them. */
+            var itemsRight = Left + DateW + ParticularsW - 6;
+            pdf.TextRight(itemsRight - 82, ty, "QTY", 6.4, OnNavy, bold: true);
+            pdf.TextRight(itemsRight - 44, ty, "RATE", 6.4, OnNavy, bold: true);
+            pdf.TextRight(itemsRight, ty, "AMOUNT", 6.4, OnNavy, bold: true);
+        }
         var x = Left + DateW + ParticularsW;
         pdf.TextRight(x + MoneyW - 5, ty, "DEBIT", 7.2, White, bold: true);
         pdf.TextRight(x + MoneyW * 2 - 5, ty, "CREDIT", 7.2, White, bold: true);
@@ -250,9 +256,9 @@ public static class LedgerStatementPdf
                     barTop = y;
                 }
                 var b = y - ItemH + 3;
-                pdf.Text(itemsLeft + 4, b, pdf.Ellipsis(it.Name, 7, itemsRight - itemsLeft - 150), 7, Muted);
-                pdf.TextRight(itemsRight - 96, b, Qty(it.Qty), 7, Muted);
-                pdf.TextRight(itemsRight - 48, b, Money(it.Rate), 7, Muted);
+                pdf.Text(itemsLeft + 4, b, pdf.Ellipsis(it.Name, 7, itemsRight - itemsLeft - 108), 7, Muted);
+                pdf.TextRight(itemsRight - 82, b, Qty(it.Qty), 7, Muted);
+                pdf.TextRight(itemsRight - 44, b, Money(it.Rate), 7, Muted);
                 pdf.TextRight(itemsRight, b, Money(it.Amount), 7, Ink);
                 y -= ItemH;
             }

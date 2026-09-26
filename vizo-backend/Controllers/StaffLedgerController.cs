@@ -385,7 +385,9 @@ public class StaffLedgerController : ApiControllerBase
             var kind = l.isMirror ? "reversal"
                 : (l.reference ?? "").StartsWith("STAFF ") || (l.reference ?? "").StartsWith("SALARY ") ? "manual" : "journal";
             rows.Add(new StaffRow($"l{l.LineId}", l.date, kind,
-                string.IsNullOrWhiteSpace(l.narration) ? (l.Description ?? "") : l.narration, l.other,
+                /* The line's own words ("Advance -- Eid advance"); the entry's narration
+                   adds the person's name, which this page already shows. */
+                string.IsNullOrWhiteSpace(l.Description) ? l.narration : l.Description!, l.other,
                 l.DebitAmount, l.CreditAmount, running, l.EntryId, l.entryNo,
                 l.reversedBy is not null, kind == "manual" && l.reversedBy is null));
         }
@@ -649,7 +651,8 @@ public class StaffLedgerController : ApiControllerBase
             TotalCredit: st.totalCredit,
             Closing: st.closingBalance,
             ClosingLabel: st.closingBalance >= 0 ? "Payable to staff" : "Advance outstanding",
-            Footnote: "Balance is in the payroll's own sense: positive is salary still owed, negative is an advance to be recovered.");
+            Footnote: "Balance is in the payroll's own sense: positive is salary still owed, negative is an advance to be recovered.",
+            ItemColumns: false);
 
         var code = Str("code");
         var file = $"STAFF-{code}-{st.from:yyyyMMdd}-{st.to:yyyyMMdd}.pdf";

@@ -392,7 +392,7 @@ public class ExpenseSheetsController : ApiControllerBase
             /* A sheet made by migration 35 out of expenses that were each
                posted on their own has one entry per line and none of its own. */
             var entries = lines.Where(l => l.entryId is not null && l.entryId != s.entryId)
-                .Select(l => new { id = l.entryId!.Value, no = l.entryNo })
+                .Select(l => new { id = l.entryId!.Value, no = l.entryNo, reversed = l.status == Reversed })
                 .DistinctBy(e => e.id).ToList();
 
             /* The corrected day, once a reversed one has been re-entered. */

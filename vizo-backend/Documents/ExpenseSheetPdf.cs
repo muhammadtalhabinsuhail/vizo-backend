@@ -350,7 +350,7 @@ public static class ExpenseSheetPdf
         var paidFromCount = m.Lines.Where(l => !l.Excluded).Select(l => l.PaidFrom).Distinct().Count();
         var tiles = new[]
         {
-            ("TOTAL SPENT", $"{m.Company.CurrencySymbol} {Money(total)}", true),
+            (m.StatusKey == "REVERSED" ? "TOTAL REVERSED" : "TOTAL SPENT", $"{m.Company.CurrencySymbol} {Money(total)}", true),
             ("EXPENSES", lineCount.ToString("N0", En), false),
             ("PAID FROM", paidFromCount == 1 ? "1 account" : $"{paidFromCount} accounts", false),
         };
@@ -379,7 +379,7 @@ public static class ExpenseSheetPdf
             var entry = string.IsNullOrWhiteSpace(m.ReversalEntryNo) ? "" : $" Reversal entry {m.ReversalEntryNo}.";
             y = Ribbon(pdf, y, DangerFill, Danger, Danger,
                 $"REVERSED{when}{who}".ToUpperInvariant(),
-                $"{m.ReversalReason ?? "No reason recorded."}{entry}");
+                $"{(m.ReversalReason ?? "No reason recorded").TrimEnd('.')}.{entry}");
         }
 
         return y - 4;

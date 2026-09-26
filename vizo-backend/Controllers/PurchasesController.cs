@@ -55,6 +55,7 @@ namespace vizo_backend.Controllers;
 public class PurchasesController : ApiControllerBase
 {
     private readonly PushNotificationService _push;
+    private readonly IServiceScopeFactory _scopes;
 
     /* The accounts a purchase posts to. By code, like the rest of this
        codebase (AccountingController looks up 1130/2101 the same way). */
@@ -67,8 +68,12 @@ public class PurchasesController : ApiControllerBase
 
     public PurchasesController(AppDbContext db, IConfiguration cfg,
         ILogger<PurchasesController> logger, IWebHostEnvironment env,
-        PushNotificationService push)
-        : base(db, cfg, logger, env) => _push = push;
+        PushNotificationService push, IServiceScopeFactory scopes)
+        : base(db, cfg, logger, env)
+    {
+        _push = push;
+        _scopes = scopes;
+    }
 
     // ══════════════════════════════════════════════════════════════════
     //  PURCHASE ORDERS -- read
@@ -798,13 +803,39 @@ public class PurchasesController : ApiControllerBase
             await Log("PO_CREATED", "PurchaseOrder", po.PoNo,
                 $"{lines.Count} lines, {po.TotalAmount:N0}, {entries.Count} vouchers, stock into {location.LocationName}", 1);
 
-            /* PDFs exist the moment the documents do (see DocumentArchive). */
+            /* PDFs exist the moment the documents do (see DocumentArchive) --
+               but one purchase order is up to EIGHT documents (order, bill,
+               the overall sheet, five vouchers), and eight Cloudinary uploads
+               one after another kept the admin staring at "Saving..." for over
+               ten seconds (measured 26 Sep). Speed is a standing requirement
+               here (vizo-erp/AGENTS.md), and nothing on the next screen waits
+               for a stored file -- Print and Download build one on demand if it
+               is not there yet. So they are stored AFTER the response, on a
+               scope of their own: the request's DbContext is disposed the
+               moment the response is sent. A failure is logged and swallowed,
+               exactly as it always was. */
             var uid = CurrentUserId();
-            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-order", po.PoId, uid);
-            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-invoice", pi.PiId, uid);
-            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "purchase-vouchers", po.PoId, uid);
-            foreach (var e in entries)
-                await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "journal-entry", e.EntryId, uid);
+            var docs = new List<(string kind, int id)>
+            {
+                ("purchase-order", po.PoId), ("purchase-invoice", pi.PiId), ("purchase-vouchers", po.PoId)
+            };
+            docs.AddRange(entries.Select(e => ("journal-entry", e.EntryId)));
+            var cfg = _cfg;
+            var log = _logger;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var scope = _scopes.CreateScope();
+                    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                    foreach (var (kind, docId) in docs)
+                        await DocumentArchive.TryStoreForAsync(db, cfg, log, kind, docId, uid);
+                }
+                catch (Exception ex)
+                {
+                    log.LogWarning(ex, "Archiving the documents of purchase order {PoId} failed", po.PoId);
+                }
+            });
 
             await _push.NotifyRolesAsync(
                 new[] { "super-admin" },

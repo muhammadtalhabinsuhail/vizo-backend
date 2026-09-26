@@ -52,6 +52,7 @@ public class ReportsController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
 
     [HttpGet("sales-summary")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> SalesSummary(
         [FromQuery] DateOnly? from, [FromQuery] DateOnly? to, [FromQuery] int? locationId)
     {
@@ -144,6 +145,7 @@ public class ReportsController : ApiControllerBase
     /// on 60-day terms is not overdue on day 31.
     /// </summary>
     [HttpGet("aging/customer")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> CustomerAging([FromQuery] DateOnly? asOf)
     {
         try
@@ -433,6 +435,7 @@ public class ReportsController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
 
     [HttpGet("top-customers")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> TopCustomers(
         [FromQuery] DateOnly? from, [FromQuery] DateOnly? to, [FromQuery] int limit = 20)
     {
@@ -503,6 +506,7 @@ public class ReportsController : ApiControllerBase
     /// real instead of a menu of links.
     /// </summary>
     [HttpGet]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> Index()
     {
         try
@@ -600,6 +604,7 @@ public class ReportsController : ApiControllerBase
     /// account for the difference. Defaults to this month against last.
     /// </summary>
     [HttpGet("sales-drop")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> SalesDrop(
         [FromQuery] DateOnly? from, [FromQuery] DateOnly? to,
         [FromQuery] DateOnly? baseFrom, [FromQuery] DateOnly? baseTo)
@@ -866,6 +871,7 @@ public class ReportsController : ApiControllerBase
     /// always there.
     /// </summary>
     [HttpGet("sales-drop/explain")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> ExplainSalesDrop(
         [FromQuery] DateOnly? from, [FromQuery] DateOnly? to,
         [FromQuery] DateOnly? baseFrom, [FromQuery] DateOnly? baseTo,
@@ -912,6 +918,7 @@ public class ReportsController : ApiControllerBase
     /// which is not the same as oldest-debt-first.
     /// </summary>
     [HttpGet("recovery-priority")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> RecoveryPriority(CancellationToken ct = default)
     {
         try
@@ -1016,6 +1023,7 @@ public class ReportsController : ApiControllerBase
     /// Dead and slow-moving stock, with a line on what to do with each.
     /// </summary>
     [HttpGet("dead-stock/advice")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> DeadStockAdvice([FromQuery] int days = 90, CancellationToken ct = default)
     {
         try
@@ -1108,6 +1116,7 @@ public class ReportsController : ApiControllerBase
     /// shrinking. AI only writes the one-line reason.
     /// </summary>
     [HttpGet("customers/at-risk")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> CustomersAtRisk([FromQuery] int take = 15, CancellationToken ct = default)
     {
         try
@@ -1310,6 +1319,7 @@ public class ReportsController : ApiControllerBase
     /// #7 -- margins that have gone thin, and what a discount would do.
     /// </summary>
     [HttpGet("margin-watch")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> MarginWatch(
         [FromQuery] decimal thinBelowPercent = 10m, [FromQuery] int days = 90,
         CancellationToken ct = default)
@@ -1395,6 +1405,7 @@ public class ReportsController : ApiControllerBase
     /// #9 -- the month in one page, written out.
     /// </summary>
     [HttpGet("month-end-summary")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> MonthEndSummary(
         [FromQuery] int? year, [FromQuery] int? month, CancellationToken ct = default)
     {
@@ -1501,6 +1512,7 @@ public class ReportsController : ApiControllerBase
     ///   2. run it, then answer FROM ITS OUTPUT
     /// </summary>
     [HttpPost("ask")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> Ask([FromBody] AskRequest body, CancellationToken ct = default)
     {
         try
@@ -1644,6 +1656,7 @@ public class ReportsController : ApiControllerBase
     /// what is in the drawer.
     /// </summary>
     [HttpGet("dashboard/accountant")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> AccountantDashboard()
     {
         try
@@ -1932,7 +1945,7 @@ public class ReportsController : ApiControllerBase
                     processing = CountOf("PROCESSING"),
                     packed = CountOf("PACKED"),
                     creditHold = CountOf("CREDIT_HOLD"),
-                    creditHoldValue = ValueOf("CREDIT_HOLD"),
+                    creditHoldValue = CurrentRole() == "order-dept" ? 0m : ValueOf("CREDIT_HOLD"),
                     queue
                 },
                 packing = new { waiting = CountOf("CONFIRMED") + CountOf("PROCESSING"), packed = CountOf("PACKED") },
@@ -1942,11 +1955,19 @@ public class ReportsController : ApiControllerBase
                     lowCount = lowStock.Count,
                     items = lowStock.Take(8)
                 },
+                /* Claims are valued at COST, which the order desk must not see
+                   (26 September) -- nor do they work claims any more. The count
+                   stays; the value and the per-claim cost go. */
                 claims = new
                 {
                     openCount = openClaims.Count,
-                    openValue = openClaims.Sum(c => c.value),
-                    items = openClaims.Take(6)
+                    openValue = CurrentRole() == "order-dept" ? 0m : openClaims.Sum(c => c.value),
+                    items = openClaims.Take(6).Select(c => new
+                    {
+                        c.id, c.claimNo, c.customer, c.product, c.quantity,
+                        value = CurrentRole() == "order-dept" ? 0m : c.value,
+                        c.stage, c.receivedOn, c.remindersSent
+                    })
                 }
             });
         }
@@ -2096,6 +2117,7 @@ public class ReportsController : ApiControllerBase
     }
 
     [HttpGet("{key}/pdf")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> RenderPdf(string key,
         [FromQuery] DateOnly? from, [FromQuery] DateOnly? to, [FromQuery] int? locationId,
         [FromQuery] DateOnly? asOf, [FromQuery] int days = 90,
@@ -2120,6 +2142,7 @@ public class ReportsController : ApiControllerBase
     /// Re-running the same report with the same parameters replaces its file.
     /// </summary>
     [HttpPost("{key}/pdf")]
+    [Authorize(Roles = "super-admin,accountant,sales")]   // not the order desk: money (26 Sep)
     public async Task<IActionResult> ArchivePdf(string key,
         [FromQuery] DateOnly? from, [FromQuery] DateOnly? to, [FromQuery] int? locationId,
         [FromQuery] DateOnly? asOf, [FromQuery] int days = 90,

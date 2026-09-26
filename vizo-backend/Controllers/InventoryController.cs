@@ -915,6 +915,11 @@ public class InventoryController : ApiControllerBase
                                        s.Product.Sku.ToLower().Contains(term));
             }
 
+            /* The order desk keeps Stock in Hand but sees no cost (the owner,
+               26 September) -- cost and the value built on it are zero for that
+               role. A local, so EF reads it as a constant (trap 27). */
+            var noCost = CurrentRole() == "order-dept";
+
             var items = await rows
                 .OrderBy(s => s.Product.ProductName).ThenBy(s => s.Location.LocationName)
                 .Select(s => new
@@ -926,7 +931,7 @@ public class InventoryController : ApiControllerBase
                     packing = s.Product.Packing,
                     minQty = s.Product.MinQty,
                     maxQty = s.Product.MaxQty,
-                    costPrice = s.Product.CostPrice,
+                    costPrice = noCost ? 0m : s.Product.CostPrice,
                     locationId = s.LocationId,
                     locationCode = s.Location.LocationCode,
                     locationName = s.Location.LocationName,
@@ -975,7 +980,7 @@ public class InventoryController : ApiControllerBase
                         cityId = g.Key.CityId,
                         city = g.Key.CityName,
                         units = g.Sum(x => x.Quantity),
-                        value = g.Sum(x => x.Quantity * x.Product.CostPrice),
+                        value = noCost ? 0m : g.Sum(x => x.Quantity * x.Product.CostPrice),
                         locations = g.Select(x => x.LocationId).Distinct().Count()
                     })
                     .OrderBy(c => c.city)
@@ -1085,6 +1090,7 @@ public class InventoryController : ApiControllerBase
     {
         try
         {
+            var noCost = CurrentRole() == "order-dept";   // no cost for the order desk (26 Sep)
             var a = await _db.StockAdjustments.AsNoTracking()
                 .Where(x => x.AdjustmentId == id)
                 .Select(x => new
@@ -1111,7 +1117,7 @@ public class InventoryController : ApiControllerBase
                         currentQty = i.CurrentQty,
                         newQty = i.NewQty,
                         delta = i.NewQty - i.CurrentQty,
-                        costPrice = i.Product.CostPrice
+                        costPrice = noCost ? 0m : i.Product.CostPrice
                     }).ToList()
                 })
                 .FirstOrDefaultAsync();
@@ -1220,6 +1226,7 @@ public class InventoryController : ApiControllerBase
     {
         try
         {
+            var noCost = CurrentRole() == "order-dept";   // no cost for the order desk (26 Sep)
             return Ok(new
             {
                 categories = await _db.Categories.AsNoTracking()
@@ -1307,7 +1314,7 @@ public class InventoryController : ApiControllerBase
                         imageUrl = p.ImageUrl,
                         name = p.ProductName,
                         packing = p.Packing,
-                        costPrice = p.CostPrice,
+                        costPrice = noCost ? 0m : p.CostPrice,
                         salePrice = p.SalePrice,
                         totalStock = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
                     })

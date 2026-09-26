@@ -1364,11 +1364,6 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.TaxAmount).HasPrecision(14, 2);
             entity.Property(e => e.TotalAmount).HasPrecision(14, 2);
 
-            entity.HasOne(d => d.ApprovedByUser).WithMany(p => p.PurchaseOrderApprovedByUsers)
-                .HasForeignKey(d => d.ApprovedByUserId)
-                .OnDelete(DeleteBehavior.SetNull)
-                .HasConstraintName("fk_po_approved_by");
-
             entity.HasOne(d => d.CreatedByUser).WithMany(p => p.PurchaseOrderCreatedByUsers)
                 .HasForeignKey(d => d.CreatedByUserId)
                 .HasConstraintName("fk_po_created_by");
@@ -1376,10 +1371,6 @@ public partial class AppDbContext : DbContext
             entity.HasOne(d => d.Location).WithMany(p => p.PurchaseOrders)
                 .HasForeignKey(d => d.LocationId)
                 .HasConstraintName("fk_po_location");
-
-            entity.HasOne(d => d.Status).WithMany(p => p.PurchaseOrders)
-                .HasForeignKey(d => d.StatusId)
-                .HasConstraintName("fk_po_status");
 
             entity.HasOne(d => d.SupplierUser).WithMany(p => p.PurchaseOrders)
                 .HasForeignKey(d => d.SupplierUserId)

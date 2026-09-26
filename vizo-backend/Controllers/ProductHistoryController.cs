@@ -821,17 +821,21 @@ public class ProductHistoryController : ApiControllerBase
             .Where(i => i.ProductId == productId)
             .Select(i => new
             {
-                id = i.Po.PoId, no = i.Po.PoNo, date = i.Po.PoDate, expected = i.Po.ExpectedDate,
+                id = i.Po.PoId, no = i.Po.PoNo, date = i.Po.PoDate,
                 supplier = (i.Po.SupplierUser.DisplayName ?? i.Po.SupplierUser.LegalName), location = i.Po.Location.LocationName,
-                status = i.Po.Status.StatusName, by = i.Po.CreatedByUser.User.FullName,
+                by = i.Po.CreatedByUser.User.FullName,
+                /* Before 26 Sep an order moved nothing -- its goods receipt did.
+                   Since then the order IS the receipt: it has a lot of its own. */
+                received = _db.StockBatches.Any(b => b.PoItemId == i.PoItemId),
                 i.Quantity, i.UnitCost, i.LineTotal
             })
             .ToListAsync();
         ev.AddRange(pos.Select(x => new HistoryEvent(
-            $"PO:{x.id}", Day(x.date), false, "purchase-order", "purchasing", "Ordered from supplier",
-            x.no, $"/purchases/orders/{x.id}", x.Quantity, "none",
-            x.location, null, x.location, x.supplier, x.UnitCost, x.LineTotal, x.by, x.status,
-            x.expected is null ? null : $"Expected {x.expected:dd MMM yyyy}")));
+            $"PO:{x.id}", Day(x.date), false, "purchase-order", "purchasing",
+            x.received ? "Bought and received" : "Ordered from supplier",
+            x.no, $"/purchases/orders/{x.id}", x.Quantity, x.received ? "in" : "none",
+            x.location, null, x.location, x.supplier, x.UnitCost, x.LineTotal, x.by,
+            x.received ? "Received" : null, null)));
 
         var grns = await _db.GoodsReceiptItems.AsNoTracking()
             .Where(i => i.ProductId == productId)

@@ -1682,7 +1682,8 @@ public class SalesController : ApiControllerBase
                     unitsOut += sending;
                     sold.DispatchedQty = sending;
 
-                    _db.StockMovements.Add(new StockMovement
+                    /* Oldest purchase lot first -- see StockBatches. */
+                    await StockBatches.RecordAsync(_db, new StockMovement
                     {
                         ProductId = sold.ProductId,
                         LocationId = dispatchFrom.LocationId,
@@ -2764,7 +2765,8 @@ public class SalesController : ApiControllerBase
 
                     if (saleOut is not null)
                     {
-                        _db.StockMovements.Add(new StockMovement
+                        /* Takes back out of the very lots the return put the units into. */
+                        await StockBatches.RecordAsync(_db, new StockMovement
                         {
                             ProductId = l.ProductId,
                             LocationId = locationId,
@@ -2774,7 +2776,7 @@ public class SalesController : ApiControllerBase
                             Quantity = -l.Quantity,
                             BalanceAfter = bal.Quantity,
                             UserId = CurrentUserId()
-                        });
+                        }, followRef: ret.ReturnNo);
                     }
 
                     l.RestockLocationId = null;
@@ -3598,7 +3600,9 @@ public class SalesController : ApiControllerBase
                 }
                 bal.Quantity += l.Qty;
 
-                _db.StockMovements.Add(new StockMovement
+                /* A return is against the customer, not one invoice, so there is no
+                   single earlier movement to follow: the units join the newest lot. */
+                await StockBatches.RecordAsync(_db, new StockMovement
                 {
                     ProductId = l.ProductId,
                     LocationId = body.LocationId,
@@ -3829,7 +3833,7 @@ public class SalesController : ApiControllerBase
                     .FirstAsync(s => s.ProductId == l.ProductId && s.LocationId == body.LocationId);
                 bal.Quantity -= l.Qty;
 
-                _db.StockMovements.Add(new StockMovement
+                await StockBatches.RecordAsync(_db, new StockMovement
                 {
                     ProductId = l.ProductId,
                     LocationId = body.LocationId,

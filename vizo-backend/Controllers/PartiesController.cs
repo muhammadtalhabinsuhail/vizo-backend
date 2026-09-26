@@ -59,6 +59,13 @@ public class PartiesController : ApiControllerBase
     private int? MyPartiesOnly() =>
         CurrentRole() == Services.OrderWorkflow.RoleSales ? CurrentUserId() : null;
 
+    /// <summary>
+    /// The Order Department: it opens customers and reads their details, and
+    /// sees no money on them -- no limit, balance, opening balance or
+    /// statement. By role, like MyPartiesOnly.
+    /// </summary>
+    private bool NoMoney() => CurrentRole() == Services.OrderWorkflow.RoleOrderDept;
+
     // ══════════════════════════════════════════════════════════════════
     //  LIST
     // ══════════════════════════════════════════════════════════════════
@@ -123,6 +130,11 @@ public class PartiesController : ApiControllerBase
 
             var total = await rows.CountAsync();
 
+            /* THE ORDER DESK SEES NO MONEY (the owner, 26 September): no limit,
+               no balance, no last payment. A local, so EF reads it as a constant
+               rather than a method it cannot translate. */
+            var noMoney = NoMoney();
+
             var items = await rows
                 .OrderBy(p => (p.DisplayName ?? p.LegalName))
                 .Skip((page - 1) * pageSize)
@@ -144,8 +156,8 @@ public class PartiesController : ApiControllerBase
                     categoryName = p.Category.CategoryName,
                     ntn = p.Ntn,
                     strn = p.Strn,
-                    creditLimit = p.CreditLimit,
-                    creditDays = p.CreditDays,
+                    creditLimit = noMoney ? 0m : p.CreditLimit,
+                    creditDays = noMoney ? 0 : p.CreditDays,
                     creditHoldPolicy = p.HoldPolicy.PolicyKey,
                     salesPerson = p.SalesPersonUser != null ? p.SalesPersonUser.User.FullName : null,
                     isActive = p.User.IsActive,
@@ -154,10 +166,10 @@ public class PartiesController : ApiControllerBase
 
                     /* Receivable and payable are derived, never stored: the
                        posted ledger is the only place a balance is true. */
-                    currentBalance = p.OpeningBalance + _db.JournalEntryLines
+                    currentBalance = noMoney ? 0m : p.OpeningBalance + _db.JournalEntryLines
                         .Where(l => l.PartyUserId == p.UserId && l.Entry.StatusId == 2)
                         .Sum(l => (decimal?)(l.DebitAmount - l.CreditAmount)) ?? 0m,
-                    payableBalance = _db.JournalEntryLines
+                    payableBalance = noMoney ? 0m : _db.JournalEntryLines
                         .Where(l => l.PartyUserId == p.UserId && l.Entry.StatusId == 2)
                         .Sum(l => (decimal?)(l.CreditAmount - l.DebitAmount)) ?? 0m,
 
@@ -172,7 +184,7 @@ public class PartiesController : ApiControllerBase
                         .Max(i => (DateOnly?)i.InvoiceDate),
                     lastSupplyAt = p.PurchaseInvoices
                         .Max(i => (DateOnly?)i.InvoiceDate),
-                    lastPaymentAt = p.Collections
+                    lastPaymentAt = noMoney ? null : p.Collections
                         .Where(c => c.Status.StatusKey == "CONFIRMED")
                         .Max(c => (DateOnly?)c.CollectedOn)
                 })
@@ -269,7 +281,8 @@ public class PartiesController : ApiControllerBase
 
             if (p is null) return NotFound(new { message = $"No party with id {id}." });
 
-            var balance = p.openingBalance + await _db.JournalEntryLines
+            var noMoney = NoMoney();
+            var balance = noMoney ? 0m : p.openingBalance + await _db.JournalEntryLines
                 .Where(l => l.PartyUserId == id && l.Entry.StatusId == 2)
                 .SumAsync(l => (decimal?)(l.DebitAmount - l.CreditAmount)) ?? 0m;
 
@@ -280,8 +293,11 @@ public class PartiesController : ApiControllerBase
                 p.phone, p.altPhone, p.email, p.cityId, p.city, p.province, p.country, p.addressLine,
                 p.categoryId, p.category, p.categoryName, p.industry,
                 p.ntn, p.strn, p.cnic,
-                p.creditLimit, p.creditDays, p.holdPolicyId, p.creditHoldPolicy,
-                p.openingBalance, p.salesPersonUserId, p.salesPerson, p.defaultLocationId,
+                creditLimit = noMoney ? 0m : p.creditLimit,
+                creditDays = noMoney ? 0 : p.creditDays,
+                p.holdPolicyId, p.creditHoldPolicy,
+                openingBalance = noMoney ? 0m : p.openingBalance,
+                p.salesPersonUserId, p.salesPerson, p.defaultLocationId,
                 p.rating, p.notes, p.isActive, p.createdAt,
                 /* Projected above but never handed on until now, so the customer screen's
                    "Legal documents" button and the edit screen's pictures had nothing to
@@ -307,6 +323,7 @@ public class PartiesController : ApiControllerBase
     /// count -- a draft entry has not happened yet.
     /// </summary>
     [HttpGet("{id:int}/statement")]
+    [Authorize(Roles = "super-admin,accountant,sales")]
     public async Task<IActionResult> GetStatement(int id,
         [FromQuery] DateOnly? from, [FromQuery] DateOnly? to)
     {
@@ -490,10 +507,11 @@ public class PartiesController : ApiControllerBase
                        the controller inside a Where is not something EF can
                        turn into SQL, and it fails at run time rather than at
                        build time. */
+                    /* Written as "everything EXCEPT the two admin-only kinds"
+                       since 26 September, so a category the accountant adds on
+                       the Customer Ledgers page is offered here too. */
                     .Where(c => everyKind
-                             || c.CategoryKey == "RETAILER"
-                             || c.CategoryKey == "WHOLESALER"
-                             || c.CategoryKey == "AGENT")
+                             || (c.CategoryKey != "DISTRIBUTOR" && c.CategoryKey != "MANUFACTURER"))
                     .OrderBy(c => c.CategoryId)
                     .Select(c => new { id = c.CategoryId, key = c.CategoryKey, name = c.CategoryName })
                     .ToListAsync(),
@@ -575,6 +593,12 @@ public class PartiesController : ApiControllerBase
 
                 body = body with { PartyCode = $"{prefix}{next:0000}" };
             }
+
+            /* The order desk opens customers (the owner, 26 September) but sets
+               no money on them: the limit and the opening balance are the
+               accountant's. Zeroed here rather than refused, so the order
+               desk's form -- which does not show them -- still saves. */
+            if (NoMoney()) body = body with { CreditLimit = 0m, OpeningBalance = 0m };
 
             var error = await ValidateParty(body, null);
             if (error is not null) return BadRequest(new { message = error });
@@ -673,6 +697,11 @@ public class PartiesController : ApiControllerBase
 
             var user = await _db.Users.FirstOrDefaultAsync(u => u.UserId == id);
             if (user is null) return NotFound(new { message = $"No user row behind party {id}." });
+
+            /* Same rule on an edit: whatever limit and opening balance the
+               account has, the order desk's save leaves exactly as it was. */
+            if (NoMoney())
+                body = body with { CreditLimit = party.CreditLimit, CreditDays = party.CreditDays, OpeningBalance = party.OpeningBalance };
 
             var error = await ValidateParty(body, id);
             if (error is not null) return BadRequest(new { message = error });

@@ -47,6 +47,17 @@ public class DocumentsController : ApiControllerBase
        own documents and need the same list. */
     private static IReadOnlyDictionary<string, string> Kinds => DocumentBuilder.Kinds;
 
+    /// <summary>
+    /// The documents the Order Department may not open: everything about
+    /// money or purchases (the owner, 26 September -- "no money, accounts or
+    /// purchases anywhere"). Stock adjustments and transfers stay open to it.
+    /// By ROLE, so a permission ticked in Setup cannot reopen them.
+    /// </summary>
+    private bool MoneyKindForOrderDesk(string kind) =>
+        CurrentRole() == "order-dept" && kind.ToLowerInvariant() is
+            "purchase-order" or "purchase-invoice" or "goods-receipt" or "purchase-return" or
+            "voucher" or "journal-entry" or "expense" or "party-statement" or "sales-return";
+
     // ══════════════════════════════════════════════════════════════════
     //  RENDER  /  ARCHIVE
     // ══════════════════════════════════════════════════════════════════
@@ -59,6 +70,8 @@ public class DocumentsController : ApiControllerBase
         {
             if (!Kinds.ContainsKey(kind))
                 return NotFound(new { message = $"'{kind}' is not a document this system prints." });
+            if (MoneyKindForOrderDesk(kind))
+                return StatusCode(403, new { message = "The Order Department does not see money documents." });
 
             var doc = await DocumentBuilder.BuildAsync(_db, kind, id);
             if (doc is null) return NotFound(new { message = $"No {kind.Replace('-', ' ')} with id {id}." });
@@ -87,6 +100,8 @@ public class DocumentsController : ApiControllerBase
         {
             if (!Kinds.TryGetValue(kind, out var folder))
                 return NotFound(new { message = $"'{kind}' is not a document this system prints." });
+            if (MoneyKindForOrderDesk(kind))
+                return StatusCode(403, new { message = "The Order Department does not see money documents." });
 
             var key = id.ToString();
 
@@ -135,6 +150,8 @@ public class DocumentsController : ApiControllerBase
         {
             if (!Kinds.ContainsKey(kind))
                 return NotFound(new { message = $"'{kind}' is not a document this system prints." });
+            if (MoneyKindForOrderDesk(kind))
+                return StatusCode(403, new { message = "The Order Department does not see money documents." });
 
             var file = await DocumentArchive.EnsureAsync(_db, _cfg, _logger, kind, id, CurrentUserId());
 
@@ -165,6 +182,8 @@ public class DocumentsController : ApiControllerBase
         {
             if (!Kinds.ContainsKey(kind))
                 return NotFound(new { message = $"'{kind}' is not a document this system prints." });
+            if (MoneyKindForOrderDesk(kind))
+                return StatusCode(403, new { message = "The Order Department does not see money documents." });
 
             var row = await DocumentArchive.FindAsync(_db, kind, id.ToString());
             return row is null

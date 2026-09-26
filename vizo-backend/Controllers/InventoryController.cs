@@ -966,6 +966,10 @@ public class InventoryController : ApiControllerBase
                the response says which (valuedAt). A local, not CurrentRole()
                inside the query, which would not translate (trap 27). */
             var seesCost = CurrentRole() == "super-admin";
+            /* ...and the order desk sees no money at all -- not even the value at
+               the selling price (the owner: "money ka koi bhi section iske paas
+               nahi aana chahiye"). */
+            var noMoney = CurrentRole() == "order-dept";
 
             if (locationId is not null) rows = rows.Where(s => s.LocationId == locationId);
 
@@ -1001,7 +1005,7 @@ public class InventoryController : ApiControllerBase
                     minQty = s.Product.MinQty,
                     maxQty = s.Product.MaxQty,
                     costPrice = seesCost ? (decimal?)s.Product.CostPrice : null,
-                    unitValue = seesCost ? s.Product.CostPrice : s.Product.SalePrice,
+                    unitValue = seesCost ? s.Product.CostPrice : noMoney ? 0m : s.Product.SalePrice,
                     locationId = s.LocationId,
                     locationCode = s.Location.LocationCode,
                     locationName = s.Location.LocationName,
@@ -1031,7 +1035,7 @@ public class InventoryController : ApiControllerBase
             return Ok(new
             {
                 totalValue = shaped.Sum(s => s.value),
-                valuedAt = seesCost ? "cost" : "sale",
+                valuedAt = seesCost ? "cost" : noMoney ? "none" : "sale",
                 totalUnits = shaped.Sum(s => s.qty),
                 /* What the filter is currently looking at, so the screen can
                    label its own figures honestly rather than always saying
@@ -1051,7 +1055,7 @@ public class InventoryController : ApiControllerBase
                         cityId = g.Key.CityId,
                         city = g.Key.CityName,
                         units = g.Sum(x => x.Quantity),
-                        value = g.Sum(x => x.Quantity * (seesCost ? x.Product.CostPrice : x.Product.SalePrice)),
+                        value = noMoney ? 0m : g.Sum(x => x.Quantity * (seesCost ? x.Product.CostPrice : x.Product.SalePrice)),
                         locations = g.Select(x => x.LocationId).Distinct().Count()
                     })
                     .OrderBy(c => c.city)
@@ -1162,6 +1166,7 @@ public class InventoryController : ApiControllerBase
         try
         {
             var seesCost = CurrentRole() == "super-admin";   // see GetStockLevels
+            var noMoney = CurrentRole() == "order-dept";
             var a = await _db.StockAdjustments.AsNoTracking()
                 .Where(x => x.AdjustmentId == id)
                 .Select(x => new
@@ -1191,7 +1196,7 @@ public class InventoryController : ApiControllerBase
                         /* At cost for the Super Admin, at the selling price for
                            everyone else (see stock-levels). */
                         costPrice = seesCost ? (decimal?)i.Product.CostPrice : null,
-                        unitValue = seesCost ? i.Product.CostPrice : i.Product.SalePrice
+                        unitValue = seesCost ? i.Product.CostPrice : noMoney ? 0m : i.Product.SalePrice
                     }).ToList()
                 })
                 .FirstOrDefaultAsync();

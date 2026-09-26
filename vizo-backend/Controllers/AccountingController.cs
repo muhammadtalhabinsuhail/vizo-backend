@@ -749,10 +749,27 @@ public class AccountingController : ApiControllerBase
             var confirmed = await _db.CollectionStatuses.FirstOrDefaultAsync(s => s.StatusKey == "CONFIRMED");
             if (confirmed is null) return BadRequest(new { message = "No CONFIRMED status is configured." });
 
+            await using var tx = await _db.Database.BeginTransactionAsync();
+
             c.StatusId = confirmed.StatusId;
             c.ConfirmedOn = Today();
-            c.ConfirmedByUserId = CurrentUserId();
+            /* "ConfirmedByUserId" is a foreign key to Employee; the service
+               account and anybody without an Employee row would break it. */
+            c.ConfirmedByUserId = await CurrentEmployeeId();
             await _db.SaveChangesAsync();
+
+            /* CONFIRMING IS WHEN THE MONEY BECOMES REAL -- so it is also when the
+               books hear about it. Until 26 September this flipped a status and
+               nothing else: a confirmed collection with no voucher never
+               reached the customer's balance. It now gets a posted receipt
+               voucher (RV series) into the cash or bank account of its method,
+               written exactly like any other receipt -- Services/LedgerPosting.cs.
+               A collection that already has a voucher is left alone, so nothing
+               is ever posted twice. */
+            var unposted = await LedgerPosting.PostCollectionAsync(_db, c.CollectionId, CurrentUserId());
+            if (unposted is not null) return BadRequest(new { message = unposted });
+
+            await tx.CommitAsync();
             await Log("COLLECTION_CONFIRMED", "Collection", c.ReceiptNo, $"{c.Amount:N2}", 2);
 
             /* -- C8 -- addressed to the rep who physically took the cash and is

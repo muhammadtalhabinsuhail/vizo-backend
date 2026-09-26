@@ -252,4 +252,214 @@ public class PackingController : ApiControllerBase
             return Fail(ex, $"load order {id} for packing");
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  RECENT ORDERS -- the top of the Packing page
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Every order CREATED in the last seven days -- today and the six before
+    /// it, Pakistan time -- newest first, whatever its status. The owner, 26
+    /// September: the order desk wants to see at a glance what came in this
+    /// week, not only what is waiting to be packed.
+    ///
+    /// NO MONEY on these rows, on purpose: order no, date, salesperson,
+    /// customer, status and how many items. The order desk sees no totals,
+    /// balances or payments anywhere (the same day's rule); the Packing detail
+    /// is the one place it sees a price, and that is the Super Admin's base
+    /// price, never a rep's.
+    ///
+    /// Capped at 300 rows -- a week of this business is a few dozen orders, and
+    /// the cap is what stops a busy week turning into a page that never loads.
+    /// </summary>
+    [HttpGet("recent")]
+    public async Task<IActionResult> GetRecentOrders([FromQuery] int days = 7)
+    {
+        try
+        {
+            if (days is < 1 or > 31) days = 7;
+            var since = Today().AddDays(-(days - 1));
+
+            var items = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.CreatedAt >= since)
+                .OrderByDescending(o => o.CreatedAt).ThenByDescending(o => o.OrderId)
+                .Take(300)
+                .Select(o => new
+                {
+                    id = o.OrderId,
+                    orderNo = o.OrderNo,
+                    orderDate = o.OrderDate,
+                    createdAt = o.CreatedAt,
+                    customerName = o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName,
+                    city = o.CustomerUser.City.CityName,
+                    salesPerson = o.SalesPersonUser != null ? o.SalesPersonUser.User.FullName : null,
+                    status = o.Status.StatusKey,
+                    statusName = o.Status.StatusName,
+                    itemCount = o.SalesOrderItems.Count,
+                    units = o.SalesOrderItems.Sum(l => (int?)l.Quantity) ?? 0
+                })
+                .ToListAsync();
+
+            return Ok(new { since, days, count = items.Count, items });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the recent orders");
+        }
+    }
+
+    /// <summary>
+    /// One order, read-only, for the order desk -- any status, not only the
+    /// ones ready to pack. The ordinary order screen (/sales/orders/{id}) is
+    /// built around money -- rates with the rep's margin, what has been paid,
+    /// the customer's balance and limit -- and around buttons the desk may not
+    /// press; this is the same order with its items, pictures, quantities and
+    /// the base price the Packing screen already shows, and where it has got to.
+    /// </summary>
+    [HttpGet("recent/{id:int}")]
+    public async Task<IActionResult> GetOrderReadOnly(int id)
+    {
+        try
+        {
+            var o = await _db.SalesOrders.AsNoTracking()
+                .Where(x => x.OrderId == id)
+                .Select(x => new
+                {
+                    id = x.OrderId,
+                    orderNo = x.OrderNo,
+                    orderDate = x.OrderDate,
+                    createdAt = x.CreatedAt,
+                    deliveryDate = x.DeliveryDate,
+                    customerName = x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName,
+                    customerCode = x.CustomerUser.PartyCode,
+                    customerPhone = x.CustomerUser.User.Phone,
+                    customerAddress = x.CustomerUser.AddressLine,
+                    city = x.CustomerUser.City.CityName,
+                    salesPerson = x.SalesPersonUser != null ? x.SalesPersonUser.User.FullName : null,
+                    createdBy = x.CreatedByUser.FullName,
+                    status = x.Status.StatusKey,
+                    statusName = x.Status.StatusName,
+                    location = x.Location.LocationName,
+                    notes = x.Notes,
+                    invoiceNo = x.SalesInvoice != null ? x.SalesInvoice.InvoiceNo : null,
+                    channel = x.Deliveries.OrderByDescending(d => d.DeliveryId).Select(d => d.Channel.ChannelName).FirstOrDefault(),
+                    carrier = x.Deliveries.OrderByDescending(d => d.DeliveryId)
+                        .Select(d => d.Courier != null ? d.Courier.CourierName : null).FirstOrDefault(),
+                    trackingNo = x.Deliveries.OrderByDescending(d => d.DeliveryId).Select(d => d.TrackingNo).FirstOrDefault(),
+                    dispatchedOn = x.Deliveries.OrderByDescending(d => d.DeliveryId).Select(d => (DateOnly?)d.BookedDate).FirstOrDefault(),
+                    deliveredOn = x.Deliveries.OrderByDescending(d => d.DeliveryId).Select(d => d.DeliveredDate).FirstOrDefault(),
+                    lines = x.SalesOrderItems.OrderBy(l => l.LineNo).Select(l => new
+                    {
+                        id = l.OrderItemId,
+                        productId = l.ProductId,
+                        name = l.Product.ProductName,
+                        sku = l.Product.Sku,
+                        imageUrl = l.Product.ImageUrl,
+                        packing = l.Product.Packing,
+                        qty = l.Quantity,
+                        dispatchedQty = l.DispatchedQty,
+                        price = l.Product.SalePrice
+                    }).ToList()
+                })
+                .FirstOrDefaultAsync();
+
+            if (o is null) return NotFound(new { message = $"No order with id {id}." });
+
+            return Ok(new
+            {
+                o.id, o.orderNo, o.orderDate, o.createdAt, o.deliveryDate,
+                o.customerName, o.customerCode, o.customerPhone, o.customerAddress, o.city,
+                o.salesPerson, o.createdBy, o.status, o.statusName, o.location, o.notes, o.invoiceNo,
+                o.channel, o.carrier, o.trackingNo, o.dispatchedOn, o.deliveredOn,
+                itemCount = o.lines.Count,
+                units = o.lines.Sum(l => l.qty),
+                totalAtBase = o.lines.Sum(l => l.qty * l.price),
+                o.lines
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"load order {id}");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  TAKING AN ORDER -- the order desk's own pickers
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// What the order desk's New Order screen needs, and nothing it may not see:
+    /// every active salesperson; every customer with the rep(s) they belong to
+    /// (the rep they are assigned to, and the rep who opened them -- the same
+    /// "whose customer is this" rule PartiesController.MyPartiesOnly uses) so
+    /// picking either box can fill the other; and the catalogue with the SELLING
+    /// price and stock -- no cost, no duty, no limits, no balances.
+    ///
+    /// GET /sales/lookups would answer too, with those figures zeroed for this
+    /// role; this is lighter and says exactly what the screen uses.
+    /// </summary>
+    [HttpGet("order-lookups")]
+    public async Task<IActionResult> OrderLookups()
+    {
+        try
+        {
+            var salesPeople = await _db.Employees.AsNoTracking()
+                .Where(e => e.User.Role.RoleKey == OrderWorkflow.RoleSales && e.User.IsActive)
+                .OrderBy(e => e.User.FullName)
+                .Select(e => new { id = e.UserId, name = e.User.FullName })
+                .ToListAsync();
+            var repIds = salesPeople.Select(r => r.id).ToHashSet();
+
+            var raw = await _db.Parties.AsNoTracking()
+                .Where(p => (p.User.RoleId == 5 || p.User.RoleId == 7) && p.User.IsActive && p.PartyCode != "VZ-C-WALKIN")
+                .OrderBy(p => p.DisplayName ?? p.LegalName)
+                .Select(p => new
+                {
+                    id = p.UserId,
+                    code = p.PartyCode,
+                    name = p.DisplayName ?? p.LegalName,
+                    city = p.City.CityName,
+                    phone = p.User.Phone,
+                    p.SalesPersonUserId,
+                    p.CreatedByUserId
+                })
+                .ToListAsync();
+
+            var customers = raw.Select(c => new
+            {
+                c.id, c.code, c.name, c.city, c.phone,
+                /* Assigned rep first -- it is the one the reverse fill picks. */
+                repIds = new[] { c.SalesPersonUserId, c.CreatedByUserId }
+                    .Where(r => r is int v && repIds.Contains(v)).Select(r => r!.Value).Distinct().ToList()
+            }).ToList();
+
+            var methods = await _db.PaymentMethods.AsNoTracking()
+                .Where(m => m.IsActive && m.IsForReceiving)
+                .OrderBy(m => m.MethodId)
+                .Select(m => new { id = m.MethodId, key = m.MethodKey, name = m.MethodName })
+                .ToListAsync();
+
+            var products = await _db.Products.AsNoTracking()
+                .Where(p => p.IsActive)
+                .OrderBy(p => p.ProductName)
+                .Select(p => new
+                {
+                    id = p.ProductId,
+                    sku = p.Sku,
+                    name = p.ProductName,
+                    packing = p.Packing,
+                    salePrice = p.SalePrice,
+                    taxRatePercent = p.TaxRatePercent,
+                    imageUrl = p.ImageUrl,
+                    stock = p.StockBalances.Sum(s => (int?)s.Quantity) ?? 0
+                })
+                .ToListAsync();
+
+            return Ok(new { salesPeople, customers, methods, products, maxMarginPercent = 10 });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "load the order desk's pickers");
+        }
+    }
 }

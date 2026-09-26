@@ -199,6 +199,26 @@ A short record of what was built. Full reasoning, warnings and decisions are in
 
 `api 1667625`, `api 29972d1` · `web 3e36a26`, `web 6053504`
 
+## 11. Purchases, ledgers and day expenses — 26 Sep (three parallel sessions)
+- **Purchases (A):** a purchase order is received, billed and posted at once —
+  no status, no GRN; five price parts (Cost, Duty, Fi Sabilillah, Margin 1,
+  Margin 2) per line with reasons; duty owed to a logistics company (an
+  account, managed in place); five journal vouchers + one printable overall
+  sheet; every unit in a stock lot traceable to its purchase; the new selling
+  price chosen in a popup that averages the ticked earlier purchases; purchases
+  and item cost for the Super Admin only.
+- **Ledgers and order desk (B):** sales, returns and collections post to the
+  books (D7 closed; a backfill button posts the history); customer ledgers
+  like the old SOA with `+` rows and PDF; staff ledgers with salary runs;
+  inline categories; Faysal Bank; Excel import; the order desk sees this
+  week's orders, keys its own orders, and sees no money anywhere.
+- **Day expenses (C):** one sheet per day and location, typed like a
+  spreadsheet, approved as one entry, printed as one invoice.
+
+Branches `feat/a-purchases`, `feat/b-ledgers`, `feat/c-expenses`, merged in
+`integration/2026-09-26` (both repos). **Not on main/master; migrations 26,
+30–33, 35 NOT run on live** — order in `changa.txt` §G.
+
 ---
 
 ## Database migrations — all run on live Neon

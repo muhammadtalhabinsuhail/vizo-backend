@@ -960,6 +960,13 @@ public class InventoryController : ApiControllerBase
         {
             var rows = _db.StockBalances.AsNoTracking().AsQueryable();
 
+            /* Stock is valued at COST for the Super Admin only -- what an item
+               cost is his alone since 26 Sep, and the order desk works this
+               screen. Everyone else sees it valued at the SELLING price, and
+               the response says which (valuedAt). A local, not CurrentRole()
+               inside the query, which would not translate (trap 27). */
+            var seesCost = CurrentRole() == "super-admin";
+
             if (locationId is not null) rows = rows.Where(s => s.LocationId == locationId);
 
             /* STOCK IN HAND, BY CITY.
@@ -993,7 +1000,8 @@ public class InventoryController : ApiControllerBase
                     packing = s.Product.Packing,
                     minQty = s.Product.MinQty,
                     maxQty = s.Product.MaxQty,
-                    costPrice = s.Product.CostPrice,
+                    costPrice = seesCost ? (decimal?)s.Product.CostPrice : null,
+                    unitValue = seesCost ? s.Product.CostPrice : s.Product.SalePrice,
                     locationId = s.LocationId,
                     locationCode = s.Location.LocationCode,
                     locationName = s.Location.LocationName,
@@ -1006,12 +1014,12 @@ public class InventoryController : ApiControllerBase
 
             var shaped = items.Select(s => new
             {
-                s.productId, s.sku, s.name, s.packing, s.minQty, s.maxQty, s.costPrice,
+                s.productId, s.sku, s.name, s.packing, s.minQty, s.maxQty, s.costPrice, s.unitValue,
                 s.locationId, s.locationCode, s.locationName, s.locationKind,
                 s.cityId, s.cityName, s.qty,
                 packets = s.packing > 0 ? s.qty / s.packing : 0,
                 loose = s.packing > 0 ? s.qty % s.packing : s.qty,
-                value = s.qty * s.costPrice,
+                value = s.qty * s.unitValue,
                 status = s.qty <= 0 ? "out"
                        : s.qty <= s.minQty ? "low"
                        : s.maxQty > 0 && s.qty > s.maxQty ? "over" : "ok"
@@ -1023,6 +1031,7 @@ public class InventoryController : ApiControllerBase
             return Ok(new
             {
                 totalValue = shaped.Sum(s => s.value),
+                valuedAt = seesCost ? "cost" : "sale",
                 totalUnits = shaped.Sum(s => s.qty),
                 /* What the filter is currently looking at, so the screen can
                    label its own figures honestly rather than always saying
@@ -1042,7 +1051,7 @@ public class InventoryController : ApiControllerBase
                         cityId = g.Key.CityId,
                         city = g.Key.CityName,
                         units = g.Sum(x => x.Quantity),
-                        value = g.Sum(x => x.Quantity * x.Product.CostPrice),
+                        value = g.Sum(x => x.Quantity * (seesCost ? x.Product.CostPrice : x.Product.SalePrice)),
                         locations = g.Select(x => x.LocationId).Distinct().Count()
                     })
                     .OrderBy(c => c.city)
@@ -1152,6 +1161,7 @@ public class InventoryController : ApiControllerBase
     {
         try
         {
+            var seesCost = CurrentRole() == "super-admin";   // see GetStockLevels
             var a = await _db.StockAdjustments.AsNoTracking()
                 .Where(x => x.AdjustmentId == id)
                 .Select(x => new
@@ -1178,7 +1188,10 @@ public class InventoryController : ApiControllerBase
                         currentQty = i.CurrentQty,
                         newQty = i.NewQty,
                         delta = i.NewQty - i.CurrentQty,
-                        costPrice = i.Product.CostPrice
+                        /* At cost for the Super Admin, at the selling price for
+                           everyone else (see stock-levels). */
+                        costPrice = seesCost ? (decimal?)i.Product.CostPrice : null,
+                        unitValue = seesCost ? i.Product.CostPrice : i.Product.SalePrice
                     }).ToList()
                 })
                 .FirstOrDefaultAsync();
@@ -1287,6 +1300,7 @@ public class InventoryController : ApiControllerBase
     {
         try
         {
+            var seesCostLk = CurrentRole() == "super-admin";   // see GetStockLevels
             return Ok(new
             {
                 categories = await _db.Categories.AsNoTracking()
@@ -1374,7 +1388,7 @@ public class InventoryController : ApiControllerBase
                         imageUrl = p.ImageUrl,
                         name = p.ProductName,
                         packing = p.Packing,
-                        costPrice = p.CostPrice,
+                        costPrice = seesCostLk ? (decimal?)p.CostPrice : null,
                         salePrice = p.SalePrice,
                         totalStock = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
                     })

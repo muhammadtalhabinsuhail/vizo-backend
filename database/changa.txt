@@ -35,6 +35,12 @@
        36_collection_series.sql              -- (27 Sep) the COL numbering for
                                                collections made on Confirm
                                                Collections
+       37_must_change_password.sql           -- (27 Sep, E1) the new API FAILS
+       38_backup_files.sql                      without these two; 38 deletes
+                                               the 5 fake BackupHistory rows
+       39_visits_and_delivery_confirmation.sql -- (27 Sep, E2) Delivery and
+                                               Visits answer 500 without it
+       41_bank_statement_import.sql          -- (27 Sep, E3) additive
      Each is safe to run twice. None of them breaks the OLD API still running.
 
  G3  DEPLOY: merge integration/2026-09-26 into master (backend) and main
@@ -52,7 +58,8 @@
 
  G6  AS SUPER ADMIN: Money -> Customer Ledgers -> "Post them now" (once). It
      posts the 27 old invoices and 5 returns that never reached the books
-     (PKR 446,755.69). Then open Trial Balance: the movement must still balance.
+     (PKR 446,755.69). Then open the Balance Sheet: it must still balance (the
+     Trial Balance screen was removed on 27 Sep at the owner's request).
      Customer balances go UP by what was billed, so some shops will now be
      over their limit (on the copy: Mobile Zone Lahore 396,749 vs 200,000).
 
@@ -72,6 +79,23 @@
 
  G11 When the old-system (FoxPro) customer file is ready: Customer Ledgers ->
      Import -> download the template, fill it, upload, check the preview, import.
+
+ G12 (27 Sep, rounds D/E -- details at the top of NOTES-d/e1/e2/e3.md)
+       - STAFF PASSWORDS: 7 of 11 staff still sign in with Vizo@1234, the other
+         4 with the seed passwords. Set a temporary password per person
+         (Setup -> Users -> Password), or force everyone to choose a new one at
+         next sign-in with the SQL in NOTES-e1.md item 1.
+       - After deploy: Setup -> Users -> (another admin) -> Password -> "Email a
+         reset code" once, to prove the Gmail app password still works.
+       - Karachi own-team deliveries can only be confirmed by the Super Admin
+         (the channel names the sales rep, who has no Delivery screen). Either
+         make the order desk its confirmer at /admin/couriers, or ask for a
+         "delivered" button for reps.
+       - DLV-26-0220 carries COD 58,648 against a 2,183.05 invoice (ORD-26-0162):
+         cancel and re-book it, or correct it in the database.
+       - People -> Customers: customers assigned to Bilal Ahmed (Order Dept) and
+         Hassan Raza (Accountant) should move to real salespeople; reminders go
+         to whoever is assigned.
 
 
 ───────────────────────────────────────────────────────────────────────────────

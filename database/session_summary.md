@@ -219,6 +219,25 @@ Branches `feat/a-purchases`, `feat/b-ledgers`, `feat/c-expenses`, merged in
 `integration/2026-09-26` (both repos). **Not on main/master; migrations 26,
 30–33, 35 NOT run on live** — order in `changa.txt` §G.
 
+## 12. Everything from the database — 27 Sep (rounds D, E1, E2, E3)
+- **D:** Confirm Collections is real: collect on any invoiced order, and the receipt
+  posts to the customer and is allocated to his invoice. A rep's collection can be
+  confirmed for what actually arrived, or bounced. The sign-in page is animated. The
+  Account List is real (add, edit, delete, switch off). The Trial Balance screen is
+  removed. **Print prints** everywhere.
+- **E1:** Forgot and reset password by email, temporary passwords with a forced
+  change, and real backups that can be downloaded.
+- **E2:** Delivery booking and confirmation, and COD settlement. Visits, and reports
+  from the DB. The order desk no longer types the COD.
+- **E3:** The company name comes from the DB, Quick Create works with "N then a
+  letter", notifications are real, the dispatch channel is suggested by the API, and
+  bank statement import is added.
+
+Branches `feat/d-collections`, `feat/e1-auth`, `feat/e2-ops`, `feat/e3-shell`, all
+merged into `integration/2026-09-26`. **Migrations 36–39 and 41 are NOT run on live**
+(37, 38 and 39 must run before the new API). The owner's items are in `changa.txt`
+§G12.
+
 ---
 
 ## Database migrations — all run on live Neon

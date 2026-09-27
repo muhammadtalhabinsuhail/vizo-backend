@@ -75,8 +75,10 @@ public class DispatchController : ApiControllerBase
                     customerPhone = o.CustomerUser.User.Phone,
                     address = o.CustomerUser.AddressLine,
                     city = o.CustomerUser.City.CityName,
+                    cityId = o.CustomerUser.CityId,
                     province = o.CustomerUser.City.Province.ProvinceName,
                     locationId = o.LocationId,
+                    locationCityId = o.Location.CityId,
                     location = o.Location.LocationName,
                     orderDate = o.OrderDate,
                     deliveryDate = o.DeliveryDate,
@@ -95,6 +97,8 @@ public class DispatchController : ApiControllerBase
                 })
                 .ToListAsync();
 
+            var suggest = await SuggestChannels(items.Select(o => (o.cityId, o.locationCityId)).ToList());
+
             var today = Today();
             var shaped = items.Select(o => new
             {
@@ -105,6 +109,7 @@ public class DispatchController : ApiControllerBase
                 o.total, o.paymentMethod, o.itemCount, o.totalUnits,
                 o.invoiceId, o.invoiceNo, o.paidAmount,
                 suggestedCod = o.paymentMethod == "CREDIT" ? 0m : o.total - o.paidAmount,
+                suggestedChannelId = suggest(o.cityId, o.locationCityId),
                 waitingDays = today.DayNumber - o.orderDate.DayNumber,
                 isLate = o.deliveryDate != null && o.deliveryDate < today
             }).ToList();
@@ -120,6 +125,57 @@ public class DispatchController : ApiControllerBase
         {
             return Fail(ex, "load the dispatch queue");
         }
+    }
+
+    /// <summary>
+    /// Which channel the booking form should START on for each order. Only a
+    /// starting point -- the order desk can pick any channel -- but a good one
+    /// saves a click on every parcel.
+    ///
+    /// It used to be `order.city === "Karachi"` in the browser, which never
+    /// matched anything: city names carry the country ("Karachi - Pakistan",
+    /// HANDOFF trap 22), so every order opened on cargo. And it hard-coded the
+    /// one city this company happens to have its own riders in. The rule is now
+    /// read from the data:
+    ///
+    ///   1. The customer is in the SAME CITY as the place the goods left from
+    ///      -> the channel the salesman confirms himself (ConfirmedByRole =
+    ///      sales): the own-team, by-hand delivery. That is what "local" means,
+    ///      in Karachi and equally in Lahore.
+    ///   2. Otherwise -> whichever channel this customer's CITY was last booked
+    ///      on (the by-hand channel excluded: it cannot reach another city).
+    ///      The desk's own habit per destination -- Islamabad goes by freight,
+    ///      Multan by cargo -- and it follows them if the habit changes.
+    ///   3. A city never shipped to before -> the first active channel that is
+    ///      not by hand.
+    /// </summary>
+    private async Task<Func<int, int, int?>> SuggestChannels(List<(int cityId, int locationCityId)> orders)
+    {
+        var channels = await _db.DeliveryChannels.AsNoTracking()
+            .Where(c => c.IsActive)
+            .OrderBy(c => c.ChannelId)
+            .Select(c => new { c.ChannelId, byHand = c.ConfirmedByRole.RoleKey == OrderWorkflow.RoleSales })
+            .ToListAsync();
+
+        var handId = channels.FirstOrDefault(c => c.byHand)?.ChannelId;
+        var fallback = channels.FirstOrDefault(c => !c.byHand)?.ChannelId ?? handId;
+        var usable = channels.Where(c => !c.byHand).Select(c => c.ChannelId).ToHashSet();
+
+        var cityIds = orders.Select(o => o.cityId).Distinct().ToList();
+        var history = cityIds.Count == 0
+            ? new Dictionary<int, int>()
+            : (await _db.Deliveries.AsNoTracking()
+                .Where(d => cityIds.Contains(d.Order.CustomerUser.CityId))
+                .Select(d => new { cityId = d.Order.CustomerUser.CityId, d.ChannelId, d.DeliveryId })
+                .ToListAsync())
+              .Where(d => usable.Contains(d.ChannelId))
+              .GroupBy(d => d.cityId)
+              .ToDictionary(g => g.Key, g => g.OrderByDescending(d => d.DeliveryId).First().ChannelId);
+
+        return (cityId, locationCityId) =>
+            cityId == locationCityId && handId is not null ? handId
+            : history.TryGetValue(cityId, out var last) ? last
+            : fallback;
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -260,6 +316,7 @@ public class DispatchController : ApiControllerBase
             {
                 channels = await _db.DeliveryChannels.AsNoTracking()
                     .Where(c => c.IsActive)
+                    .OrderBy(c => c.ChannelId)
                     .Select(c => new
                     {
                         id = c.ChannelId,
@@ -268,6 +325,9 @@ public class DispatchController : ApiControllerBase
                         description = c.Description,
                         requiresBilty = c.RequiresBilty,
                         remindAfterDays = c.RemindAfterDays,
+                        /* The sheet prints "then repeat every N hours"; without
+                           this it printed "every undefined hours". */
+                        remindEveryHours = c.RemindEveryHours,
                         confirmedByRole = c.ConfirmedByRole.RoleKey,
                         confirmedByRoleName = c.ConfirmedByRole.RoleName,
 

@@ -135,7 +135,12 @@ public class AdminUsersController : AdminControllerBase
                     isActive = x.IsActive,
                     isLocked = x.Employee != null && x.Employee.IsLocked,
                     lastLoginAt = x.Employee != null ? x.Employee.LastLoginAt : null,
-                    createdAt = x.CreatedAt
+                    createdAt = x.CreatedAt,
+                    /* Still on a temporary password -- the same test
+                       GET /api/account/status applies. */
+                    mustChangePassword = x.MustChangePassword && x.TemporaryPasswordHash != null
+                                         && x.TemporaryPasswordHash == x.PasswordHash,
+                    temporaryPasswordIssuedAt = x.TemporaryPasswordIssuedAt
                 })
                 .FirstOrDefaultAsync();
 
@@ -144,7 +149,8 @@ public class AdminUsersController : AdminControllerBase
             {
                 u.id, u.fullName, initials = Initials(u.fullName), u.email, u.phone,
                 u.employeeCode, u.roleId, u.roles, u.roleKey, u.permissionCount,
-                u.locations, u.primaryLocationId, u.isActive, u.isLocked, u.lastLoginAt, u.createdAt
+                u.locations, u.primaryLocationId, u.isActive, u.isLocked, u.lastLoginAt, u.createdAt,
+                u.mustChangePassword, u.temporaryPasswordIssuedAt
             });
         }
         catch (Exception ex)
@@ -181,6 +187,21 @@ public class AdminUsersController : AdminControllerBase
         }
     }
 
+    /// <summary>
+    /// Creates a staff account with a password NOBODY CHOSE.
+    ///
+    /// Until 27 Sep the form sent "Vizo@1234" for every new person, so every
+    /// account created from Setup shared one password that anybody who had ever
+    /// been given an account knew -- and the "Send invite email" switch beside
+    /// it did nothing at all (SendInvite was never read).
+    ///
+    /// Now the server generates a random temporary password, the account is
+    /// flagged MustChangePassword, and the password is returned ONCE in this
+    /// response for the Super Admin to hand over. With SendInvite on it is also
+    /// emailed to the new person through Services/Mailer. Whatever the email
+    /// does, the admin still sees the password, so a mail failure never leaves
+    /// somebody without a way in. body.Password is ignored on purpose.
+    /// </summary>
     [HttpPost("users")]
     public async Task<IActionResult> CreateUser([FromBody] UserRequest body)
     {
@@ -200,12 +221,12 @@ public class AdminUsersController : AdminControllerBase
                 Phone = body.Phone?.Trim(),
                 IsActive = body.IsActive,
                 CreatedAt = Today(),
-                /* A staff account always has a password. When an invite is sent
-                   it is a random one nobody knows, so the only way in is the
-                   emailed reset code. */
-                PasswordHash = BCrypt.Net.BCrypt.HashPassword(
-                    string.IsNullOrWhiteSpace(body.Password) ? Guid.NewGuid().ToString("N") : body.Password, 11)
             };
+
+            /* ck_user_password wants a hash on every staff row, so the
+               temporary one is written with the row itself. */
+            var temporary = Credentials.NewTemporaryPassword();
+            Credentials.SetTemporaryPassword(user, temporary, Now());
 
             if (body.LocationIds is { Count: > 0 })
                 user.PrimaryLocationId = body.LocationIds[0];
@@ -228,7 +249,13 @@ public class AdminUsersController : AdminControllerBase
             }
 
             await _db.SaveChangesAsync();
-            await Log("CREATED", "User", user.Email ?? user.FullName, $"{role.RoleName} account created", 1);
+            await Log("CREATED", "User", user.Email ?? user.FullName,
+                      $"{role.RoleName} account created with a temporary password", 1);
+
+            var (emailed, emailError) = body.SendInvite
+                ? await TryMail(() => Mailer.SendTemporaryPasswordAsync(_cfg, user.Email!, user.FullName, temporary, isNewAccount: true),
+                                "invite", user.Email!)
+                : (false, null);
 
             /* -- F1 -- other admins only. Somebody gaining access to the system
                is an admin's business and nobody else's. */
@@ -240,7 +267,16 @@ public class AdminUsersController : AdminControllerBase
                 url: $"/admin/users/{user.UserId}",
                 exceptUserId: CurrentUserId());
 
-            return Ok(new { id = user.UserId, message = $"{user.FullName} added." });
+            return Ok(new
+            {
+                id = user.UserId,
+                message = $"{user.FullName} added.",
+                email = user.Email,
+                temporaryPassword = temporary,
+                inviteRequested = body.SendInvite,
+                emailed,
+                emailError
+            });
         }
         catch (Exception ex)
         {
@@ -347,10 +383,24 @@ public class AdminUsersController : AdminControllerBase
         }
     }
 
-    /// <summary>Clears the password so the only way back in is the emailed
-    /// reset code. The code itself is issued by /api/auth/forgot-password.</summary>
+    /// <summary>
+    /// Emails the person a six-digit reset code. Their CURRENT PASSWORD KEEPS
+    /// WORKING until they choose a new one.
+    ///
+    /// This used to overwrite the password hash with a random GUID and send
+    /// nothing: the message said "must now reset via the code sent to ..." but
+    /// no code was ever sent (the forgot-password action was commented out),
+    /// so pressing it simply locked the person out for good. Now it issues the
+    /// same kind of code /forgot-password issues -- same table, same expiry --
+    /// and the person finishes on the Forgot password screen, where
+    /// AuthController's verify-code and reset-password spend it.
+    ///
+    /// Unlike the anonymous endpoint, the Super Admin IS told when the email
+    /// could not be sent: they are trusted, and they need to know to use a
+    /// temporary password instead.
+    /// </summary>
     [HttpPost("users/{id:int}/password-reset")]
-    public async Task<IActionResult> ForceReset(int id)
+    public async Task<IActionResult> SendResetCode(int id)
     {
         try
         {
@@ -358,16 +408,121 @@ public class AdminUsersController : AdminControllerBase
             if (user is null) return NotFound(new { message = "User not found." });
             if (string.IsNullOrWhiteSpace(user.Email))
                 return BadRequest(new { message = "That user has no email address to send a code to." });
+            if (!user.IsActive)
+                return BadRequest(new { message = "That account is deactivated. Activate it first -- a code is no use to somebody who cannot sign in." });
 
-            user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(Guid.NewGuid().ToString("N"), 11);
-            await _db.SaveChangesAsync();
-            await Log("PASSWORD_RESET", "User", user.Email, "Password cleared by the administrator", 3);
+            var email = user.Email;
+            var minutes = Credentials.CodeExpiryMinutes(_cfg);
+            var code = await Credentials.IssueResetCodeAsync(_db, user.UserId, minutes, Now());
 
-            return Ok(new { message = $"{user.FullName} must now reset via the code sent to {user.Email}." });
+            var (emailed, emailError) = await TryMail(
+                () => Mailer.SendResetCodeAsync(_cfg, email, user.FullName, code, minutes, askedByAdmin: true),
+                "reset code", email);
+
+            if (!emailed)
+            {
+                /* A code nobody received is a code nobody can use; spend it so
+                   the table does not hold a live one that went nowhere. */
+                var live = await _db.PasswordResetCodes
+                    .Where(c => c.UserId == user.UserId && c.ConsumedAt == null).ToListAsync();
+                foreach (var c in live) c.ConsumedAt = Now();
+                await _db.SaveChangesAsync();
+
+                return StatusCode(502, new
+                {
+                    message = "The reset code could not be emailed. Nothing on the account has changed -- " +
+                              "set a temporary password instead and hand it over yourself.",
+                    error = emailError
+                });
+            }
+
+            await Log("PASSWORD_RESET_SENT", "User", email,
+                      "Reset code emailed by the administrator; the current password still works", 3);
+
+            return Ok(new
+            {
+                message = $"A reset code is on its way to {email}. It is valid for {minutes} minutes; " +
+                          "their current password keeps working until they use it.",
+                expiresInMinutes = minutes
+            });
         }
         catch (Exception ex)
         {
             return Fail(ex, "save /api/admin/users/{id:int}/password-reset");
+        }
+    }
+
+    /// <summary>
+    /// Replaces the password with a random temporary one, shown to the Super
+    /// Admin ONCE in this response (and emailed too when asked), and makes the
+    /// person choose their own at next sign-in.
+    ///
+    /// For the person with no working email, or who is standing next to the
+    /// admin. Unlike the reset code this DOES stop the old password working --
+    /// which is also what you want when a password may have been seen by
+    /// somebody else.
+    /// </summary>
+    [HttpPost("users/{id:int}/temporary-password")]
+    public async Task<IActionResult> SetTemporaryPassword(int id, [FromBody] TemporaryPasswordRequest? body)
+    {
+        try
+        {
+            var user = await _db.Users.FirstOrDefaultAsync(u => u.UserId == id);
+            if (user is null) return NotFound(new { message = "User not found." });
+            if (id == CurrentUserId())
+                return BadRequest(new { message = "Change your own password from My Profile -> Security." });
+
+            var temporary = Credentials.NewTemporaryPassword();
+            Credentials.SetTemporaryPassword(user, temporary, Now());
+
+            /* An outstanding reset code would be a second way round the
+               temporary password; it dies with the old password. */
+            var live = await _db.PasswordResetCodes
+                .Where(c => c.UserId == user.UserId && c.ConsumedAt == null).ToListAsync();
+            foreach (var c in live) c.ConsumedAt = Now();
+
+            await _db.SaveChangesAsync();
+            await Log("PASSWORD_TEMPORARY", "User", user.Email ?? user.FullName,
+                      "Temporary password set by the administrator; must be changed at next sign-in", 3);
+
+            var sendEmail = body?.SendEmail == true && !string.IsNullOrWhiteSpace(user.Email);
+            var (emailed, emailError) = sendEmail
+                ? await TryMail(() => Mailer.SendTemporaryPasswordAsync(_cfg, user.Email!, user.FullName, temporary, isNewAccount: false),
+                                "temporary password", user.Email!)
+                : (false, null);
+
+            return Ok(new
+            {
+                message = $"{user.FullName} must choose a new password at next sign-in.",
+                email = user.Email,
+                temporaryPassword = temporary,
+                emailRequested = sendEmail,
+                emailed,
+                emailError
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, "save /api/admin/users/{id:int}/temporary-password");
+        }
+    }
+
+    /// <summary>
+    /// Runs one Mailer call and reports (sent?, short reason). The whole
+    /// exception goes to the log; the Super Admin gets the mail server's own
+    /// one-line reason, which is what they need to put the settings right.
+    /// </summary>
+    private async Task<(bool Sent, string? Error)> TryMail(Func<Task> send, string what, string to)
+    {
+        try
+        {
+            await send();
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Could not email the {What} to {To}", what, to);
+            return (false, ex.GetBaseException().Message);
         }
     }
 
@@ -511,6 +666,7 @@ public class AdminUsersController : AdminControllerBase
         string FullName, string? Email, string? Phone, string? EmployeeCode,
         int RoleId, List<int>? LocationIds, bool IsActive, bool SendInvite, string? Password);
     public record BoolRequest(bool Value);
+    public record TemporaryPasswordRequest(bool SendEmail);
 
     // ══════════════════════ request bodies ════════════════════════════
 

@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel.DataAnnotations.Schema;
 
 namespace vizo_backend.Models;
 
@@ -25,12 +26,24 @@ public partial class PasswordResetCode
 
     public string CodeHash { get; set; } = null!;
 
+    /* THE THREE TIMESTAMPS ARE DECLARED "timestamp without time zone" (27 Sep).
+       Without the declaration EF maps a DateTime to timestamptz, and Npgsql
+       then refuses the Kind=Unspecified value Now() produces (HANDOFF trap
+       12): "Cannot write DateTime with Kind=Unspecified to PostgreSQL type
+       'timestamp with time zone'". So the first code ever issued failed to
+       save, and reset-password could never mark one spent -- the reset flow
+       had never worked end to end. The columns themselves were always plain
+       TIMESTAMP (06_neon_auth.sql); only the mapping was wrong. */
+
+    [Column(TypeName = "timestamp without time zone")]
     public DateTime ExpiresAt { get; set; }
 
+    [Column(TypeName = "timestamp without time zone")]
     public DateTime? ConsumedAt { get; set; }
 
     public short Attempts { get; set; }
 
+    [Column(TypeName = "timestamp without time zone")]
     public DateTime CreatedAt { get; set; }
 
     /* Deliberately NO 'public virtual User User' navigation.

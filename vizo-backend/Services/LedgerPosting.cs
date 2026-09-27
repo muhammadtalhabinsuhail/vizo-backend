@@ -481,6 +481,21 @@ public static class LedgerPosting
         db.Vouchers.Add(v);
         await db.SaveChangesAsync();
 
+        /* The receipt pays INVOICES, not just the customer (27 Sep). Each order
+           the collection was allocated to carries its invoice's share, so the
+           invoice's paid / balance and the Sale Invoices list move with it --
+           until now a confirmed collection reached the ledger but every
+           invoice still read unpaid. */
+        var shares = await db.CollectionAllocations
+            .Where(a => a.CollectionId == c.CollectionId && a.Order.SalesInvoice != null)
+            .Select(a => new { invoiceId = a.Order.SalesInvoice!.InvoiceId, a.Amount })
+            .ToListAsync();
+        foreach (var s in shares.GroupBy(s => s.invoiceId))
+            db.VoucherAllocations.Add(new VoucherAllocation
+            {
+                VoucherId = v.VoucherId, SalesInvoiceId = s.Key, Amount = s.Sum(x => x.Amount)
+            });
+
         var (entry, error) = await WriteEntryAsync(db, c.CollectedOn, "RECEIPT", locationId, v.VoucherNo,
             $"Collection {c.ReceiptNo}", userId, new[]
             {

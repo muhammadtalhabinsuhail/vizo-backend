@@ -734,17 +734,51 @@ public class AccountingController : ApiControllerBase
     /// becomes real to the books.
     /// </summary>
     [HttpPost("collections/{id:int}/confirm")]
-    public async Task<IActionResult> ConfirmCollection(int id)
+    public async Task<IActionResult> ConfirmCollection(int id,
+        [FromBody(EmptyBodyBehavior = Microsoft.AspNetCore.Mvc.ModelBinding.EmptyBodyBehavior.Allow)] ConfirmCollectionRequest? body)
     {
         try
         {
             var c = await _db.Collections
                 .Include(x => x.Status)
+                .Include(x => x.CollectionAllocations)
                 .FirstOrDefaultAsync(x => x.CollectionId == id);
 
             if (c is null) return NotFound(new { message = $"No collection with id {id}." });
             if (c.Status.StatusKey == "CONFIRMED")
                 return BadRequest(new { message = $"{c.ReceiptNo} was already confirmed." });
+
+            /* HOW MUCH IS BEING CONFIRMED (27 Sep). The modal asks; a rep may
+               have recorded 60,000 and handed in 55,000. Never more than he
+               recorded -- a bigger amount is a new collection, not this one. */
+            var recorded = c.Amount;
+            if (body?.Amount is { } confirmAmount)
+            {
+                if (confirmAmount <= 0 || confirmAmount > recorded)
+                    return BadRequest(new { message = $"Confirm between 1 and {recorded:N2} -- what {c.ReceiptNo} recorded." });
+                if (confirmAmount < recorded)
+                {
+                    /* Trim the orders it was allocated to, newest allocation first. */
+                    var cut = recorded - confirmAmount;
+                    foreach (var a in c.CollectionAllocations.OrderByDescending(a => a.AllocationId).ToList())
+                    {
+                        if (cut <= 0) break;
+                        var take = Math.Min(a.Amount, cut);
+                        a.Amount -= take;
+                        cut -= take;
+                        if (a.Amount == 0) _db.CollectionAllocations.Remove(a);
+                    }
+                    c.Amount = confirmAmount;
+                    var why = $"Recorded {recorded:N2}, confirmed {confirmAmount:N2}.";
+                    c.Note = (string.IsNullOrWhiteSpace(c.Note) ? why : $"{c.Note} {why}");
+                    if (c.Note.Length > 300) c.Note = c.Note[..300];
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(body?.Note))
+            {
+                c.Note = string.IsNullOrWhiteSpace(c.Note) ? body!.Note!.Trim() : $"{c.Note} {body!.Note!.Trim()}";
+                if (c.Note.Length > 300) c.Note = c.Note[..300];
+            }
 
             var confirmed = await _db.CollectionStatuses.FirstOrDefaultAsync(s => s.StatusKey == "CONFIRMED");
             if (confirmed is null) return BadRequest(new { message = "No CONFIRMED status is configured." });
@@ -2093,6 +2127,9 @@ public class AccountingController : ApiControllerBase
     // ══════════════════════ request bodies (part 2) ═════════════════════
 
     public record VoucherAllocationRequest(int? SalesInvoiceId, int? PurchaseInvoiceId, decimal Amount);
+
+    /// <summary>Optional: confirm less than the rep recorded, and/or add a note.</summary>
+    public record ConfirmCollectionRequest(decimal? Amount, string? Note);
 
     public record MatchLineRequest(int StatementLineId, int? JournalEntryLineId);
 

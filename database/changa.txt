@@ -2,12 +2,76 @@
  CHANGA  —  what YOU have to change, by hand, outside the code
 ═══════════════════════════════════════════════════════════════════════════════
 
- Updated with the latest session (section F, first): the Order Department's
+ Updated 27 September with the three parallel sessions of 26 September
+ (section G, FIRST -- it has the deploy order). Before that, section F: the Order Department's
  Packing screen and the loss of Claims. E is the warehouse role and panel
  deleted and purchase returns removed; D is Railway, the Gemini free-tier
  limit and two earlier live-data changes; C is the order-chain and
  new-customer work, B is 21 September, A is 20 September and
  1-4 are 17 September. All of them still stand.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ G.  26 SEPTEMBER — PURCHASES, LEDGERS, DAY EXPENSES: HOW TO PUT THEM LIVE
+───────────────────────────────────────────────────────────────────────────────
+
+ Everything from 26 September is on the branch integration/2026-09-26 in BOTH
+ repositories (and on feat/a-purchases, feat/b-ledgers, feat/c-expenses). It
+ is NOT on main / master: merging it there deploys it, and the live database
+ needs its migrations first. Do these in this order, all on the same day.
+
+ G1  TAKE A NEON SNAPSHOT (Neon console -> Branches -> Create branch / restore
+     point). Six migrations change the books and the stock.
+
+ G2  RUN ON LIVE, BEFORE THE DEPLOY, in this order (backend/database/):
+       26_purchase_pricing_and_batches.sql   -- SECTION 1 only (the top part);
+                                               it aborts by itself if the stock
+                                               lots and the shelves disagree
+       30_ledger_accounts.sql
+       31_staff_ledgers.sql                  -- the new API FAILS without it
+       32_ledger_entry_items.sql
+       33_order_desk_no_money.sql
+       35_expense_sheets.sql                 -- first run
+       36_collection_series.sql              -- (27 Sep) the COL numbering for
+                                               collections made on Confirm
+                                               Collections
+     Each is safe to run twice. None of them breaks the OLD API still running.
+
+ G3  DEPLOY: merge integration/2026-09-26 into master (backend) and main
+     (frontend) and push -- API first, then the website. Or tell Claude "merge
+     and push integration" and it will, as AmmarKamran2005.
+
+ G4  RUN ON LIVE, AFTER THE DEPLOY:
+       26_purchase_pricing_and_batches.sql   -- SECTION 2 (the three DROP
+                                               COLUMN lines at the bottom)
+       35_expense_sheets.sql                 -- second run: files any expense
+                                               the old API wrote in between
+
+ G5  EVERYONE SIGNS OUT AND BACK IN. The accountant loses Purchases and the
+     order desk loses money from their menus; both ride in the 8-hour token.
+
+ G6  AS SUPER ADMIN: Money -> Customer Ledgers -> "Post them now" (once). It
+     posts the 27 old invoices and 5 returns that never reached the books
+     (PKR 446,755.69). Then open Trial Balance: the movement must still balance.
+     Customer balances go UP by what was billed, so some shops will now be
+     over their limit (on the copy: Mobile Zone Lahore 396,749 vs 200,000).
+
+ G7  Purchases -> Logistics Companies: add the companies you pay duty to.
+
+ G8  Staff Ledgers: set each person's monthly salary, then "Salary run" per
+     month. Drivers/helpers without a login can be added there.
+
+ G9  Account List: give 1113 Faysal Bank its real opening balance, if it had one.
+
+ G10 Two old expenses need a click (session C found them):
+       - EXS-26-0009 (2 Sep, SSGC PKR 7,800): its journal entry was reversed on
+         15 Sep but the expense still reads Posted -> open the sheet, press
+         Reverse (no new entry is written; it only marks the day reversed).
+       - EXP-26-0026 (30 Aug, PKR 4,500, draft) is booked to Owner Capital ->
+         open sheet EXS-26-0007 and pick a real expense head before approving.
+
+ G11 When the old-system (FoxPro) customer file is ready: Customer Ledgers ->
+     Import -> download the template, fill it, upload, check the preview, import.
 
 
 ───────────────────────────────────────────────────────────────────────────────

@@ -153,17 +153,30 @@ public class InventoryController : ApiControllerBase
             /* status is derived, not stored: out -> low -> inactive -> active. */
             var shaped = items.Select(p => new
             {
-                p.id, p.sku, p.name, p.description,
-                p.categoryId, p.categoryName, p.brandId, p.brandName,
-                p.packing, p.minQty, p.maxQty,
+                p.id,
+                p.sku,
+                p.name,
+                p.description,
+                p.categoryId,
+                p.categoryName,
+                p.brandId,
+                p.brandName,
+                p.packing,
+                p.minQty,
+                p.maxQty,
                 costPrice = seesCost ? p.costPrice : (decimal?)null,
                 dutyPrice = seesCost ? p.dutyPrice : (decimal?)null,
                 fsPrice = seesCost ? p.fsPrice : (decimal?)null,
                 marginPrice = seesCost ? p.marginPrice : (decimal?)null,
                 margin2Price = seesCost ? p.margin2Price : (decimal?)null,
-                p.salePrice, p.taxRatePercent,
-                p.hideStock, p.isActive, p.imageUrl, p.createdAt,
-                p.totalStock, p.barcodes,
+                p.salePrice,
+                p.taxRatePercent,
+                p.hideStock,
+                p.isActive,
+                p.imageUrl,
+                p.createdAt,
+                p.totalStock,
+                p.barcodes,
                 status = !p.isActive ? "inactive"
                        : p.totalStock <= 0 ? "out"
                        : p.totalStock <= p.minQty ? "low" : "active"
@@ -177,7 +190,9 @@ public class InventoryController : ApiControllerBase
             var all = await _db.Products.AsNoTracking()
                 .Select(p => new
                 {
-                    p.IsActive, p.MinQty, landed = p.CostPrice + p.DutyPrice,
+                    p.IsActive,
+                    p.MinQty,
+                    landed = p.CostPrice + p.DutyPrice,
                     stock = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
                 })
                 .ToListAsync();
@@ -252,15 +267,25 @@ public class InventoryController : ApiControllerBase
             var seesCost = CurrentRole() == "super-admin";   // see the list above
             return Ok(new
             {
-                p.id, p.sku, p.name, p.description,
-                p.categoryId, p.categoryName, p.brandId, p.brandName,
-                p.packing, p.minQty, p.maxQty,
+                p.id,
+                p.sku,
+                p.name,
+                p.description,
+                p.categoryId,
+                p.categoryName,
+                p.brandId,
+                p.brandName,
+                p.packing,
+                p.minQty,
+                p.maxQty,
                 costPrice = seesCost ? p.costPrice : (decimal?)null,
                 dutyPrice = seesCost ? p.dutyPrice : (decimal?)null,
                 fsPrice = seesCost ? p.fsPrice : (decimal?)null,
                 marginPrice = seesCost ? p.marginPrice : (decimal?)null,
                 margin2Price = seesCost ? p.margin2Price : (decimal?)null,
-                p.salePrice, p.taxRatePercent, p.pricingLocked,
+                p.salePrice,
+                p.taxRatePercent,
+                p.pricingLocked,
                 /* The product's lots -- what is left of each purchase and at what
                    price -- for the Super Admin's Pricing tab. */
                 lots = seesCost
@@ -269,15 +294,22 @@ public class InventoryController : ApiControllerBase
                         .OrderByDescending(b => b.BatchDate).ThenByDescending(b => b.BatchId)
                         .Select(b => new
                         {
-                            id = b.BatchId, batchNo = b.BatchNo, date = b.BatchDate,
+                            id = b.BatchId,
+                            batchNo = b.BatchNo,
+                            date = b.BatchDate,
                             poId = b.PoItem != null ? (int?)b.PoItem.PoId : null,
                             qtyReceived = b.QtyReceived,
                             unitSalePrice = b.UnitCost + b.UnitDuty + b.UnitFs + b.UnitMargin1 + b.UnitMargin2,
                             onHand = b.Balances.Sum(x => (int?)x.Quantity) ?? 0
                         }).ToListAsync()
                     : null,
-                p.hideStock, p.isActive, p.imageUrl, p.createdAt,
-                p.barcodes, p.totalStock, p.stockSpread,
+                p.hideStock,
+                p.isActive,
+                p.imageUrl,
+                p.createdAt,
+                p.barcodes,
+                p.totalStock,
+                p.stockSpread,
                 status = !p.isActive ? "inactive"
                        : p.totalStock <= 0 ? "out"
                        : p.totalStock <= p.minQty ? "low" : "active"
@@ -966,6 +998,10 @@ public class InventoryController : ApiControllerBase
                the response says which (valuedAt). A local, not CurrentRole()
                inside the query, which would not translate (trap 27). */
             var seesCost = CurrentRole() == "super-admin";
+            /* ...and the order desk sees no money at all -- not even the value at
+               the selling price (the owner: "money ka koi bhi section iske paas
+               nahi aana chahiye"). */
+            var noMoney = CurrentRole() == "order-dept";
 
             if (locationId is not null) rows = rows.Where(s => s.LocationId == locationId);
 
@@ -989,11 +1025,6 @@ public class InventoryController : ApiControllerBase
                                        s.Product.Sku.ToLower().Contains(term));
             }
 
-            /* The order desk keeps Stock in Hand but sees no cost (the owner,
-               26 September) -- cost and the value built on it are zero for that
-               role. A local, so EF reads it as a constant (trap 27). */
-            var noCost = CurrentRole() == "order-dept";
-
             var items = await rows
                 .OrderBy(s => s.Product.ProductName).ThenBy(s => s.Location.LocationName)
                 .Select(s => new
@@ -1005,12 +1036,8 @@ public class InventoryController : ApiControllerBase
                     packing = s.Product.Packing,
                     minQty = s.Product.MinQty,
                     maxQty = s.Product.MaxQty,
-<<<<<<< HEAD
                     costPrice = seesCost ? (decimal?)s.Product.CostPrice : null,
-                    unitValue = seesCost ? s.Product.CostPrice : s.Product.SalePrice,
-=======
-                    costPrice = noCost ? 0m : s.Product.CostPrice,
->>>>>>> origin/feat/b-ledgers
+                    unitValue = seesCost ? s.Product.CostPrice : noMoney ? 0m : s.Product.SalePrice,
                     locationId = s.LocationId,
                     locationCode = s.Location.LocationCode,
                     locationName = s.Location.LocationName,
@@ -1023,9 +1050,21 @@ public class InventoryController : ApiControllerBase
 
             var shaped = items.Select(s => new
             {
-                s.productId, s.sku, s.name, s.packing, s.minQty, s.maxQty, s.costPrice, s.unitValue,
-                s.locationId, s.locationCode, s.locationName, s.locationKind,
-                s.cityId, s.cityName, s.qty,
+                s.productId,
+                s.sku,
+                s.name,
+                s.packing,
+                s.minQty,
+                s.maxQty,
+                s.costPrice,
+                s.unitValue,
+                s.locationId,
+                s.locationCode,
+                s.locationName,
+                s.locationKind,
+                s.cityId,
+                s.cityName,
+                s.qty,
                 packets = s.packing > 0 ? s.qty / s.packing : 0,
                 loose = s.packing > 0 ? s.qty % s.packing : s.qty,
                 value = s.qty * s.unitValue,
@@ -1040,7 +1079,7 @@ public class InventoryController : ApiControllerBase
             return Ok(new
             {
                 totalValue = shaped.Sum(s => s.value),
-                valuedAt = seesCost ? "cost" : "sale",
+                valuedAt = seesCost ? "cost" : noMoney ? "none" : "sale",
                 totalUnits = shaped.Sum(s => s.qty),
                 /* What the filter is currently looking at, so the screen can
                    label its own figures honestly rather than always saying
@@ -1060,11 +1099,7 @@ public class InventoryController : ApiControllerBase
                         cityId = g.Key.CityId,
                         city = g.Key.CityName,
                         units = g.Sum(x => x.Quantity),
-<<<<<<< HEAD
-                        value = g.Sum(x => x.Quantity * (seesCost ? x.Product.CostPrice : x.Product.SalePrice)),
-=======
-                        value = noCost ? 0m : g.Sum(x => x.Quantity * x.Product.CostPrice),
->>>>>>> origin/feat/b-ledgers
+                        value = noMoney ? 0m : g.Sum(x => x.Quantity * (seesCost ? x.Product.CostPrice : x.Product.SalePrice)),
                         locations = g.Select(x => x.LocationId).Distinct().Count()
                     })
                     .OrderBy(c => c.city)
@@ -1174,11 +1209,8 @@ public class InventoryController : ApiControllerBase
     {
         try
         {
-<<<<<<< HEAD
             var seesCost = CurrentRole() == "super-admin";   // see GetStockLevels
-=======
-            var noCost = CurrentRole() == "order-dept";   // no cost for the order desk (26 Sep)
->>>>>>> origin/feat/b-ledgers
+            var noMoney = CurrentRole() == "order-dept";
             var a = await _db.StockAdjustments.AsNoTracking()
                 .Where(x => x.AdjustmentId == id)
                 .Select(x => new
@@ -1205,14 +1237,10 @@ public class InventoryController : ApiControllerBase
                         currentQty = i.CurrentQty,
                         newQty = i.NewQty,
                         delta = i.NewQty - i.CurrentQty,
-<<<<<<< HEAD
                         /* At cost for the Super Admin, at the selling price for
                            everyone else (see stock-levels). */
                         costPrice = seesCost ? (decimal?)i.Product.CostPrice : null,
-                        unitValue = seesCost ? i.Product.CostPrice : i.Product.SalePrice
-=======
-                        costPrice = noCost ? 0m : i.Product.CostPrice
->>>>>>> origin/feat/b-ledgers
+                        unitValue = seesCost ? i.Product.CostPrice : noMoney ? 0m : i.Product.SalePrice
                     }).ToList()
                 })
                 .FirstOrDefaultAsync();
@@ -1321,11 +1349,7 @@ public class InventoryController : ApiControllerBase
     {
         try
         {
-<<<<<<< HEAD
             var seesCostLk = CurrentRole() == "super-admin";   // see GetStockLevels
-=======
-            var noCost = CurrentRole() == "order-dept";   // no cost for the order desk (26 Sep)
->>>>>>> origin/feat/b-ledgers
             return Ok(new
             {
                 categories = await _db.Categories.AsNoTracking()
@@ -1413,11 +1437,7 @@ public class InventoryController : ApiControllerBase
                         imageUrl = p.ImageUrl,
                         name = p.ProductName,
                         packing = p.Packing,
-<<<<<<< HEAD
                         costPrice = seesCostLk ? (decimal?)p.CostPrice : null,
-=======
-                        costPrice = noCost ? 0m : p.CostPrice,
->>>>>>> origin/feat/b-ledgers
                         salePrice = p.SalePrice,
                         totalStock = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
                     })

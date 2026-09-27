@@ -122,6 +122,19 @@ public abstract class ApiControllerBase : ControllerBase
     /// From the JWT, which already carries it. Every rule about who may do what
     /// to an order is decided from this.
     /// </summary>
+    /// <summary>
+    /// The scheme the CALLER used. Behind Railway's proxy the API itself is
+    /// reached over plain http, so Request.Scheme says "http" and every link it
+    /// built for someone else (a bill shared on WhatsApp, a printable document)
+    /// came out as http://... for an https site. The proxy says what the
+    /// browser really used in X-Forwarded-Proto (27 Sep).
+    /// </summary>
+    protected string PublicScheme()
+    {
+        var forwarded = Request.Headers["X-Forwarded-Proto"].FirstOrDefault();
+        return string.IsNullOrWhiteSpace(forwarded) ? Request.Scheme : forwarded.Split(',')[0].Trim();
+    }
+
     protected string CurrentRole() => User.FindFirstValue(ClaimTypes.Role) ?? "";
 
     protected string CurrentUserName(bool firstNameOnly = true)

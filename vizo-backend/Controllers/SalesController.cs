@@ -4288,7 +4288,7 @@ public class SalesController : ApiControllerBase
     }
 
     private string ShareLink(string invoiceNo) =>
-        $"{Request.Scheme}://{Request.Host}/api/sales/bill/{Uri.EscapeDataString(invoiceNo)}?k={BillKey(invoiceNo)}";
+        $"{PublicScheme()}://{Request.Host}/api/sales/bill/{Uri.EscapeDataString(invoiceNo)}?k={BillKey(invoiceNo)}";
 
     /// <summary>
     /// THE LINK A PRINT BUTTON SHOULD OPEN. Cloudinary when Cloudinary will
@@ -4324,7 +4324,7 @@ public class SalesController : ApiControllerBase
     private string ReturnNoteUrl(int returnId, string? pdfUrl, bool deliverable)
     {
         if (deliverable && !string.IsNullOrWhiteSpace(pdfUrl)) return pdfUrl!;
-        return DocumentLinks.Share(Request.Scheme, Request.Host.ToString(),
+        return DocumentLinks.Share(PublicScheme(), Request.Host.ToString(),
             _cfg["Jwt:Key"], "sales-return", returnId.ToString());
     }
 

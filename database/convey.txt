@@ -2,7 +2,8 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
- Last written 22 September 2026, after the order and customer work: the chain
+ PART 26 SEPTEMBER (first, below) is the newest: purchases, ledgers and day
+ expenses. Before it, last written 22 September 2026, after the order and customer work: the chain
  cut from ten steps to seven, stock finally coming off the shelf when an order
  is dispatched, an order screen with pictures and margins, four ways to take
  money, display names everywhere, and a new customer opened from photographs
@@ -14,6 +15,102 @@
 
  WHAT MUST BE DONE BY HAND lives in its own file: changa.txt, beside this one.
  Read that first and this second.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ PART 26 SEPTEMBER — PURCHASES, LEDGERS, DAY EXPENSES (built in three parallel
+ sessions; full detail in NOTES-a.md, NOTES-b.md, NOTES-c.md at the root of
+ the FRONTEND repository, D:\Main\Sales Softwaer)
+═══════════════════════════════════════════════════════════════════════════════
+
+
+───────────────────────────────────────────────────────────────────────────────
+ T0.  WHAT YOU SHOULD SEE FIRST
+───────────────────────────────────────────────────────────────────────────────
+
+ 1  THE STOCK IS NOW IN THE BOOKS AT ITS FULL SELLING VALUE, AND NOTHING TAKES
+    IT OUT WHEN IT IS SOLD. Each purchase debits Inventory with cost + duty +
+    Fi Sabilillah + Margin 1 + Margin 2 and credits the supplier, the logistics
+    company and three reserves (2160/2161/2162). Sales now post to the books
+    (Dr customer / Cr Sale) but no cost of goods sold is posted -- never was.
+    Example: buy 50 at 1,400 -> Inventory +70,000; sell all 50 -> Inventory
+    still +70,000. The fix is a cost-of-sales entry at dispatch that releases
+    each lot's parts (the lots exist now). Needs your accountant's word on where
+    FS and the margins go once sold.
+
+ 2  THE ACCOUNTANT CAN STILL WORK OUT A COST FROM THE LEDGER. You chose that he
+    keeps the purchase vouchers in the ledger; a goods voucher line reads
+    "Item x 50 @ 1,500.00". Every screen that shows cost is closed to him. If
+    that must go too, the vouchers would post one total instead of a line per item.
+
+ 3  POSTING THE HISTORY RAISES CUSTOMER BALANCES (changa.txt G6). Some shops
+    will be over their credit limit the moment it runs, and their next order
+    will be held for approval.
+
+ 4  DEPLOY ORDER MATTERS (changa.txt G2-G4). Migration 31 before the API or
+    every ledger screen fails; 35 before and after; 26 section 2 only after.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ T1.  JUDGEMENT CALLS (you said "recommended for all"; these are the rest)
+───────────────────────────────────────────────────────────────────────────────
+
+ Purchases (A)
+ - The "overall JV" is a printable sheet of an order's five vouchers, not a
+   sixth posting -- a sixth would count every rupee twice.
+ - Average = quantity-weighted over what is LEFT of each ticked purchase,
+   claim locations not counted; the average sale price is taken whole (10 x
+   1,400 + 50 x 2,000 over 60 = 1,900 exactly) and Margin 1 absorbs rounding or
+   a hand-typed final price, so the five parts always add up.
+ - Lots: oldest first out; a transfer lands the same lots at the other end; a
+   return joins the newest lot; a rejected return takes back from the same
+   lot; a short shelf takes the shortfall from the newest lot (it can go
+   negative, as the shelf itself can). Today's stock is one OPENING lot per
+   product at today's price.
+ - A PO line no longer has tax % (tax is 0 everywhere since 22 Sep); a
+   discount is still allowed.
+ - A logistics company with duty on its account is switched off, never deleted.
+ - Stock in Hand and stock corrections: at cost for the Super Admin, at the
+   selling price for the accountant, no value at all for the order desk.
+ - Claims keep their value at cost for the accountant (his accounting work).
+
+ Ledgers and the order desk (B)
+ - A customer's ledger IS the books: his Accounts Receivable lines plus his
+   opening balance as Balance B/F. One source for statement, trial balance and
+   the credit check.
+ - Staff payables: one account 2140 with a per-person column; drivers/helpers
+   without a login live in their own list and can never sign in.
+ - Undo is always a reversal, never a delete. A cash refund on a return posts
+   only the credit; paying it back is a payment voucher.
+ - Counter-sale cash goes to 1101 Cash on Hand (no per-shop cash account exists).
+
+ Day expenses (C)
+ - A day sheet may be dated in the past (a day is typed up afterwards), never
+   in the future; Claim Stock has no sheet (no cash drawer).
+ - The payment-method column stays (the database requires it); it fills itself
+   from the paid-from account.
+
+
+───────────────────────────────────────────────────────────────────────────────
+ T2.  FOUND AND NOT CHANGED
+───────────────────────────────────────────────────────────────────────────────
+
+ - The order desk still sees ORDER and INVOICE TOTALS (sale values, like the
+   Packing screen); paid, balance and limit are zeroed. Notifications sent to
+   the desk still quote PKR amounts in their text.
+ - A voucher's detail page links each supplier bill to /purchases/invoices/N,
+   which the accountant can no longer open.
+ - System entries (invoice, return, purchase vouchers) can still be edited,
+   deleted or reversed from Journal Entries like any hand-written one; nothing
+   marks them as system-owned. (Session C blocked this for expense sheets only.)
+ - A customer who is also a supplier (VZ-B-0001) shows its supplier-side
+   opening balance (-145,000) on the customer ledger: Party.OpeningBalance is
+   one figure.
+ - Two shelves were negative on 26 Sep (product 13 at -1, product 32 at -975,
+   Karachi Warehouse); their OPENING lots carry the same negatives.
+ - PurchaseOrderStatus (the lookup table) is left in place, unused.
+ - Talha's Models/AppDbContext.cs lost exactly two relationship blocks (the PO
+   status and approved-by columns dropped by migration 26 section 2).
 
 
 ═══════════════════════════════════════════════════════════════════════════════

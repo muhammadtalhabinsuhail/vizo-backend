@@ -1379,6 +1379,7 @@ public class AccountingController : ApiControllerBase
                     id = r.ReconciliationId,
                     accountId = r.AccountId,
                     accountName = r.Account.AccountName,
+                    periodFrom = r.PeriodFrom,
                     statementDate = r.StatementDate,
                     openingBalance = r.OpeningBalance,
                     closingBalance = r.ClosingBalance,
@@ -1438,6 +1439,7 @@ public class AccountingController : ApiControllerBase
                     id = l.StatementLineId,
                     date = l.LineDate,
                     description = l.Description,
+                    reference = l.Reference,
                     amount = l.Amount,
                     matchedLineId = l.MatchedLineId
                 })
@@ -1447,8 +1449,13 @@ public class AccountingController : ApiControllerBase
                within a month either side of the statement date. Anything already
                claimed by ANOTHER reconciliation is left out so two statements
                cannot both take the same ledger line. */
-            var from = recon.StatementDate.AddMonths(-1);
-            var to = recon.StatementDate.AddMonths(1);
+            /* With a statement PERIOD (migration 41, set by every
+               reconciliation started from the screen) the window is the period
+               itself, a week wider at each end -- a cheque written on the 30th
+               clears on the 3rd, and the two sides must still meet. The five
+               older rows have only an end date and keep the old window. */
+            var from = recon.PeriodFrom is DateOnly pf ? pf.AddDays(-7) : recon.StatementDate.AddMonths(-1);
+            var to = recon.PeriodFrom is not null ? recon.StatementDate.AddDays(7) : recon.StatementDate.AddMonths(1);
 
             var claimedElsewhere = await _db.BankStatementLines.AsNoTracking()
                 .Where(l => l.ReconciliationId != id && l.MatchedLineId != null)
@@ -1482,6 +1489,7 @@ public class AccountingController : ApiControllerBase
                 accountId = recon.AccountId,
                 accountName = recon.Account.AccountName,
                 accountCode = recon.Account.AccountCode,
+                periodFrom = recon.PeriodFrom,
                 statementDate = recon.StatementDate,
                 openingBalance = recon.OpeningBalance,
                 closingBalance = recon.ClosingBalance,

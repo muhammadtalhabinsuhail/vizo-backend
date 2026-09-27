@@ -131,6 +131,15 @@ public class SalesController : ApiControllerBase
 
                     channel = o.Deliveries.OrderByDescending(d => d.DeliveryId)
                         .Select(d => d.Channel.ChannelKey).FirstOrDefault(),
+                    /* The channel's own name and who confirms it, from the
+                       DeliveryChannel row -- the list used to look both up in
+                       a copy of the four channels hard-coded in the front end
+                       (lib/app-config.ts), so a channel renamed or added in
+                       the database never showed. */
+                    channelName = o.Deliveries.OrderByDescending(d => d.DeliveryId)
+                        .Select(d => d.Channel.ChannelName).FirstOrDefault(),
+                    channelConfirmedBy = o.Deliveries.OrderByDescending(d => d.DeliveryId)
+                        .Select(d => d.Channel.ConfirmedByRole.RoleKey).FirstOrDefault(),
                     carrier = o.Deliveries.OrderByDescending(d => d.DeliveryId)
                         .Select(d => d.Courier != null ? d.Courier.CourierName : null).FirstOrDefault(),
                     trackingNo = o.Deliveries.OrderByDescending(d => d.DeliveryId)
@@ -158,7 +167,7 @@ public class SalesController : ApiControllerBase
                               : o.paidAmount <= 0 ? "UNPAID"
                               : o.paidAmount >= o.total ? "PAID" : "PARTIAL",
                 o.creditHoldReason, o.notes, o.invoiceId, o.invoiceNo,
-                o.channel, o.carrier, o.trackingNo, o.deliveryState,
+                o.channel, o.channelName, o.channelConfirmedBy, o.carrier, o.trackingNo, o.deliveryState,
                 o.dispatchedOn, o.deliveredOn
             });
 
@@ -290,6 +299,8 @@ public class SalesController : ApiControllerBase
 
                     channel = x.Deliveries.OrderByDescending(d => d.DeliveryId)
                         .Select(d => d.Channel.ChannelKey).FirstOrDefault(),
+                    channelName = x.Deliveries.OrderByDescending(d => d.DeliveryId)
+                        .Select(d => d.Channel.ChannelName).FirstOrDefault(),
                     carrier = x.Deliveries.OrderByDescending(d => d.DeliveryId)
                         .Select(d => d.Courier != null ? d.Courier.CourierName : null).FirstOrDefault(),
                     trackingNo = x.Deliveries.OrderByDescending(d => d.DeliveryId)
@@ -368,7 +379,7 @@ public class SalesController : ApiControllerBase
                               : o.paidAmount <= 0 ? "UNPAID"
                               : o.paidAmount >= o.total ? "PAID" : "PARTIAL",
                 outstanding = noMoney ? 0m : o.outstanding,
-                o.channel, o.carrier, o.trackingNo, o.deliveryState,
+                o.channel, o.channelName, o.carrier, o.trackingNo, o.deliveryState,
                 o.dispatchedOn, o.deliveredOn,
                 o.lines,
                 activity

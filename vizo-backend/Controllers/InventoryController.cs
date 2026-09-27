@@ -125,10 +125,13 @@ public class InventoryController : ApiControllerBase
                     maxQty = p.MaxQty,
                     costPrice = p.CostPrice,
                     dutyPrice = p.DutyPrice,
-                    /* Derived, not read from the column: SalePrice is the
-                       authority, and a row written by an older build (which
-                       leaves MarginPrice at 0) must not show a margin of 0. */
-                    marginPrice = p.SalePrice - p.CostPrice - p.DutyPrice,
+                    fsPrice = p.FsPrice,
+                    /* Margin 1 is stored since 26 Sep (it is typed, not derived:
+                       Sale = Cost + Duty + FS + Margin 1 + Margin 2). Every
+                       older row was back-filled as Sale - Cost - Duty by
+                       migration 19, so reading the column is right for them too. */
+                    marginPrice = p.MarginPrice,
+                    margin2Price = p.Margin2Price,
                     salePrice = p.SalePrice,
                     taxRatePercent = p.TaxRatePercent,
                     hideStock = p.HideStock,
@@ -140,14 +143,25 @@ public class InventoryController : ApiControllerBase
                 })
                 .ToListAsync();
 
+            /* WHAT AN ITEM COST IS THE SUPER ADMIN'S ALONE (26 Sep): "koi bhi
+               item kitne mein khareeda hai ... kisi bhi role ko nahi dikhni
+               chahiye". Everyone else gets the selling price and nothing that
+               would let them work the cost back out. Read into a local first --
+               a method call inside the query would not translate (trap 27). */
+            var seesCost = CurrentRole() == "super-admin";
+
             /* status is derived, not stored: out -> low -> inactive -> active. */
             var shaped = items.Select(p => new
             {
                 p.id, p.sku, p.name, p.description,
                 p.categoryId, p.categoryName, p.brandId, p.brandName,
                 p.packing, p.minQty, p.maxQty,
-                p.costPrice, p.dutyPrice, p.marginPrice, p.salePrice, p.taxRatePercent,
-                marginPercent = MarginPercent(p.costPrice, p.dutyPrice, p.marginPrice),
+                costPrice = seesCost ? p.costPrice : (decimal?)null,
+                dutyPrice = seesCost ? p.dutyPrice : (decimal?)null,
+                fsPrice = seesCost ? p.fsPrice : (decimal?)null,
+                marginPrice = seesCost ? p.marginPrice : (decimal?)null,
+                margin2Price = seesCost ? p.margin2Price : (decimal?)null,
+                p.salePrice, p.taxRatePercent,
                 p.hideStock, p.isActive, p.imageUrl, p.createdAt,
                 p.totalStock, p.barcodes,
                 status = !p.isActive ? "inactive"
@@ -175,7 +189,7 @@ public class InventoryController : ApiControllerBase
                 low = all.Count(p => p.IsActive && p.stock > 0 && p.stock <= p.MinQty),
                 @out = all.Count(p => p.IsActive && p.stock <= 0),
                 inactive = all.Count(p => !p.IsActive),
-                stockValue = all.Sum(p => Math.Max(0, p.stock) * p.landed)
+                stockValue = seesCost ? all.Sum(p => Math.Max(0, p.stock) * p.landed) : (decimal?)null
             };
 
             return Ok(new { total, page, pageSize, stats, items = shaped });
@@ -209,8 +223,13 @@ public class InventoryController : ApiControllerBase
                     maxQty = x.MaxQty,
                     costPrice = x.CostPrice,
                     dutyPrice = x.DutyPrice,
-                    marginPrice = x.SalePrice - x.CostPrice - x.DutyPrice,
+                    fsPrice = x.FsPrice,
+                    marginPrice = x.MarginPrice,
+                    margin2Price = x.Margin2Price,
                     salePrice = x.SalePrice,
+                    /* Opening Pricing can be edited until the first purchase
+                       order; from then on only purchase orders set the price. */
+                    pricingLocked = _db.StockBatches.Any(b => b.ProductId == x.ProductId && b.PoItemId != null),
                     taxRatePercent = x.TaxRatePercent,
                     hideStock = x.HideStock,
                     isActive = x.IsActive,
@@ -230,13 +249,33 @@ public class InventoryController : ApiControllerBase
 
             if (p is null) return NotFound(new { message = $"No product with id {id}." });
 
+            var seesCost = CurrentRole() == "super-admin";   // see the list above
             return Ok(new
             {
                 p.id, p.sku, p.name, p.description,
                 p.categoryId, p.categoryName, p.brandId, p.brandName,
                 p.packing, p.minQty, p.maxQty,
-                p.costPrice, p.dutyPrice, p.marginPrice, p.salePrice, p.taxRatePercent,
-                marginPercent = MarginPercent(p.costPrice, p.dutyPrice, p.marginPrice),
+                costPrice = seesCost ? p.costPrice : (decimal?)null,
+                dutyPrice = seesCost ? p.dutyPrice : (decimal?)null,
+                fsPrice = seesCost ? p.fsPrice : (decimal?)null,
+                marginPrice = seesCost ? p.marginPrice : (decimal?)null,
+                margin2Price = seesCost ? p.margin2Price : (decimal?)null,
+                p.salePrice, p.taxRatePercent, p.pricingLocked,
+                /* The product's lots -- what is left of each purchase and at what
+                   price -- for the Super Admin's Pricing tab. */
+                lots = seesCost
+                    ? await _db.StockBatches.AsNoTracking()
+                        .Where(b => b.ProductId == id)
+                        .OrderByDescending(b => b.BatchDate).ThenByDescending(b => b.BatchId)
+                        .Select(b => new
+                        {
+                            id = b.BatchId, batchNo = b.BatchNo, date = b.BatchDate,
+                            poId = b.PoItem != null ? (int?)b.PoItem.PoId : null,
+                            qtyReceived = b.QtyReceived,
+                            unitSalePrice = b.UnitCost + b.UnitDuty + b.UnitFs + b.UnitMargin1 + b.UnitMargin2,
+                            onHand = b.Balances.Sum(x => (int?)x.Quantity) ?? 0
+                        }).ToListAsync()
+                    : null,
                 p.hideStock, p.isActive, p.imageUrl, p.createdAt,
                 p.barcodes, p.totalStock, p.stockSpread,
                 status = !p.isActive ? "inactive"
@@ -285,10 +324,15 @@ public class InventoryController : ApiControllerBase
                 Packing = body.Packing,
                 MinQty = body.MinQty,
                 MaxQty = body.MaxQty,
+                /* OPENING PRICING (26 Sep): five boxes, and the sale price is
+                   their sum -- worked out here, never taken from the browser,
+                   so the six numbers on the row can never disagree. */
                 CostPrice = body.CostPrice,
                 DutyPrice = body.DutyPrice,
-                MarginPrice = body.SalePrice - body.CostPrice - body.DutyPrice,
-                SalePrice = body.SalePrice,
+                FsPrice = body.FsPrice,
+                MarginPrice = body.Margin1Price,
+                Margin2Price = body.Margin2Price,
+                SalePrice = body.CostPrice + body.DutyPrice + body.FsPrice + body.Margin1Price + body.Margin2Price,
                 TaxRatePercent = body.TaxRatePercent,
                 HideStock = body.HideStock,
                 IsActive = body.IsActive,
@@ -365,10 +409,33 @@ public class InventoryController : ApiControllerBase
             product.Packing = body.Packing;
             product.MinQty = body.MinQty;
             product.MaxQty = body.MaxQty;
-            product.CostPrice = body.CostPrice;
-            product.DutyPrice = body.DutyPrice;
-            product.MarginPrice = body.SalePrice - body.CostPrice - body.DutyPrice;
-            product.SalePrice = body.SalePrice;
+            /* THE PRICE, ONLY WHILE IT IS STILL THE OPENING PRICE -- and only
+               from the Super Admin, the one role that is shown it. Once a
+               purchase order has bought the item, its selling price is what
+               the admin settled on in that order's price popup, and a stray
+               edit here would silently undo that decision. The form shows the
+               boxes read-only; this refuses a request that changes them anyway. */
+            var locked = await _db.StockBatches.AnyAsync(b => b.ProductId == id && b.PoItemId != null);
+            var partsChanged = body.CostPrice != product.CostPrice || body.DutyPrice != product.DutyPrice
+                               || body.FsPrice != product.FsPrice || body.Margin1Price != product.MarginPrice
+                               || body.Margin2Price != product.Margin2Price;
+            if (CurrentRole() == "super-admin" && !locked)
+            {
+                product.CostPrice = body.CostPrice;
+                product.DutyPrice = body.DutyPrice;
+                product.FsPrice = body.FsPrice;
+                product.MarginPrice = body.Margin1Price;
+                product.Margin2Price = body.Margin2Price;
+                product.SalePrice = body.CostPrice + body.DutyPrice + body.FsPrice + body.Margin1Price + body.Margin2Price;
+            }
+            else if (locked && partsChanged && CurrentRole() == "super-admin")
+            {
+                return BadRequest(new
+                {
+                    message = "This item has been bought through a purchase order, so its price is set by purchase orders now. " +
+                              "Change it in the price popup of the next purchase order."
+                });
+            }
             product.TaxRatePercent = body.TaxRatePercent;
             product.HideStock = body.HideStock;
             product.IsActive = body.IsActive;
@@ -893,6 +960,13 @@ public class InventoryController : ApiControllerBase
         {
             var rows = _db.StockBalances.AsNoTracking().AsQueryable();
 
+            /* Stock is valued at COST for the Super Admin only -- what an item
+               cost is his alone since 26 Sep, and the order desk works this
+               screen. Everyone else sees it valued at the SELLING price, and
+               the response says which (valuedAt). A local, not CurrentRole()
+               inside the query, which would not translate (trap 27). */
+            var seesCost = CurrentRole() == "super-admin";
+
             if (locationId is not null) rows = rows.Where(s => s.LocationId == locationId);
 
             /* STOCK IN HAND, BY CITY.
@@ -926,7 +1000,8 @@ public class InventoryController : ApiControllerBase
                     packing = s.Product.Packing,
                     minQty = s.Product.MinQty,
                     maxQty = s.Product.MaxQty,
-                    costPrice = s.Product.CostPrice,
+                    costPrice = seesCost ? (decimal?)s.Product.CostPrice : null,
+                    unitValue = seesCost ? s.Product.CostPrice : s.Product.SalePrice,
                     locationId = s.LocationId,
                     locationCode = s.Location.LocationCode,
                     locationName = s.Location.LocationName,
@@ -939,12 +1014,12 @@ public class InventoryController : ApiControllerBase
 
             var shaped = items.Select(s => new
             {
-                s.productId, s.sku, s.name, s.packing, s.minQty, s.maxQty, s.costPrice,
+                s.productId, s.sku, s.name, s.packing, s.minQty, s.maxQty, s.costPrice, s.unitValue,
                 s.locationId, s.locationCode, s.locationName, s.locationKind,
                 s.cityId, s.cityName, s.qty,
                 packets = s.packing > 0 ? s.qty / s.packing : 0,
                 loose = s.packing > 0 ? s.qty % s.packing : s.qty,
-                value = s.qty * s.costPrice,
+                value = s.qty * s.unitValue,
                 status = s.qty <= 0 ? "out"
                        : s.qty <= s.minQty ? "low"
                        : s.maxQty > 0 && s.qty > s.maxQty ? "over" : "ok"
@@ -956,6 +1031,7 @@ public class InventoryController : ApiControllerBase
             return Ok(new
             {
                 totalValue = shaped.Sum(s => s.value),
+                valuedAt = seesCost ? "cost" : "sale",
                 totalUnits = shaped.Sum(s => s.qty),
                 /* What the filter is currently looking at, so the screen can
                    label its own figures honestly rather than always saying
@@ -975,7 +1051,7 @@ public class InventoryController : ApiControllerBase
                         cityId = g.Key.CityId,
                         city = g.Key.CityName,
                         units = g.Sum(x => x.Quantity),
-                        value = g.Sum(x => x.Quantity * x.Product.CostPrice),
+                        value = g.Sum(x => x.Quantity * (seesCost ? x.Product.CostPrice : x.Product.SalePrice)),
                         locations = g.Select(x => x.LocationId).Distinct().Count()
                     })
                     .OrderBy(c => c.city)
@@ -1085,6 +1161,7 @@ public class InventoryController : ApiControllerBase
     {
         try
         {
+            var seesCost = CurrentRole() == "super-admin";   // see GetStockLevels
             var a = await _db.StockAdjustments.AsNoTracking()
                 .Where(x => x.AdjustmentId == id)
                 .Select(x => new
@@ -1111,7 +1188,10 @@ public class InventoryController : ApiControllerBase
                         currentQty = i.CurrentQty,
                         newQty = i.NewQty,
                         delta = i.NewQty - i.CurrentQty,
-                        costPrice = i.Product.CostPrice
+                        /* At cost for the Super Admin, at the selling price for
+                           everyone else (see stock-levels). */
+                        costPrice = seesCost ? (decimal?)i.Product.CostPrice : null,
+                        unitValue = seesCost ? i.Product.CostPrice : i.Product.SalePrice
                     }).ToList()
                 })
                 .FirstOrDefaultAsync();
@@ -1220,6 +1300,7 @@ public class InventoryController : ApiControllerBase
     {
         try
         {
+            var seesCostLk = CurrentRole() == "super-admin";   // see GetStockLevels
             return Ok(new
             {
                 categories = await _db.Categories.AsNoTracking()
@@ -1307,7 +1388,7 @@ public class InventoryController : ApiControllerBase
                         imageUrl = p.ImageUrl,
                         name = p.ProductName,
                         packing = p.Packing,
-                        costPrice = p.CostPrice,
+                        costPrice = seesCostLk ? (decimal?)p.CostPrice : null,
                         salePrice = p.SalePrice,
                         totalStock = p.StockBalances.Sum(b => (int?)b.Quantity) ?? 0
                     })
@@ -1330,7 +1411,8 @@ public class InventoryController : ApiControllerBase
         if (b.MaxQty < 0) return "Maximum quantity cannot be negative.";
         if (b.MaxQty > 0 && b.MaxQty < b.MinQty)
             return "Maximum quantity cannot be below the minimum.";
-        if (b.CostPrice < 0 || b.SalePrice < 0 || b.DutyPrice < 0) return "Prices cannot be negative.";
+        if (b.CostPrice < 0 || b.DutyPrice < 0 || b.FsPrice < 0 || b.Margin1Price < 0 || b.Margin2Price < 0)
+            return "No price box can be negative.";
         if (b.TaxRatePercent is < 0 or > 100) return "Tax rate must be between 0 and 100.";
 
         /* THE SAME PRODUCT TWICE IS REFUSED -- exactly the same name.
@@ -1389,12 +1471,13 @@ public class InventoryController : ApiControllerBase
        one only when it came off a scanned barcode (see ResolveSku), or on an
        edit to keep the one the product already has.
 
-       MarginPrice is not accepted: it is SalePrice - CostPrice - DutyPrice,
-       worked out here, so the three numbers on the row can never disagree. */
+       The price is five boxes (26 Sep): Cost, Duty, Fi Sabilillah, Margin 1,
+       Margin 2. SalePrice is not accepted -- it is their sum, worked out here. */
     public record ProductRequest(
         string? Sku, string Name, string? Description, int CategoryId, int BrandId,
         int Packing, int MinQty, int MaxQty,
-        decimal CostPrice, decimal DutyPrice, decimal SalePrice, decimal TaxRatePercent,
+        decimal CostPrice, decimal DutyPrice, decimal FsPrice, decimal Margin1Price, decimal Margin2Price,
+        decimal TaxRatePercent,
         bool HideStock, bool IsActive, string? ImageUrl, List<string>? Barcodes);
 
     public record SkuPreviewRequest(string? Name, int? CategoryId, int? BrandId, List<string>? Barcodes);
@@ -1485,7 +1568,8 @@ public class InventoryController : ApiControllerBase
                 bal.Quantity = l.NewQty;
                 moved++;
 
-                _db.StockMovements.Add(new StockMovement
+                /* Through StockBatches so the lots follow the count (see that class). */
+                await StockBatches.RecordAsync(_db, new StockMovement
                 {
                     ProductId = l.ProductId,
                     LocationId = body.LocationId,
@@ -1616,7 +1700,9 @@ public class InventoryController : ApiControllerBase
                     .FirstAsync(s => s.ProductId == l.ProductId && s.LocationId == body.FromLocationId);
                 from.Quantity -= l.Qty;
 
-                _db.StockMovements.Add(new StockMovement
+                /* The lots leave with the goods; ReceiveTransfer puts the SAME lots
+                   back in at the other end (StockBatches follows the transfer no). */
+                await StockBatches.RecordAsync(_db, new StockMovement
                 {
                     ProductId = l.ProductId,
                     LocationId = body.FromLocationId,
@@ -1717,7 +1803,7 @@ public class InventoryController : ApiControllerBase
                 }
                 to.Quantity += l.Quantity;
 
-                _db.StockMovements.Add(new StockMovement
+                await StockBatches.RecordAsync(_db, new StockMovement
                 {
                     ProductId = l.ProductId,
                     LocationId = tr.ToLocationId,
@@ -1727,7 +1813,7 @@ public class InventoryController : ApiControllerBase
                     Quantity = l.Quantity,
                     BalanceAfter = to.Quantity,
                     UserId = CurrentUserId()
-                });
+                }, followRef: tr.TransferNo);
             }
 
             tr.StatusId = received.StatusId;
@@ -1796,6 +1882,20 @@ public class InventoryController : ApiControllerBase
             var action = await GetProducts(q, categoryId, brandId, status, includeInactive, 1, 5000);
             if (action is not OkObjectResult ok || ok.Value is null) return action;
 
+            /* The five price parts only for the Super Admin -- the one role
+               that is shown what an item cost (26 Sep). */
+            var seesCost = CurrentRole() == "super-admin";
+            var priceParts = seesCost
+                ? new[]
+                {
+                    new XlsxWriter.Column("Cost", "costPrice", XlsxWriter.CellKind.Money),
+                    new XlsxWriter.Column("Duty", "dutyPrice", XlsxWriter.CellKind.Money),
+                    new XlsxWriter.Column("Fi Sabilillah", "fsPrice", XlsxWriter.CellKind.Money),
+                    new XlsxWriter.Column("Margin 1", "marginPrice", XlsxWriter.CellKind.Money),
+                    new XlsxWriter.Column("Margin 2", "margin2Price", XlsxWriter.CellKind.Money),
+                }
+                : Array.Empty<XlsxWriter.Column>();
+
             var columns = new[]
             {
                 new XlsxWriter.Column("Code", "sku", XlsxWriter.CellKind.Text, 16),
@@ -1803,10 +1903,8 @@ public class InventoryController : ApiControllerBase
                 new XlsxWriter.Column("Category", "categoryName", XlsxWriter.CellKind.Text, 20),
                 new XlsxWriter.Column("Brand", "brandName", XlsxWriter.CellKind.Text, 18),
                 new XlsxWriter.Column("Pack", "packing", XlsxWriter.CellKind.Integer, 8),
-                new XlsxWriter.Column("Cost", "costPrice", XlsxWriter.CellKind.Money),
-                new XlsxWriter.Column("Duty", "dutyPrice", XlsxWriter.CellKind.Money),
-                new XlsxWriter.Column("Margin", "marginPrice", XlsxWriter.CellKind.Money),
-                new XlsxWriter.Column("Margin %", "marginPercent", XlsxWriter.CellKind.Percent, 10),
+            }.Concat(priceParts).Concat(new[]
+            {
                 new XlsxWriter.Column("Sale Price", "salePrice", XlsxWriter.CellKind.Money),
                 new XlsxWriter.Column("Tax %", "taxRatePercent", XlsxWriter.CellKind.Number, 10),
                 new XlsxWriter.Column("On Hand", "totalStock", XlsxWriter.CellKind.Integer, 12),
@@ -1814,7 +1912,7 @@ public class InventoryController : ApiControllerBase
                 new XlsxWriter.Column("Max Qty", "maxQty", XlsxWriter.CellKind.Integer, 10),
                 new XlsxWriter.Column("Stock Status", "status"),
                 new XlsxWriter.Column("Active", "isActive", XlsxWriter.CellKind.Text, 8),
-            };
+            }).ToArray();
 
             var bytes = XlsxWriter.FromPayload("Products",
                 JsonSerializer.SerializeToElement(ok.Value, ExportJson), columns);

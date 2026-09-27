@@ -1,4 +1,6 @@
 ﻿using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -54,6 +56,74 @@ public class ProductHistoryController : ApiControllerBase
 
     private const string TransferOut = "TRANSFER_OUT";
     private const string TransferIn = "TRANSFER_IN";
+
+    /* ── WHAT AN ITEM COST IS THE SUPER ADMIN'S ALONE (26 Sep) ──────────────
+
+       The owner: "koi bhi purchases ki koi bhi cheez, koi bhi item kitne mein
+       khareeda hai ... kisi bhi role ko nahi dikhni chahiye". These screens
+       are open to the order desk (Stock History) and the accountant, so for
+       every role but the Super Admin: the purchasing events are left out of
+       the timeline, every cost-derived figure (unit cost, landed cost, stock
+       value, cost of sales, profit, a claim's value at cost) is removed, and a
+       purchase movement shows its quantity but not the purchase behind it.
+       Quantities, sale prices and who-did-what are untouched. */
+    private bool SeesCost => CurrentRole() == "super-admin";
+
+    private static readonly HashSet<string> CostKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "costPrice", "dutyPrice", "fsPrice", "marginPrice", "margin2Price", "valueAtCost", "unitCost",
+        "cost", "landed", "landedCost", "stockValue", "costOfSales", "grossProfit", "purchasedValue",
+        "profit", "margin",
+    };
+
+    /* Purchase quantities (bought, damaged on arrival, sent back) are
+       purchasing too -- also the Super Admin's alone. */
+    private static readonly HashSet<string> PurchaseKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "purchasedUnits", "damagedOnArrival", "returnedToSuppliers",
+    };
+
+    private static readonly JsonSerializerOptions WebJson = new(JsonSerializerDefaults.Web)
+    {
+        ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles
+    };
+
+    /// <summary>Ok(payload) for the Super Admin; for anyone else the same payload
+    /// with every cost-derived field taken out, at any depth.</summary>
+    private IActionResult OkForRole(object payload)
+    {
+        if (SeesCost) return Ok(payload);
+        var node = JsonSerializer.SerializeToNode(payload, WebJson);
+        Scrub(node);
+        return Ok(node);
+    }
+
+    private static void Scrub(JsonNode? node)
+    {
+        switch (node)
+        {
+            case JsonObject o:
+                foreach (var key in o.Select(p => p.Key).Where(k => CostKeys.Contains(k) || PurchaseKeys.Contains(k)).ToList()) o.Remove(key);
+                foreach (var p in o.ToList()) Scrub(p.Value);
+                break;
+            case JsonArray a:
+                foreach (var item in a) Scrub(item);
+                break;
+        }
+    }
+
+    /// <summary>The timeline as a non-Super-Admin may see it.</summary>
+    private List<HistoryEvent> Redact(List<HistoryEvent> events) =>
+        SeesCost ? events : events
+            .Where(e => e.Group != "purchasing")
+            .Select(e => e.Kind == "claim"
+                ? e with { Rate = null, Amount = null }
+                : e.Kind == "invoice"
+                    ? e with { Detail = CostNote.Replace(e.Detail ?? "", "").Trim(' ', '·', ',') is var d && d.Length > 0 ? d : null }
+                    : e)
+            .ToList();
+
+    private static readonly Regex CostNote = new(@"Cost [\d,.\-]+, profit [\d,.\-]+", RegexOptions.Compiled);
 
     /// <summary>
     /// The product's stock movements, newest first, one card each -- except a
@@ -278,7 +348,7 @@ public class ProductHistoryController : ApiControllerBase
 
             var document = await DocumentFor(m.type, m.reference, productId);
 
-            return Ok(new
+            return OkForRole(new
             {
                 m.id, m.type, m.typeName, m.movedAt, m.reference, m.qty, m.balanceAfter,
                 direction = m.type is TransferOut or TransferIn ? "move" : m.qty >= 0 ? "in" : "out",
@@ -290,7 +360,9 @@ public class ProductHistoryController : ApiControllerBase
                 valueAtCost = Math.Abs(m.qty) * (m.product.costPrice + m.product.dutyPrice),
                 m.product,
                 legs,
-                document
+                /* A purchase is not shown past its quantity to anyone but the
+                   Super Admin (see SeesCost). */
+                document = !SeesCost && m.type is "PURCHASE" or "PURCHASE_RETURN" ? null : document
             });
         }
         catch (Exception ex)
@@ -363,6 +435,49 @@ public class ProductHistoryController : ApiControllerBase
                     {
                         l.productId, l.sku, l.name, l.qty, isThis = l.productId == productId
                     })
+                };
+            }
+
+            case "PURCHASE" when reference.StartsWith("PO", StringComparison.OrdinalIgnoreCase):
+            {
+                /* Since 26 Sep a purchase order IS the receipt: its movement
+                   carries the PO number, not a GRN number. */
+                var o = await _db.PurchaseOrders.AsNoTracking()
+                    .Where(x => x.PoNo == reference)
+                    .Select(x => new
+                    {
+                        id = x.PoId, no = x.PoNo, date = x.PoDate,
+                        supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
+                        location = x.Location.LocationName,
+                        billNo = x.SupplierBillNo,
+                        by = x.CreatedByUser.User.FullName,
+                        notes = x.Notes,
+                        lines = x.PurchaseOrderItems.OrderBy(i => i.LineNo).Select(i => new
+                        {
+                            productId = i.ProductId, sku = i.Product.Sku, name = i.Product.ProductName,
+                            qty = i.Quantity, rate = i.UnitCost
+                        }).ToList()
+                    })
+                    .FirstOrDefaultAsync();
+                if (o is null) return null;
+                var mine = o.lines.FirstOrDefault(l => l.productId == productId);
+                return new
+                {
+                    kind = "purchase-order",
+                    label = "Bought and received",
+                    o.id, o.no, url = $"/purchases/orders/{o.id}",
+                    completeLabel = "See complete purchase order",
+                    date = o.date, status = "Received", statusKey = (string?)null,
+                    facts = Facts(
+                        ("Supplier", o.supplier),
+                        ("Received at", o.location),
+                        ("Supplier's bill", o.billNo),
+                        ("Raised by", o.by),
+                        ("Notes", o.notes)),
+                    thisLine = mine is null ? null : new { qty = mine.qty, rate = (decimal?)mine.rate, amount = (decimal?)(mine.qty * mine.rate) },
+                    lineCount = o.lines.Count,
+                    totalUnits = o.lines.Sum(l => l.qty),
+                    lines = o.lines.Select(l => new { l.productId, l.sku, l.name, l.qty, isThis = l.productId == productId })
                 };
             }
 
@@ -664,6 +779,18 @@ public class ProductHistoryController : ApiControllerBase
                 })
                 .ToListAsync();
             foreach (var g in found) result[("PURCHASE", g.GrnNo)] = new DocRef(g.GrnId, $"/purchases/grns/{g.GrnId}", g.rate);
+
+            /* Since 26 Sep the purchase order is the receipt; its number is the reference. */
+            var poNos = grn.Where(r => !result.ContainsKey(("PURCHASE", r))).ToList();
+            if (poNos.Count > 0)
+                foreach (var o in await _db.PurchaseOrders.AsNoTracking().Where(o => poNos.Contains(o.PoNo))
+                             .Select(o => new
+                             {
+                                 o.PoId, o.PoNo,
+                                 rate = productId == null ? null
+                                     : o.PurchaseOrderItems.Where(i => i.ProductId == productId).Select(i => (decimal?)i.UnitCost).FirstOrDefault()
+                             }).ToListAsync())
+                    result[("PURCHASE", o.PoNo)] = new DocRef(o.PoId, $"/purchases/orders/{o.PoId}", o.rate);
         }
 
         var inv = Refs("SALE");
@@ -770,7 +897,7 @@ public class ProductHistoryController : ApiControllerBase
             var head = await ProductHead(productId);
             if (head is null) return NotFound(new { message = $"No product with id {productId}." });
 
-            var events = await BuildHistory(productId, head.Sku);
+            var events = Redact(await BuildHistory(productId, head.Sku));
             var summary = await Summary(productId, head);
 
             var groups = Groups
@@ -784,7 +911,7 @@ public class ProductHistoryController : ApiControllerBase
             var total = events.Count;
             var items = events.Skip((page - 1) * pageSize).Take(pageSize).ToList();
 
-            return Ok(new { product = head, summary, groups, total, page, pageSize, items });
+            return OkForRole(new { product = head, summary, groups, total, page, pageSize, items });
         }
         catch (Exception ex)
         {
@@ -821,17 +948,21 @@ public class ProductHistoryController : ApiControllerBase
             .Where(i => i.ProductId == productId)
             .Select(i => new
             {
-                id = i.Po.PoId, no = i.Po.PoNo, date = i.Po.PoDate, expected = i.Po.ExpectedDate,
+                id = i.Po.PoId, no = i.Po.PoNo, date = i.Po.PoDate,
                 supplier = (i.Po.SupplierUser.DisplayName ?? i.Po.SupplierUser.LegalName), location = i.Po.Location.LocationName,
-                status = i.Po.Status.StatusName, by = i.Po.CreatedByUser.User.FullName,
+                by = i.Po.CreatedByUser.User.FullName,
+                /* Before 26 Sep an order moved nothing -- its goods receipt did.
+                   Since then the order IS the receipt: it has a lot of its own. */
+                received = _db.StockBatches.Any(b => b.PoItemId == i.PoItemId),
                 i.Quantity, i.UnitCost, i.LineTotal
             })
             .ToListAsync();
         ev.AddRange(pos.Select(x => new HistoryEvent(
-            $"PO:{x.id}", Day(x.date), false, "purchase-order", "purchasing", "Ordered from supplier",
-            x.no, $"/purchases/orders/{x.id}", x.Quantity, "none",
-            x.location, null, x.location, x.supplier, x.UnitCost, x.LineTotal, x.by, x.status,
-            x.expected is null ? null : $"Expected {x.expected:dd MMM yyyy}")));
+            $"PO:{x.id}", Day(x.date), false, "purchase-order", "purchasing",
+            x.received ? "Bought and received" : "Ordered from supplier",
+            x.no, $"/purchases/orders/{x.id}", x.Quantity, x.received ? "in" : "none",
+            x.location, null, x.location, x.supplier, x.UnitCost, x.LineTotal, x.by,
+            x.received ? "Received" : null, null)));
 
         var grns = await _db.GoodsReceiptItems.AsNoTracking()
             .Where(i => i.ProductId == productId)
@@ -1277,6 +1408,9 @@ public class ProductHistoryController : ApiControllerBase
                 return NotFound(new { message = $"No product with id {productId}." });
 
             var (opening, onHand, rows) = await BuildLedger(productId);
+            /* A ledger row's rate is a COST (what a receipt cost, what a sale
+               cost) -- not for anyone but the Super Admin (see SeesCost). */
+            if (!SeesCost) rows = rows.Select(r => r with { Rate = null, Value = null }).ToList();
 
             /* Newest first on screen, the running total already worked out
                oldest-first so every row carries the balance it actually had. */
@@ -1284,7 +1418,7 @@ public class ProductHistoryController : ApiControllerBase
             var total = ordered.Count;
             var items = ordered.Skip((page - 1) * pageSize).Take(pageSize).ToList();
 
-            return Ok(new
+            return OkForRole(new
             {
                 opening,
                 totalIn = rows.Sum(r => r.QtyIn),
@@ -1359,9 +1493,10 @@ public class ProductHistoryController : ApiControllerBase
             var head = await ProductHead(productId);
             if (head is null) return NotFound(new { message = $"No product with id {productId}." });
 
-            var events = await BuildHistory(productId, head.Sku);
+            var events = Redact(await BuildHistory(productId, head.Sku));
             var summary = await Summary(productId, head);
             var (opening, onHand, ledger) = await BuildLedger(productId);
+            if (!SeesCost) ledger = ledger.Select(r => r with { Rate = null, Value = null }).ToList();
 
             var opts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
             JsonElement J(object o) => JsonSerializer.SerializeToElement(o, opts);
@@ -1374,12 +1509,17 @@ public class ProductHistoryController : ApiControllerBase
                 new { label = "SKU", value = head.Sku },
                 new { label = "Category", value = head.Category },
                 new { label = "Brand", value = head.Brand },
-                new { label = "Cost price", value = head.CostPrice.ToString("N2") },
-                new { label = "Duty", value = head.DutyPrice.ToString("N2") },
-                new { label = "Margin", value = head.MarginPrice.ToString("N2") },
                 new { label = "Sale price", value = head.SalePrice.ToString("N2") },
                 new { label = "In the catalogue since", value = head.CreatedAt.ToString("dd MMM yyyy") },
             };
+            /* The price parts only for the Super Admin (see SeesCost). */
+            if (SeesCost)
+                summaryRows.InsertRange(4, new object[]
+                {
+                    new { label = "Cost price", value = head.CostPrice.ToString("N2") },
+                    new { label = "Duty", value = head.DutyPrice.ToString("N2") },
+                    new { label = "Margin", value = head.MarginPrice.ToString("N2") },
+                });
             foreach (var (label, field) in new[]
                      {
                          ("On hand", "onHand"), ("Stock value at landed cost", "stockValue"),
@@ -1394,6 +1534,7 @@ public class ProductHistoryController : ApiControllerBase
                          ("Net stock correction", "netCorrection"), ("Warranty claims", "claims"),
                      })
             {
+                if (!SeesCost && (CostKeys.Contains(field) || PurchaseKeys.Contains(field))) continue;
                 s.TryGetProperty(field, out var v);
                 summaryRows.Add(new { label, value = v.ValueKind == JsonValueKind.Undefined ? "" : v.ToString() });
             }

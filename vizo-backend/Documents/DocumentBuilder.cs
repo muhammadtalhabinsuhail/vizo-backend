@@ -28,6 +28,9 @@ public static class DocumentBuilder
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["purchase-order"] = "purchase-orders",
+            /* Every journal voucher one purchase order wrote, on one sheet -- the
+               owner's "overall JV" (26 Sep). Keyed by the PO's id. */
+            ["purchase-vouchers"] = "purchase-vouchers",
             ["purchase-invoice"] = "purchase-invoices",
             ["goods-receipt"] = "goods-receipts",
             ["purchase-return"] = "purchase-returns",
@@ -59,6 +62,7 @@ public static class DocumentBuilder
     public static async Task<DocumentPdf.Data?> BuildAsync(AppDbContext db, string kind, int id) => kind.ToLowerInvariant() switch
     {
         "purchase-order" => await PurchaseOrder(db, id),
+        "purchase-vouchers" => await PurchaseVouchers(db, id),
         "purchase-invoice" => await PurchaseInvoice(db, id),
         "goods-receipt" => await GoodsReceipt(db, id),
         "purchase-return" => await PurchaseReturn(db, id),
@@ -80,9 +84,8 @@ public static class DocumentBuilder
             .Where(x => x.PoId == id)
             .Select(x => new
             {
-                x.PoNo, x.PoDate, x.ExpectedDate, x.Subtotal, x.DiscountAmount,
-                x.TaxAmount, x.TotalAmount, x.Notes,
-                status = x.Status.StatusName,
+                x.PoNo, x.PoDate, x.Subtotal, x.DiscountAmount,
+                x.TaxAmount, x.TotalAmount, x.Notes, x.SupplierBillNo,
                 location = x.Location.LocationName,
                 supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
                 supplierCode = x.SupplierUser.PartyCode,
@@ -91,11 +94,10 @@ public static class DocumentBuilder
                 supplierPhone = x.SupplierUser.User.Phone,
                 supplierNtn = x.SupplierUser.Ntn,
                 createdBy = x.CreatedByUser.User.FullName,
-                approvedBy = x.ApprovedByUser != null ? x.ApprovedByUser.User.FullName : null,
                 lines = x.PurchaseOrderItems.OrderBy(l => l.LineNo).Select(l => new
                 {
                     l.LineNo, name = l.Product.ProductName, sku = l.Product.Sku,
-                    qty = l.Quantity, cost = l.UnitCost, tax = l.TaxPercent, total = l.LineTotal
+                    qty = l.Quantity, cost = l.UnitCost, total = l.LineTotal
                 }).ToList()
             })
             .FirstOrDefaultAsync();
@@ -107,7 +109,10 @@ public static class DocumentBuilder
             Company: c,
             Title: "Purchase Order",
             DocNo: o.PoNo,
-            StatusName: o.status,
+            /* No status since 26 Sep: an order is received the moment it is
+               written. This is the SUPPLIER's copy, so it carries their price
+               only -- never duty, Fi Sabilillah or our margins. */
+            StatusName: "Received",
             Counterparty: new DocumentPdf.Party("Supplier", o.supplier, Lines(
                 o.supplierCode, o.supplierAddress, o.supplierCity,
                 o.supplierPhone is null ? null : $"Phone {o.supplierPhone}",
@@ -115,10 +120,9 @@ public static class DocumentBuilder
             Meta: new[]
             {
                 new DocumentPdf.Fact("PO Date", DocumentPdf.Day(o.PoDate)),
-                new DocumentPdf.Fact("Expected", DocumentPdf.Day(o.ExpectedDate)),
-                new DocumentPdf.Fact("Deliver To", o.location),
+                new DocumentPdf.Fact("Received At", o.location),
+                new DocumentPdf.Fact("Supplier Bill", o.SupplierBillNo ?? "-"),
                 new DocumentPdf.Fact("Raised By", o.createdBy),
-                new DocumentPdf.Fact("Approved By", o.approvedBy ?? "Not yet"),
             },
             Columns: new[]
             {
@@ -126,20 +130,116 @@ public static class DocumentBuilder
                 new DocumentPdf.Col("Description", 5),
                 new DocumentPdf.Col("Qty", 1, DocumentPdf.Align.Right),
                 new DocumentPdf.Col("Unit Cost", 1.5, DocumentPdf.Align.Right),
-                new DocumentPdf.Col("Tax %", 1, DocumentPdf.Align.Right),
                 new DocumentPdf.Col("Amount", 1.7, DocumentPdf.Align.Right),
             },
             Rows: o.lines.Select(l => new DocumentPdf.Row(
                 new[]
                 {
                     l.LineNo.ToString(), l.name, DocumentPdf.Qty(l.qty),
-                    DocumentPdf.Money(l.cost), $"{l.tax:0.##}%", DocumentPdf.Money(l.total)
+                    DocumentPdf.Money(l.cost), DocumentPdf.Money(l.total)
                 }, Sub: l.sku)).ToList(),
             Totals: Totals(c, ("Subtotal", o.Subtotal), ("Discount", -o.DiscountAmount),
-                            ("Tax", o.TaxAmount), ("Order Total", o.TotalAmount)),
+                            ("Order Total", o.TotalAmount)),
             Notes: o.Notes,
             Footnote: "Please quote this purchase order number on your delivery note and invoice.",
             PreparedBy: o.createdBy);
+    }
+
+    /// <summary>
+    /// The "overall JV" of one purchase order: every voucher it posted -- goods,
+    /// duty, Fi Sabilillah, Margin 1, Margin 2 -- one after another, each line
+    /// with the reason the admin gave for that box. The vouchers themselves are
+    /// the postings; this sheet only gathers them, so nothing is counted twice.
+    /// </summary>
+    private static async Task<DocumentPdf.Data?> PurchaseVouchers(AppDbContext db, int id)
+    {
+        var o = await db.PurchaseOrders.AsNoTracking()
+            .Where(x => x.PoId == id)
+            .Select(x => new
+            {
+                x.PoNo, x.PoDate, x.TotalAmount,
+                location = x.Location.LocationName,
+                supplier = (x.SupplierUser.DisplayName ?? x.SupplierUser.LegalName),
+                supplierCode = x.SupplierUser.PartyCode,
+                createdBy = x.CreatedByUser.User.FullName,
+                vouchers = x.PurchaseOrderEntries.OrderBy(e => e.EntryId).Select(e => new
+                {
+                    e.Component,
+                    e.Entry.EntryNo,
+                    e.Entry.Narration,
+                    lines = e.Entry.JournalEntryLines.OrderBy(l => l.LineNo).Select(l => new
+                    {
+                        code = l.Account.AccountCode, account = l.Account.AccountName,
+                        l.Description, l.DebitAmount, l.CreditAmount
+                    }).ToList()
+                }).ToList()
+            })
+            .FirstOrDefaultAsync();
+
+        if (o is null) return null;
+        var c = await LetterHead(db);
+
+        static string Part(string key) => key switch
+        {
+            "GOODS" => "Goods", "DUTY" => "Duty", "FS" => "Fi Sabilillah",
+            "MARGIN1" => "Margin 1", "MARGIN2" => "Margin 2", _ => key
+        };
+
+        /* One summary row per voucher up top; each voucher's lines as its own
+           section below, so the page reads like the stack of JVs it stands for. */
+        var cols = new[]
+        {
+            new DocumentPdf.Col("Account", 3.2),
+            new DocumentPdf.Col("Particulars", 5),
+            new DocumentPdf.Col("Debit", 1.6, DocumentPdf.Align.Right),
+            new DocumentPdf.Col("Credit", 1.6, DocumentPdf.Align.Right),
+        };
+        var sections = o.vouchers.Select(v => new DocumentPdf.Section(
+            $"{v.EntryNo} · {Part(v.Component)}",
+            cols,
+            v.lines.Select(l => new DocumentPdf.Row(new[]
+            {
+                l.account, l.Description ?? "-",
+                l.DebitAmount == 0 ? "-" : DocumentPdf.Money(l.DebitAmount),
+                l.CreditAmount == 0 ? "-" : DocumentPdf.Money(l.CreditAmount)
+            }, Sub: l.code)).ToList())).ToList();
+
+        var total = o.vouchers.Sum(v => v.lines.Sum(l => l.DebitAmount));
+        return new DocumentPdf.Data(
+            Company: c,
+            Title: "Purchase Vouchers",
+            DocNo: o.PoNo,
+            StatusName: "Posted",
+            Counterparty: new DocumentPdf.Party("Supplier", o.supplier, Lines(o.supplierCode)),
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("PO Date", DocumentPdf.Day(o.PoDate)),
+                new DocumentPdf.Fact("Received At", o.location),
+                new DocumentPdf.Fact("Vouchers", o.vouchers.Count.ToString()),
+                new DocumentPdf.Fact("Raised By", o.createdBy),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Voucher", 2),
+                new DocumentPdf.Col("Part", 2),
+                new DocumentPdf.Col("Narration", 4.6),
+                new DocumentPdf.Col("Amount", 1.8, DocumentPdf.Align.Right),
+            },
+            Rows: o.vouchers.Select(v => new DocumentPdf.Row(new[]
+            {
+                v.EntryNo, Part(v.Component), v.Narration,
+                DocumentPdf.Money(v.lines.Sum(l => l.DebitAmount))
+            })).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Owed to the supplier", DocumentPdf.Money(o.TotalAmount, c.CurrencySymbol)),
+                new DocumentPdf.Total("Stock carried at", DocumentPdf.Money(total, c.CurrencySymbol), Emphasis: true),
+            },
+            Notes: "Each voucher debits Inventory and credits the party that part of the price belongs to: " +
+                   "the supplier (goods), the logistics company (duty), or the Fi Sabilillah / Margin reserves.",
+            Footnote: null,
+            PreparedBy: o.createdBy,
+            More: sections);
     }
 
     private static async Task<DocumentPdf.Data?> PurchaseInvoice(AppDbContext db, int id)

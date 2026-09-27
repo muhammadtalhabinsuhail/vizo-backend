@@ -33,8 +33,6 @@ public partial class Employee
 
     public virtual ICollection<PurchaseInvoice> PurchaseInvoices { get; set; } = new List<PurchaseInvoice>();
 
-    public virtual ICollection<PurchaseOrder> PurchaseOrderApprovedByUsers { get; set; } = new List<PurchaseOrder>();
-
     public virtual ICollection<PurchaseOrder> PurchaseOrderCreatedByUsers { get; set; } = new List<PurchaseOrder>();
 
     public virtual ICollection<PurchaseReturn> PurchaseReturns { get; set; } = new List<PurchaseReturn>();

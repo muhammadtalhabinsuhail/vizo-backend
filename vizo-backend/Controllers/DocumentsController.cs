@@ -301,7 +301,7 @@ public class DocumentsController : ApiControllerBase
         DocumentLinks.Key(_cfg["Jwt:Key"], kind, key);
 
     private string ShareLink(string kind, string key) =>
-        DocumentLinks.Share(Request.Scheme, Request.Host.ToString(), _cfg["Jwt:Key"], kind, key);
+        DocumentLinks.Share(PublicScheme(), Request.Host.ToString(), _cfg["Jwt:Key"], kind, key);
 
     private object Shape(DocumentFile f, bool rebuilt, string? message) => new
     {

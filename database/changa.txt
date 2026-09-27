@@ -32,6 +32,9 @@
        32_ledger_entry_items.sql
        33_order_desk_no_money.sql
        35_expense_sheets.sql                 -- first run
+       36_collection_series.sql              -- (27 Sep) the COL numbering for
+                                               collections made on Confirm
+                                               Collections
      Each is safe to run twice. None of them breaks the OLD API still running.
 
  G3  DEPLOY: merge integration/2026-09-26 into master (backend) and main

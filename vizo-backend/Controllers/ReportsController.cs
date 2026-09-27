@@ -61,6 +61,14 @@ public class ReportsController : ApiControllerBase
             var start = from ?? Today().AddDays(-30);
             var end = to ?? Today();
 
+            /* COST AND MARGIN ARE THE SUPER ADMIN'S (the owner, 26 Sep: what an
+               item cost is his alone). This report is open to the accountant and
+               to sales, and it printed cost of sales and margin -- which is cost
+               with one subtraction. For anybody else both are 0 and showsCost is
+               false, so the screen and the PDF leave them out (27 Sep, round E).
+               A local, not CurrentRole() inside the query (trap 27). */
+            var seesCost = CurrentRole() == "super-admin";
+
             var q = _db.SalesInvoices.AsNoTracking()
                 .Where(i => i.InvoiceDate >= start && i.InvoiceDate <= end);
             if (locationId is not null) q = q.Where(i => i.LocationId == locationId);
@@ -89,8 +97,8 @@ public class ReportsController : ApiControllerBase
                     invoices = g.Count(),
                     units = g.Sum(x => x.Units),
                     revenue = g.Sum(x => x.TotalAmount),
-                    cost = g.Sum(x => x.Cost),
-                    margin = g.Sum(x => x.TotalAmount) - g.Sum(x => x.Cost)
+                    cost = seesCost ? g.Sum(x => x.Cost) : 0m,
+                    margin = seesCost ? g.Sum(x => x.TotalAmount) - g.Sum(x => x.Cost) : 0m
                 })
                 .OrderBy(x => x.date)
                 .ToList();
@@ -102,19 +110,20 @@ public class ReportsController : ApiControllerBase
                     location = g.Key,
                     invoices = g.Count(),
                     revenue = g.Sum(x => x.TotalAmount),
-                    cost = g.Sum(x => x.Cost),
-                    margin = g.Sum(x => x.TotalAmount) - g.Sum(x => x.Cost)
+                    cost = seesCost ? g.Sum(x => x.Cost) : 0m,
+                    margin = seesCost ? g.Sum(x => x.TotalAmount) - g.Sum(x => x.Cost) : 0m
                 })
                 .OrderByDescending(x => x.revenue)
                 .ToList();
 
             var revenue = invoices.Sum(i => i.TotalAmount);
-            var cost = invoices.Sum(i => i.Cost);
+            var cost = seesCost ? invoices.Sum(i => i.Cost) : 0m;
 
             return Ok(new
             {
                 from = start,
                 to = end,
+                showsCost = seesCost,
                 invoiceCount = invoices.Count,
                 unitsSold = invoices.Sum(i => i.Units),
                 subtotal = invoices.Sum(i => i.Subtotal),
@@ -122,8 +131,8 @@ public class ReportsController : ApiControllerBase
                 tax = invoices.Sum(i => i.TaxAmount),
                 revenue,
                 cost,
-                margin = revenue - cost,
-                marginPercent = revenue == 0 ? 0 : Math.Round(100 * (revenue - cost) / revenue, 1),
+                margin = seesCost ? revenue - cost : 0m,
+                marginPercent = !seesCost || revenue == 0 ? 0 : Math.Round(100 * (revenue - cost) / revenue, 1),
                 averageInvoice = invoices.Count == 0 ? 0 : Math.Round(revenue / invoices.Count, 2),
                 byDay,
                 byLocation
@@ -474,6 +483,9 @@ public class ReportsController : ApiControllerBase
         try
         {
             if (limit is < 1 or > 200) limit = 20;
+            /* Margin is cost with one subtraction: the Super Admin's alone (see
+               SalesSummary above). */
+            var seesCost = CurrentRole() == "super-admin";
             var start = from ?? Today().AddDays(-365);
             var end = to ?? Today();
 
@@ -502,9 +514,10 @@ public class ReportsController : ApiControllerBase
                 {
                     r.customerId, r.customerName,
                     customerInitials = Initials(r.customerName),
-                    r.city, r.invoiceCount, r.revenue, r.cost,
-                    margin = r.revenue - r.cost,
-                    marginPercent = r.revenue == 0 ? 0 : Math.Round(100 * (r.revenue - r.cost) / r.revenue, 1),
+                    r.city, r.invoiceCount, r.revenue,
+                    cost = seesCost ? r.cost : 0m,
+                    margin = seesCost ? r.revenue - r.cost : 0m,
+                    marginPercent = !seesCost || r.revenue == 0 ? 0 : Math.Round(100 * (r.revenue - r.cost) / r.revenue, 1),
                     averageInvoice = r.invoiceCount == 0 ? 0 : Math.Round(r.revenue / r.invoiceCount, 2),
                     r.lastInvoice,
                     daysSinceLastInvoice = Today().DayNumber - r.lastInvoice.DayNumber
@@ -517,6 +530,7 @@ public class ReportsController : ApiControllerBase
             {
                 from = start,
                 to = end,
+                showsCost = seesCost,
                 count = top.Count,
                 totalRevenue = top.Sum(t => t.revenue),
                 totalMargin = top.Sum(t => t.margin),
@@ -553,8 +567,12 @@ public class ReportsController : ApiControllerBase
                 .Where(l => l.PartyUserId != null && l.Entry.Status.StatusKey == "POSTED")
                 .SumAsync(l => (decimal?)(l.DebitAmount - l.CreditAmount)) ?? 0m;
 
-            var stockValue = await _db.StockBalances.AsNoTracking()
-                .SumAsync(s => (decimal?)(s.Quantity * s.Product.CostPrice)) ?? 0m;
+            /* At cost for the Super Admin only; at the selling price for the
+               accountant and sales, as Stock in Hand does (27 Sep, round E). */
+            var atCost = CurrentRole() == "super-admin";
+            var stockValue = atCost
+                ? await _db.StockBalances.AsNoTracking().SumAsync(s => (decimal?)(s.Quantity * s.Product.CostPrice)) ?? 0m
+                : await _db.StockBalances.AsNoTracking().SumAsync(s => (decimal?)(s.Quantity * s.Product.SalePrice)) ?? 0m;
 
             return Ok(new
             {
@@ -562,6 +580,7 @@ public class ReportsController : ApiControllerBase
                 monthInvoices = await _db.SalesInvoices.CountAsync(i => i.InvoiceDate >= monthStart),
                 receivable,
                 stockValue,
+                stockValuedAt = atCost ? "cost" : "sale",
                 stockUnits = await _db.StockBalances.SumAsync(s => (int?)s.Quantity) ?? 0,
                 activeCustomers = await _db.Parties
                     .CountAsync(p => (p.User.RoleId == 5 || p.User.RoleId == 7) && p.User.IsActive),
@@ -2278,6 +2297,62 @@ public class ReportsController : ApiControllerBase
     /* ─────────────────────── the six report layouts ─────────────────────── */
 
     private DocumentPdf.Data SalesSummaryPdf(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
+        Bool(j, "showsCost") ? SalesSummaryPdfWithCost(j, c, cur) : SalesSummaryPdfNoCost(j, c, cur);
+
+    /// <summary>The sales summary for anybody but the Super Admin: no cost, no margin.</summary>
+    private DocumentPdf.Data SalesSummaryPdfNoCost(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
+        new(
+            Company: c,
+            Title: "Sales Summary",
+            DocNo: null,
+            StatusName: null,
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("From", Day(j, "from")),
+                new DocumentPdf.Fact("To", Day(j, "to")),
+                new DocumentPdf.Fact("Invoices", Num(j, "invoiceCount")),
+                new DocumentPdf.Fact("Units Sold", Num(j, "unitsSold")),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Date", 2.6),
+                new DocumentPdf.Col("Invoices", 1.4, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Units", 1.4, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Revenue", 2.4, DocumentPdf.Align.Right),
+            },
+            Rows: Arr(j, "byDay").Select(d => new DocumentPdf.Row(new[]
+            {
+                Day(d, "date"), Num(d, "invoices"), Num(d, "units"), DocumentPdf.Money(Dec(d, "revenue"))
+            })).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Subtotal", DocumentPdf.Money(Dec(j, "subtotal"), cur)),
+                new DocumentPdf.Total("Discount", DocumentPdf.Money(-Dec(j, "discount"), cur), Colour: DocumentPdf.Danger),
+                new DocumentPdf.Total("Tax", DocumentPdf.Money(Dec(j, "tax"), cur)),
+                new DocumentPdf.Total("Average invoice", DocumentPdf.Money(Dec(j, "averageInvoice"), cur)),
+                new DocumentPdf.Total("Revenue", DocumentPdf.Money(Dec(j, "revenue"), cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Revenue is invoiced value.",
+            PreparedBy: null,
+            EmptyMessage: "No invoices in this period.",
+            More: new[]
+            {
+                new DocumentPdf.Section("By location",
+                    new[]
+                    {
+                        new DocumentPdf.Col("Location", 4.0),
+                        new DocumentPdf.Col("Invoices", 1.6, DocumentPdf.Align.Right),
+                        new DocumentPdf.Col("Revenue", 2.6, DocumentPdf.Align.Right),
+                    },
+                    Arr(j, "byLocation").Select(l => new DocumentPdf.Row(new[]
+                    {
+                        Str(l, "location"), Num(l, "invoices"), DocumentPdf.Money(Dec(l, "revenue"))
+                    })).ToList())
+            });
+
+    private DocumentPdf.Data SalesSummaryPdfWithCost(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
         new(
             Company: c,
             Title: "Sales Summary",
@@ -2473,6 +2548,48 @@ public class ReportsController : ApiControllerBase
             EmptyMessage: "Everything is turning over inside the cover threshold.");
 
     private DocumentPdf.Data TopCustomersPdf(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
+        Bool(j, "showsCost") ? TopCustomersPdfWithCost(j, c, cur) : TopCustomersPdfNoCost(j, c, cur);
+
+    /// <summary>Top customers for anybody but the Super Admin: revenue, no margin.</summary>
+    private DocumentPdf.Data TopCustomersPdfNoCost(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
+        new(
+            Company: c,
+            Title: "Top Customers",
+            DocNo: null,
+            StatusName: null,
+            Counterparty: null,
+            Meta: new[]
+            {
+                new DocumentPdf.Fact("From", Day(j, "from")),
+                new DocumentPdf.Fact("To", Day(j, "to")),
+                new DocumentPdf.Fact("Customers", Num(j, "count")),
+                new DocumentPdf.Fact("Revenue", DocumentPdf.Money(Dec(j, "totalRevenue"))),
+            },
+            Columns: new[]
+            {
+                new DocumentPdf.Col("Customer", 4.2),
+                new DocumentPdf.Col("Inv", 1.0, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Revenue", 2.2, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Avg Invoice", 2.0, DocumentPdf.Align.Right),
+                new DocumentPdf.Col("Last Buy", 1.6, DocumentPdf.Align.Right),
+            },
+            Rows: Arr(j, "items").Select(r => new DocumentPdf.Row(new[]
+            {
+                Str(r, "customerName"), Num(r, "invoiceCount"),
+                DocumentPdf.Money(Dec(r, "revenue")),
+                DocumentPdf.Money(Dec(r, "averageInvoice")),
+                $"{Num(r, "daysSinceLastInvoice")}d ago"
+            }, Sub: Str(r, "city"))).ToList(),
+            Totals: new[]
+            {
+                new DocumentPdf.Total("Total Revenue", DocumentPdf.Money(Dec(j, "totalRevenue"), cur), Emphasis: true),
+            },
+            Notes: null,
+            Footnote: "Ranked by invoiced revenue over the period.",
+            PreparedBy: null,
+            EmptyMessage: "No invoices in this period.");
+
+    private DocumentPdf.Data TopCustomersPdfWithCost(JsonElement j, DocumentPdf.LetterHead c, string cur) =>
         new(
             Company: c,
             Title: "Top Customers",

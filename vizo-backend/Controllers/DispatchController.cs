@@ -75,8 +75,10 @@ public class DispatchController : ApiControllerBase
                     customerPhone = o.CustomerUser.User.Phone,
                     address = o.CustomerUser.AddressLine,
                     city = o.CustomerUser.City.CityName,
+                    cityId = o.CustomerUser.CityId,
                     province = o.CustomerUser.City.Province.ProvinceName,
                     locationId = o.LocationId,
+                    locationCityId = o.Location.CityId,
                     location = o.Location.LocationName,
                     orderDate = o.OrderDate,
                     deliveryDate = o.DeliveryDate,
@@ -95,28 +97,33 @@ public class DispatchController : ApiControllerBase
                 })
                 .ToListAsync();
 
-            /* THE ORDER DESK SEES NO MONEY (the owner, 26 Sep; B's
-               HideMoneyFromOrderDesk on the order screens). This queue is the
-               desk's own screen and it showed each order's total and the COD
-               to collect. For the desk those figures are zero and it is told
-               only WHETHER cash is to be taken at the door; the COD itself is
-               worked out on the server when it books (Dispatch, below). A
-               local, not CurrentRole() inside a query (trap 27). */
-            var noMoney = CurrentRole() == OrderWorkflow.RoleOrderDept;
+            var suggest = await SuggestChannels(items.Select(o => (o.cityId, o.locationCityId)).ToList());
 
             var today = Today();
             var shaped = items.Select(o => new
             {
-                o.id, o.orderNo, o.customerId, o.customerName,
+                o.id,
+                o.orderNo,
+                o.customerId,
+                o.customerName,
                 customerInitials = Initials(o.customerName),
-                o.customerPhone, o.address, o.city, o.province,
-                o.locationId, o.location, o.orderDate, o.deliveryDate,
-                total = noMoney ? 0m : o.total,
-                o.paymentMethod, o.itemCount, o.totalUnits,
-                o.invoiceId, o.invoiceNo,
-                paidAmount = noMoney ? 0m : o.paidAmount,
-                suggestedCod = noMoney ? 0m : SuggestedCod(o.paymentMethod, o.total, o.paidAmount),
-                collectsCash = SuggestedCod(o.paymentMethod, o.total, o.paidAmount) > 0,
+                o.customerPhone,
+                o.address,
+                o.city,
+                o.province,
+                o.locationId,
+                o.location,
+                o.orderDate,
+                o.deliveryDate,
+                o.total,
+                o.paymentMethod,
+                o.itemCount,
+                o.totalUnits,
+                o.invoiceId,
+                o.invoiceNo,
+                o.paidAmount,
+                suggestedCod = o.paymentMethod == "CREDIT" ? 0m : o.total - o.paidAmount,
+                suggestedChannelId = suggest(o.cityId, o.locationCityId),
                 waitingDays = today.DayNumber - o.orderDate.DayNumber,
                 isLate = o.deliveryDate != null && o.deliveryDate < today
             }).ToList();
@@ -125,7 +132,6 @@ public class DispatchController : ApiControllerBase
             {
                 waiting = shaped.Count,
                 late = shaped.Count(o => o.isLate),
-                moneyHidden = noMoney,
                 items = shaped
             });
         }
@@ -133,6 +139,57 @@ public class DispatchController : ApiControllerBase
         {
             return Fail(ex, "load the dispatch queue");
         }
+    }
+
+    /// <summary>
+    /// Which channel the booking form should START on for each order. Only a
+    /// starting point -- the order desk can pick any channel -- but a good one
+    /// saves a click on every parcel.
+    ///
+    /// It used to be `order.city === "Karachi"` in the browser, which never
+    /// matched anything: city names carry the country ("Karachi - Pakistan",
+    /// HANDOFF trap 22), so every order opened on cargo. And it hard-coded the
+    /// one city this company happens to have its own riders in. The rule is now
+    /// read from the data:
+    ///
+    ///   1. The customer is in the SAME CITY as the place the goods left from
+    ///      -> the channel the salesman confirms himself (ConfirmedByRole =
+    ///      sales): the own-team, by-hand delivery. That is what "local" means,
+    ///      in Karachi and equally in Lahore.
+    ///   2. Otherwise -> whichever channel this customer's CITY was last booked
+    ///      on (the by-hand channel excluded: it cannot reach another city).
+    ///      The desk's own habit per destination -- Islamabad goes by freight,
+    ///      Multan by cargo -- and it follows them if the habit changes.
+    ///   3. A city never shipped to before -> the first active channel that is
+    ///      not by hand.
+    /// </summary>
+    private async Task<Func<int, int, int?>> SuggestChannels(List<(int cityId, int locationCityId)> orders)
+    {
+        var channels = await _db.DeliveryChannels.AsNoTracking()
+            .Where(c => c.IsActive)
+            .OrderBy(c => c.ChannelId)
+            .Select(c => new { c.ChannelId, byHand = c.ConfirmedByRole.RoleKey == OrderWorkflow.RoleSales })
+            .ToListAsync();
+
+        var handId = channels.FirstOrDefault(c => c.byHand)?.ChannelId;
+        var fallback = channels.FirstOrDefault(c => !c.byHand)?.ChannelId ?? handId;
+        var usable = channels.Where(c => !c.byHand).Select(c => c.ChannelId).ToHashSet();
+
+        var cityIds = orders.Select(o => o.cityId).Distinct().ToList();
+        var history = cityIds.Count == 0
+            ? new Dictionary<int, int>()
+            : (await _db.Deliveries.AsNoTracking()
+                .Where(d => cityIds.Contains(d.Order.CustomerUser.CityId))
+                .Select(d => new { cityId = d.Order.CustomerUser.CityId, d.ChannelId, d.DeliveryId })
+                .ToListAsync())
+              .Where(d => usable.Contains(d.ChannelId))
+              .GroupBy(d => d.cityId)
+              .ToDictionary(g => g.Key, g => g.OrderByDescending(d => d.DeliveryId).First().ChannelId);
+
+        return (cityId, locationCityId) =>
+            cityId == locationCityId && handId is not null ? handId
+            : history.TryGetValue(cityId, out var last) ? last
+            : fallback;
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -187,28 +244,9 @@ public class DispatchController : ApiControllerBase
                 !await _db.Couriers.AnyAsync(c => c.CourierId == body.CourierId && c.IsActive))
                 return BadRequest(new { message = "Pick a valid courier." });
 
-            /* The desk books without seeing money, so it cannot type the COD:
-               for it the server charges exactly what the queue would have
-               suggested -- whatever is unpaid on the order, nothing on credit. */
-            var codAmount = body.CodAmount;
-            if (CurrentRole() == OrderWorkflow.RoleOrderDept)
-            {
-                var o = await _db.SalesOrders.AsNoTracking().Where(x => x.OrderId == id)
-                    .Select(x => new
-                    {
-                        method = x.Method.MethodKey,
-                        total = x.TotalAmount,
-                        paid = x.CollectionAllocations
-                            .Where(a => a.Collection.Status.StatusKey == "CONFIRMED")
-                            .Sum(a => (decimal?)a.Amount) ?? 0m
-                    })
-                    .FirstAsync();
-                codAmount = SuggestedCod(o.method, o.total, o.paid);
-            }
-
             if (body.Parcels < 1)
                 return BadRequest(new { message = "A dispatch needs at least one parcel." });
-            if (codAmount < 0)
+            if (body.CodAmount < 0)
                 return BadRequest(new { message = "COD cannot be negative." });
 
             var booked = await _db.DeliveryStatuses.FirstOrDefaultAsync(s => s.StatusKey == "BOOKED");
@@ -234,7 +272,7 @@ public class DispatchController : ApiControllerBase
                 StatusId = booked.StatusId,
                 Parcels = body.Parcels,
                 WeightKg = body.WeightKg,
-                CodAmount = codAmount,
+                CodAmount = body.CodAmount,
                 IsCodSettled = false,
                 BookingCharge = body.BookingCharge,
                 RemindersSent = 0,
@@ -292,6 +330,7 @@ public class DispatchController : ApiControllerBase
             {
                 channels = await _db.DeliveryChannels.AsNoTracking()
                     .Where(c => c.IsActive)
+                    .OrderBy(c => c.ChannelId)
                     .Select(c => new
                     {
                         id = c.ChannelId,
@@ -300,8 +339,8 @@ public class DispatchController : ApiControllerBase
                         description = c.Description,
                         requiresBilty = c.RequiresBilty,
                         remindAfterDays = c.RemindAfterDays,
-                        /* The booking form says "then every N hours" -- it read
-                           a field this list never sent, and printed "undefined". */
+                        /* The sheet prints "then repeat every N hours"; without
+                           this it printed "every undefined hours". */
                         remindEveryHours = c.RemindEveryHours,
                         confirmedByRole = c.ConfirmedByRole.RoleKey,
                         confirmedByRoleName = c.ConfirmedByRole.RoleName,
@@ -334,10 +373,6 @@ public class DispatchController : ApiControllerBase
         }
     }
 
-
-    /// <summary>What is to be taken at the door: the unpaid balance, or nothing on credit.</summary>
-    private static decimal SuggestedCod(string paymentMethod, decimal total, decimal paid) =>
-        paymentMethod == "CREDIT" ? 0m : Math.Max(0m, total - paid);
 
     // ══════════════════════════ request bodies ══════════════════════════
 

@@ -199,6 +199,9 @@ public class DeliveryController : ApiControllerBase
 
     /// <summary>Marks the COD cash for a delivery as settled back to the office.</summary>
     [HttpPost("{id:int}/settle-cod")]
+    /* Settling COD is taking money in -- a collection by another name, and the
+       owner's rule of 26 September is that the order desk handles none. */
+    [Authorize(Roles = "super-admin,accountant")]
     public async Task<IActionResult> SettleCod(int id)
     {
         try

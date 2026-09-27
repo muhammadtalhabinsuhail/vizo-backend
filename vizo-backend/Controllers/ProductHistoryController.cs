@@ -44,6 +44,7 @@ namespace vizo_backend.Controllers;
 [Route("api/inventory/products/{productId:int}")]
 [ApiController]
 [Authorize(Policy = "BackOffice")]
+[vizo_backend.Services.OrderDeskNoMoney]   // the order desk sees stock history without costs or purchases -- Services/OrderDeskNoMoneyAttribute.cs
 public class ProductHistoryController : ApiControllerBase
 {
     public ProductHistoryController(AppDbContext db, IConfiguration cfg,

@@ -15,6 +15,16 @@
  G.  26 SEPTEMBER — PURCHASES, LEDGERS, DAY EXPENSES: HOW TO PUT THEM LIVE
 ───────────────────────────────────────────────────────────────────────────────
 
+ DONE 27 SEP (13:46-13:50): G1-G4 are finished. The code is on master and main
+ (Talha merged the backend; the frontend was merged and pushed as AmmarKamran2005).
+ Migrations 26 (both sections), 30-33, 35 (twice), 36-39 and 41 were run on live
+ Neon after a rehearsal on a restored copy of the same backup. Checked afterwards:
+ stock lots = shelves, no expense without a sheet, and the books balance (0.00).
+ The live sign-in no longer fails on "MustChangePassword". Backup taken just
+ before: D:\Main\advpos-testdb\LIVE-BACKUP-before-migrations-2026-09-27_1346.dump
+ (restore it with pg_restore --clean if anything has to be undone).
+ STILL TO DO BY YOU: G5 onwards.
+
  Everything from 26 September is on the branch integration/2026-09-26 in BOTH
  repositories (and on feat/a-purchases, feat/b-ledgers, feat/c-expenses). It
  is NOT on main / master: merging it there deploys it, and the live database

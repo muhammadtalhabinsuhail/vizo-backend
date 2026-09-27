@@ -836,7 +836,10 @@ public class AccountingController : ApiControllerBase
                     description = e.Description,
                     status = e.Status.StatusKey,
                     statusName = e.Status.StatusName,
-                    createdBy = e.CreatedByUser.FullName
+                    createdBy = e.CreatedByUser.FullName,
+                    /* The day sheet this expense is a line of (migration 35). */
+                    sheetId = e.SheetId,
+                    sheetNo = e.Sheet != null ? e.Sheet.SheetNo : null
                 })
                 .ToListAsync();
 
@@ -905,7 +908,12 @@ public class AccountingController : ApiControllerBase
                        say which entry undid it rather than only that it was. */
                     reversalEntryNo = x.Entry != null && x.Entry.ReversedByEntry != null
                         ? x.Entry.ReversedByEntry.EntryNo : null,
-                    createdBy = x.CreatedByUser.FullName
+                    createdBy = x.CreatedByUser.FullName,
+                    /* Since 26 Sep every expense is a line of a day sheet, and
+                       the sheet is where it is edited, approved and reversed.
+                       This screen is kept for the history links that point at it. */
+                    sheetId = x.SheetId,
+                    sheetNo = x.Sheet != null ? x.Sheet.SheetNo : null
                 })
                 .FirstOrDefaultAsync();
 
@@ -918,61 +926,22 @@ public class AccountingController : ApiControllerBase
         }
     }
 
+    /// <summary>
+    /// RETIRED 26 Sep 2026. Expenses are entered a day at a time on the daily
+    /// expense sheet (ExpenseSheetsController, /api/expense-sheets): one
+    /// document, one approval and one journal entry per day and location,
+    /// which is what the owner asked for. An expense filed here would belong
+    /// to no sheet -- it would never appear on the day's invoice, and the list
+    /// of days would not show it -- so the route answers with where to go
+    /// instead of quietly making one. The single-expense PDF, detail, list and
+    /// export are unchanged and still serve the history.
+    /// </summary>
     [HttpPost("expenses")]
-    public async Task<IActionResult> CreateExpense([FromBody] ExpenseRequest body)
-    {
-        try
+    public IActionResult CreateExpense([FromBody] ExpenseRequest? body) =>
+        BadRequest(new
         {
-            /* One validator for create and update. Two copies of the same
-               rules is two sets of rules the day somebody edits one of them. */
-            var invalid = await ValidateExpense(body);
-            if (invalid is not null) return BadRequest(new { message = invalid });
-
-            var draft = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
-
-            var e = new Expense
-            {
-                ExpenseNo = await NextNumber("EXP"),
-                ExpenseDate = body.ExpenseDate ?? Today(),
-                LocationId = body.LocationId,
-                CategoryName = body.CategoryName ?? "General",
-                ExpenseAccountId = body.ExpenseAccountId,
-                PaidFromAccountId = body.PaidFromAccountId,
-                Amount = body.Amount,
-                VendorName = body.VendorName.Trim(),
-                MethodId = body.MethodId,
-                Description = body.Description,
-                StatusId = draft?.StatusId ?? 1,
-                CreatedByUserId = CurrentUserId()
-            };
-            _db.Expenses.Add(e);
-            await _db.SaveChangesAsync();
-            await Log("EXPENSE_CREATED", "Expense", e.ExpenseNo, $"{e.Amount:N2} to {e.VendorName}", 1);
-
-            /* The PDF exists the moment the document does. Print and Download
-               then hand out the stored Cloudinary file rather than rendering a
-               fresh one, so what is on screen is what is in the store. A
-               failure here is logged and swallowed -- the document is saved
-               either way and the PDF can be rebuilt from the row. */
-            await DocumentArchive.TryStoreForAsync(_db, _cfg, _logger, "expense", e.ExpenseId, CurrentUserId());
-
-            /* -- C1 -- someone has to approve this before it reaches the
-               ledger, so the people who can approve it are told. */
-            await _push.NotifyRolesAsync(
-                new[] { "super-admin", "accountant" },
-                NotificationKinds.ExpenseCreated,
-                $"Expense filed by {CurrentUserName()}",
-                $"{e.ExpenseNo} -- {e.VendorName}, PKR {e.Amount:N0}. Waiting for approval.",
-                url: $"/accounting/expenses/{e.ExpenseId}",
-                exceptUserId: CurrentUserId());
-
-            return Ok(new { id = e.ExpenseId, expenseNo = e.ExpenseNo, message = $"Expense {e.ExpenseNo} saved." });
-        }
-        catch (Exception ex)
-        {
-            return Fail(ex, "save the expense");
-        }
-    }
+            message = "Expenses are entered on the day's expense sheet now. Open Accounting > Expenses and pick the date."
+        });
 
     // ══════════════════════════════════════════════════════════════════
     //  STATEMENTS
@@ -2593,6 +2562,9 @@ public class AccountingController : ApiControllerBase
             var e = await _db.Expenses.Include(x => x.Status).FirstOrDefaultAsync(x => x.ExpenseId == id);
             if (e is null) return NotFound(new { message = $"No expense with id {id}." });
 
+            var inSheet = await SheetLock(e);
+            if (inSheet is not null) return BadRequest(new { message = inSheet });
+
             var locked = WhyLocked(e.Status.StatusKey, e.ExpenseNo);
             if (locked is not null) return BadRequest(new { message = locked });
 
@@ -2641,6 +2613,9 @@ public class AccountingController : ApiControllerBase
             var e = await _db.Expenses.Include(x => x.Status).FirstOrDefaultAsync(x => x.ExpenseId == id);
             if (e is null) return NotFound(new { message = $"No expense with id {id}." });
 
+            var inSheet = await SheetLock(e);
+            if (inSheet is not null) return BadRequest(new { message = inSheet });
+
             var locked = WhyLocked(e.Status.StatusKey, e.ExpenseNo);
             if (locked is not null) return BadRequest(new { message = locked });
 
@@ -2685,6 +2660,8 @@ public class AccountingController : ApiControllerBase
 
             var e = await _db.Expenses.Include(x => x.Status).FirstOrDefaultAsync(x => x.ExpenseId == id);
             if (e is null) return NotFound(new { message = $"No expense with id {id}." });
+            var inSheet = await SheetLock(e);
+            if (inSheet is not null) return BadRequest(new { message = inSheet });
             if (e.Status.StatusKey != "DRAFT")
                 return BadRequest(new { message = $"{e.ExpenseNo} is already {e.Status.StatusName.ToLowerInvariant()}." });
 
@@ -2815,6 +2792,8 @@ public class AccountingController : ApiControllerBase
 
             var e = await _db.Expenses.Include(x => x.Status).FirstOrDefaultAsync(x => x.ExpenseId == id);
             if (e is null) return NotFound(new { message = $"No expense with id {id}." });
+            var inSheet = await SheetLock(e);
+            if (inSheet is not null) return BadRequest(new { message = inSheet });
             if (e.Status.StatusKey != Posted)
                 return BadRequest(new { message = $"Only a posted expense can be reversed. {e.ExpenseNo} is {e.Status.StatusName.ToLowerInvariant()}." });
 
@@ -2908,6 +2887,21 @@ public class AccountingController : ApiControllerBase
         {
             return Fail(ex, $"reverse expense {id}");
         }
+    }
+
+    /// <summary>
+    /// Refuses a single-expense edit, delete, approval or reversal when the
+    /// expense is a line of a day sheet -- which, after migration 35, is all
+    /// of them. The sheet posts ONE entry for the whole day; approving or
+    /// reversing one line of it on its own would leave that entry and the
+    /// sheet's status saying different things. Returns the refusal, or null.
+    /// </summary>
+    private async Task<string?> SheetLock(Expense e)
+    {
+        if (e.SheetId is null) return null;
+        var sheetNo = await _db.ExpenseSheets.AsNoTracking()
+            .Where(s => s.SheetId == e.SheetId).Select(s => s.SheetNo).FirstOrDefaultAsync();
+        return $"{e.ExpenseNo} is a line of the day sheet {sheetNo}. Open the sheet to change, approve or reverse it.";
     }
 
     /// <summary>The checks CreateExpense and UpdateExpense both need.</summary>
@@ -3119,6 +3113,25 @@ public class AccountingController : ApiControllerBase
                 {
                     message = $"Only a posted entry can be reversed. {entry.EntryNo} is {entry.Status.StatusName.ToLowerInvariant()} -- edit or delete it instead."
                 });
+            /* An entry an expense sheet posted is undone from the sheet, which
+               also marks the day and its lines REVERSED. Reversing it here left
+               the expenses reading POSTED while the ledger had cancelled them --
+               which is exactly how EXP-26-0029 (JV-26-0188, reversed by
+               JV-26-0189 on 15 Sep) still counts in the expense reports. */
+            if (await _db.ExpenseSheets.AnyAsync(s => s.EntryId == id)
+                || await _db.Expenses.AnyAsync(x => x.EntryId == id && x.SheetId != null))
+            {
+                var sheetNo = await _db.Expenses.AsNoTracking()
+                    .Where(x => x.EntryId == id && x.Sheet != null).Select(x => x.Sheet!.SheetNo)
+                    .FirstOrDefaultAsync()
+                    ?? await _db.ExpenseSheets.AsNoTracking().Where(s => s.EntryId == id)
+                        .Select(s => s.SheetNo).FirstOrDefaultAsync();
+                return BadRequest(new
+                {
+                    message = $"{entry.EntryNo} was posted by the expense sheet {sheetNo}. Reverse the sheet instead, so the day and its expenses are marked reversed too."
+                });
+            }
+
             if (entry.ReversedByEntryId is not null)
             {
                 var already = await _db.JournalEntries.AsNoTracking()

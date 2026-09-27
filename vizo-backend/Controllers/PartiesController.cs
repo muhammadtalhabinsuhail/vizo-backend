@@ -451,7 +451,16 @@ public class PartiesController : ApiControllerBase
         {
             if (take is < 1 or > 500) take = 100;
 
-            var visits = await _db.CustomerVisits.AsNoTracking()
+            /* The screens read GET /visits (VisitsController) since 27 Sep; this
+               older list stays for anything still calling it, and is held to the
+               same rule: a rep sees his own customers' visits, not the book. */
+            var rows = _db.CustomerVisits.AsNoTracking();
+            if (MyPartiesOnly() is int me)
+                rows = rows.Where(v => v.SalesPersonUserId == me ||
+                                       v.CustomerUser.CreatedByUserId == me ||
+                                       v.CustomerUser.SalesPersonUserId == me);
+
+            var visits = await rows
                 .OrderByDescending(v => v.VisitedAt)
                 .Take(take)
                 .Select(v => new

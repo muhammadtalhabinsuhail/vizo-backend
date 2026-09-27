@@ -55,6 +55,13 @@ public static class NotificationKinds
     public const string VoucherPosted      = "VOUCHER_POSTED";
     public const string VoucherCancelled   = "VOUCHER_CANCELLED";
     public const string CollectionConfirmed = "COLLECTION_CONFIRMED";
+    /// <summary>
+    /// "Send Reminders" on AR Aging (27 Sep, round E): each salesperson is told
+    /// which of his customers are overdue, by how much and how late; the Super
+    /// Admin and the accountant get the summary. Not severe -- it is a list to
+    /// work through, not an alarm.
+    /// </summary>
+    public const string PaymentReminder    = "PAYMENT_REMINDER";
     public const string PeriodChanged      = "PERIOD_CHANGED";
 
     // ─────────────────────────── D. purchasing and stock ───────────────────
@@ -65,6 +72,8 @@ public static class NotificationKinds
     public const string PurchaseReturn     = "PURCHASE_RETURN";
     public const string StockAdjusted      = "STOCK_ADJUSTED";
     public const string LowStock           = "LOW_STOCK";
+    /// <summary>"Plan Clearance" on Dead Stock drew up a clearance sheet (27 Sep, round E).</summary>
+    public const string ClearancePlanned   = "CLEARANCE_PLANNED";
 
     /* The catalogue. A product appearing, changing price, or a category or
        brand being added is somebody changing what the whole company sells --
@@ -109,6 +118,7 @@ public static class NotificationKinds
         new(VoucherPosted,      "Money",  "Payment received",     "A receipt or payment was posted to the ledger."),
         new(VoucherCancelled,   "Money",  "Payment cancelled",    "A posted receipt or payment was cancelled -- the invoice is owing again.", Severe: true),
         new(CollectionConfirmed,"Money",  "Collection confirmed", "Money a rep collected has been confirmed by accounts."),
+        new(PaymentReminder,    "Money",  "Payment reminder",     "Customers who are overdue, with how much and how many days late -- sent from AR Aging."),
 
         new(InvoiceRaised,      "Invoices", "Invoice raised",     "An invoice was generated for an order."),
         new(InvoiceDirect,      "Invoices", "Direct invoice",     "An invoice was created without an order."),
@@ -129,6 +139,7 @@ public static class NotificationKinds
         new(TransferReceived,   "Stock", "Stock received",        "A stock transfer arrived."),
         new(StockAdjusted,      "Stock", "Stock corrected",       "Recorded stock was changed to match a count.", Severe: true),
         new(LowStock,           "Stock", "Running out",           "Items have fallen below their minimum. Sent once a day."),
+        new(ClearancePlanned,   "Stock", "Clearance planned",     "Somebody drew up a clearance sheet for stock that has stopped selling."),
 
         new(ProductAdded,       "Catalogue", "Item added",        "Somebody put a new item in the catalogue."),
         new(ProductChanged,     "Catalogue", "Item changed",      "An item's price, tax or details were edited."),

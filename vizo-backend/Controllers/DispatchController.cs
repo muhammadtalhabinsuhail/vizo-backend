@@ -97,6 +97,14 @@ public class DispatchController : ApiControllerBase
                 })
                 .ToListAsync();
 
+            /* THE ORDER DESK SEES NO MONEY (the owner, 26 Sep; B's
+               HideMoneyFromOrderDesk on the order screens). This queue is the
+               desk's own screen and it showed each order's total and the COD
+               to collect. For the desk those figures are zero and it is told
+               only WHETHER cash is to be taken at the door; the COD itself is
+               worked out on the server when it books (Dispatch, below). A
+               local, not CurrentRole() inside a query (trap 27). */
+            var noMoney = CurrentRole() == OrderWorkflow.RoleOrderDept;
             var suggest = await SuggestChannels(items.Select(o => (o.cityId, o.locationCityId)).ToList());
 
             var today = Today();
@@ -115,14 +123,15 @@ public class DispatchController : ApiControllerBase
                 o.location,
                 o.orderDate,
                 o.deliveryDate,
-                o.total,
+                total = noMoney ? 0m : o.total,
                 o.paymentMethod,
                 o.itemCount,
                 o.totalUnits,
                 o.invoiceId,
                 o.invoiceNo,
-                o.paidAmount,
-                suggestedCod = o.paymentMethod == "CREDIT" ? 0m : o.total - o.paidAmount,
+                paidAmount = noMoney ? 0m : o.paidAmount,
+                suggestedCod = noMoney ? 0m : SuggestedCod(o.paymentMethod, o.total, o.paidAmount),
+                collectsCash = SuggestedCod(o.paymentMethod, o.total, o.paidAmount) > 0,
                 suggestedChannelId = suggest(o.cityId, o.locationCityId),
                 waitingDays = today.DayNumber - o.orderDate.DayNumber,
                 isLate = o.deliveryDate != null && o.deliveryDate < today
@@ -132,6 +141,7 @@ public class DispatchController : ApiControllerBase
             {
                 waiting = shaped.Count,
                 late = shaped.Count(o => o.isLate),
+                moneyHidden = noMoney,
                 items = shaped
             });
         }
@@ -244,9 +254,28 @@ public class DispatchController : ApiControllerBase
                 !await _db.Couriers.AnyAsync(c => c.CourierId == body.CourierId && c.IsActive))
                 return BadRequest(new { message = "Pick a valid courier." });
 
+            /* The desk books without seeing money, so it cannot type the COD:
+               for it the server charges exactly what the queue would have
+               suggested -- whatever is unpaid on the order, nothing on credit. */
+            var codAmount = body.CodAmount;
+            if (CurrentRole() == OrderWorkflow.RoleOrderDept)
+            {
+                var o = await _db.SalesOrders.AsNoTracking().Where(x => x.OrderId == id)
+                    .Select(x => new
+                    {
+                        method = x.Method.MethodKey,
+                        total = x.TotalAmount,
+                        paid = x.CollectionAllocations
+                            .Where(a => a.Collection.Status.StatusKey == "CONFIRMED")
+                            .Sum(a => (decimal?)a.Amount) ?? 0m
+                    })
+                    .FirstAsync();
+                codAmount = SuggestedCod(o.method, o.total, o.paid);
+            }
+
             if (body.Parcels < 1)
                 return BadRequest(new { message = "A dispatch needs at least one parcel." });
-            if (body.CodAmount < 0)
+            if (codAmount < 0)
                 return BadRequest(new { message = "COD cannot be negative." });
 
             var booked = await _db.DeliveryStatuses.FirstOrDefaultAsync(s => s.StatusKey == "BOOKED");
@@ -272,7 +301,7 @@ public class DispatchController : ApiControllerBase
                 StatusId = booked.StatusId,
                 Parcels = body.Parcels,
                 WeightKg = body.WeightKg,
-                CodAmount = body.CodAmount,
+                CodAmount = codAmount,
                 IsCodSettled = false,
                 BookingCharge = body.BookingCharge,
                 RemindersSent = 0,
@@ -339,8 +368,8 @@ public class DispatchController : ApiControllerBase
                         description = c.Description,
                         requiresBilty = c.RequiresBilty,
                         remindAfterDays = c.RemindAfterDays,
-                        /* The sheet prints "then repeat every N hours"; without
-                           this it printed "every undefined hours". */
+                        /* The booking form says "then every N hours" -- it read
+                           a field this list never sent, and printed "undefined". */
                         remindEveryHours = c.RemindEveryHours,
                         confirmedByRole = c.ConfirmedByRole.RoleKey,
                         confirmedByRoleName = c.ConfirmedByRole.RoleName,
@@ -373,6 +402,10 @@ public class DispatchController : ApiControllerBase
         }
     }
 
+
+    /// <summary>What is to be taken at the door: the unpaid balance, or nothing on credit.</summary>
+    private static decimal SuggestedCod(string paymentMethod, decimal total, decimal paid) =>
+        paymentMethod == "CREDIT" ? 0m : Math.Max(0m, total - paid);
 
     // ══════════════════════════ request bodies ══════════════════════════
 

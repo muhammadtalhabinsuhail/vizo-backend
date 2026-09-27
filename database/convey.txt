@@ -2,6 +2,12 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
+ 27 SEPTEMBER (rounds D, E1, E2, E3 — Confirm Collections, the Account List,
+ printing, sign-in/backups, delivery/visits/reports, the app shell): what was
+ found and not changed is in the "Found, not changed" section of NOTES-d.md,
+ NOTES-e1.md, NOTES-e2.md and NOTES-e3.md (frontend repo root); what YOU must
+ do is changa.txt §G2 + §G12.
+
  PART 26 SEPTEMBER (first, below) is the newest: purchases, ledgers and day
  expenses. Before it, last written 22 September 2026, after the order and customer work: the chain
  cut from ten steps to seven, stock finally coming off the shelf when an order

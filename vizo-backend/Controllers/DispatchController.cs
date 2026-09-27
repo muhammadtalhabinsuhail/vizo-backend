@@ -300,6 +300,9 @@ public class DispatchController : ApiControllerBase
                         description = c.Description,
                         requiresBilty = c.RequiresBilty,
                         remindAfterDays = c.RemindAfterDays,
+                        /* The booking form says "then every N hours" -- it read
+                           a field this list never sent, and printed "undefined". */
+                        remindEveryHours = c.RemindEveryHours,
                         confirmedByRole = c.ConfirmedByRole.RoleKey,
                         confirmedByRoleName = c.ConfirmedByRole.RoleName,
 

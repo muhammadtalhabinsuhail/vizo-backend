@@ -398,7 +398,8 @@ public class DeliveryController : ApiControllerBase
                 {
                     message = balance <= 0
                         ? $"{order.OrderNo} is already paid in full, so this COD would pay it twice. Check Confirm Collections before settling."
-                        : $"{order.OrderNo} only owes {balance:N2}, less than the COD of {delivery.CodAmount:N2} -- part of it was recorded another way. Settle the rest on Confirm Collections instead."
+                        : $"{order.OrderNo} only owes {balance:N2}, but this delivery carries a COD of {delivery.CodAmount:N2}. " +
+                          "Settling it would credit the customer with more than he owes -- check the order, and take what is owed on Confirm Collections."
                 });
 
             var fee = Math.Round(body.CourierFee ?? 0m, 2, MidpointRounding.AwayFromZero);

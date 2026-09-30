@@ -57,7 +57,7 @@ public class AdminUsersController : AdminControllerBase
             var total = await query.CountAsync();
 
             var rows = await query
-                .OrderBy(u => u.UserId)
+                .OrderByDescending(u => u.CreatedAt).ThenByDescending(u => u.UserId)
                 .Skip((page - 1) * pageSize).Take(pageSize)
                 .Select(u => new
                 {

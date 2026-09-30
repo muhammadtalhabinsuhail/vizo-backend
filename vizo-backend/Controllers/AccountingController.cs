@@ -1373,7 +1373,7 @@ public class AccountingController : ApiControllerBase
         try
         {
             return Ok(await _db.BankReconciliations.AsNoTracking()
-                .OrderByDescending(r => r.StatementDate)
+                .OrderByDescending(r => r.StatementDate).ThenByDescending(r => r.ReconciliationId)
                 .Select(r => new
                 {
                     id = r.ReconciliationId,

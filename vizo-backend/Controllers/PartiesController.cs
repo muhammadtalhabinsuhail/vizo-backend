@@ -66,6 +66,14 @@ public class PartiesController : ApiControllerBase
     /// </summary>
     private bool NoMoney() => CurrentRole() == Services.OrderWorkflow.RoleOrderDept;
 
+    /* WHO MAY SET A CREDIT LIMIT: the Super Admin and the accountant, nobody
+       else (the owner, 30 Sep). A rep or the order desk may open a customer,
+       but the amount the business will trust that customer with is a
+       money decision. Everyone else's saves keep the limit as it is (0 -- no
+       limit set yet -- on a new account). */
+    private bool SetsCreditLimit() =>
+        CurrentRole() is Services.OrderWorkflow.RoleAdmin or Services.OrderWorkflow.RoleAccountant;
+
     // ══════════════════════════════════════════════════════════════════
     //  LIST
     // ══════════════════════════════════════════════════════════════════
@@ -136,7 +144,11 @@ public class PartiesController : ApiControllerBase
             var noMoney = NoMoney();
 
             var items = await rows
-                .OrderBy(p => (p.DisplayName ?? p.LegalName))
+                /* Newest first by when it was ADDED to the system (the owner,
+                   30 Sep). The id is that order exactly; "User"."CreatedAt" is a
+                   date and, for customers carried over from the old system,
+                   holds the date they first traded -- not when they were added. */
+                .OrderByDescending(p => p.UserId)
                 .Skip((page - 1) * pageSize)
                 .Take(pageSize)
                 .Select(p => new
@@ -461,7 +473,7 @@ public class PartiesController : ApiControllerBase
                                        v.CustomerUser.SalesPersonUserId == me);
 
             var visits = await rows
-                .OrderByDescending(v => v.VisitedAt)
+                .OrderByDescending(v => v.VisitedAt).ThenByDescending(v => v.VisitId)
                 .Take(take)
                 .Select(v => new
                 {
@@ -608,6 +620,7 @@ public class PartiesController : ApiControllerBase
                accountant's. Zeroed here rather than refused, so the order
                desk's form -- which does not show them -- still saves. */
             if (NoMoney()) body = body with { CreditLimit = 0m, OpeningBalance = 0m };
+            if (!SetsCreditLimit()) body = body with { CreditLimit = 0m };
 
             var error = await ValidateParty(body, null);
             if (error is not null) return BadRequest(new { message = error });
@@ -711,6 +724,8 @@ public class PartiesController : ApiControllerBase
                account has, the order desk's save leaves exactly as it was. */
             if (NoMoney())
                 body = body with { CreditLimit = party.CreditLimit, CreditDays = party.CreditDays, OpeningBalance = party.OpeningBalance };
+            if (!SetsCreditLimit())
+                body = body with { CreditLimit = party.CreditLimit };
 
             var error = await ValidateParty(body, id);
             if (error is not null) return BadRequest(new { message = error });
@@ -812,6 +827,54 @@ public class PartiesController : ApiControllerBase
             return Fail(ex, $"change the status of party {id}");
         }
     }
+
+    /// <summary>
+    /// The "Set credit limit" button on a customer's page (the owner, 30 Sep):
+    /// one amount, Super Admin or accountant only. 0 means no limit.
+    /// </summary>
+    [HttpPatch("{id:int}/credit-limit")]
+    [Authorize(Policy = "Staff")]
+    public async Task<IActionResult> SetCreditLimit(int id, [FromBody] CreditLimitRequest body)
+    {
+        try
+        {
+            if (!SetsCreditLimit())
+                return StatusCode(403, new { message = "Only the Super Admin or the accountant can set a credit limit." });
+            if (body.Amount < 0)
+                return BadRequest(new { message = "A credit limit cannot be negative. Use 0 for no limit." });
+            if (body.Amount > 1_000_000_000m)
+                return BadRequest(new { message = "That limit is too large to be real -- check the zeros." });
+
+            var party = await _db.Parties.FirstOrDefaultAsync(p => p.UserId == id);
+            if (party is null) return NotFound(new { message = $"No customer with id {id}." });
+
+            var was = party.CreditLimit;
+            party.CreditLimit = Math.Round(body.Amount, 2);
+            await _db.SaveChangesAsync();
+
+            var name = party.DisplayName ?? party.LegalName;
+            await Log("PARTY_CREDIT_LIMIT", "Party", id.ToString(),
+                $"{name}: credit limit {was:N0} -> {party.CreditLimit:N0}", 2);
+
+            await _push.NotifyRolesAsync(
+                new[] { "super-admin", "accountant" },
+                NotificationKinds.PartyChanged,
+                $"Credit limit set by {CurrentUserName()}",
+                party.CreditLimit == 0
+                    ? $"{name} now has no credit limit (was {was:N0})."
+                    : $"{name}: credit limit {party.CreditLimit:N0} (was {was:N0}).",
+                url: $"/parties/{id}",
+                exceptUserId: CurrentUserId());
+
+            return Ok(new { id, creditLimit = party.CreditLimit, message = $"Credit limit for {name} saved." });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"set the credit limit of party {id}");
+        }
+    }
+
+    public record CreditLimitRequest(decimal Amount);
 
     // ════════════════════════ validation helpers ════════════════════════
 

@@ -324,7 +324,7 @@ public class PurchasesController : ApiControllerBase
             var group = await LogisticsGroupAsync();
             var rows = await _db.Accounts.AsNoTracking()
                 .Where(a => a.ParentAccountId == group.AccountId && (includeInactive || a.IsActive))
-                .OrderBy(a => a.AccountName)
+                .OrderByDescending(a => a.AccountId)
                 .Select(a => new
                 {
                     id = a.AccountId, code = a.AccountCode, name = a.AccountName, isActive = a.IsActive,

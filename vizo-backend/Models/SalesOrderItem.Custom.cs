@@ -13,4 +13,12 @@ public partial class SalesOrderItem
     /// backend/database/25_packing_and_claims_removed.sql.
     /// </summary>
     public int? DispatchedQty { get; set; }
+
+    /// <summary>
+    /// The ORIGINAL price per unit when the line was written -- the product's
+    /// selling price, or what the Super Admin / accountant corrected it to --
+    /// so the salesperson's margin is <c>UnitPrice - BasePrice</c>. NULL on
+    /// lines older than migration 42.
+    /// </summary>
+    public decimal? BasePrice { get; set; }
 }

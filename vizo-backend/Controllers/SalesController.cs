@@ -93,7 +93,10 @@ public class SalesController : ApiControllerBase
             var total = await rows.CountAsync();
 
             var items = await rows
-                .OrderByDescending(o => o.OrderDate).ThenByDescending(o => o.OrderId)
+                /* Newest first by when it was CREATED (the owner, 30 Sep): the id
+                   is the creation order, whereas OrderDate is whatever date was
+                   typed on the order and can sit in the past. */
+                .OrderByDescending(o => o.OrderId)
                 .Skip((page - 1) * pageSize).Take(pageSize)
                 .Select(o => new
                 {
@@ -106,6 +109,10 @@ public class SalesController : ApiControllerBase
                     location = o.Location.LocationName,
                     locationCode = o.Location.LocationCode,
                     salesPerson = o.SalesPersonUser != null ? o.SalesPersonUser.User.FullName : null,
+                    /* Who actually keyed it in -- the rep, the order desk, the admin --
+                       by their own name (the owner, 30 Sep: shown in brackets after
+                       the customer on the list). */
+                    createdBy = o.CreatedByUser.FullName,
                     orderDate = o.OrderDate,
                     deliveryDate = o.DeliveryDate,
                     status = o.Status.StatusKey,
@@ -158,7 +165,7 @@ public class SalesController : ApiControllerBase
             {
                 o.id, o.orderNo, o.customerId, o.customerName,
                 customerInitials = Initials(o.customerName),
-                o.customerType, o.city, o.location, o.locationCode, o.salesPerson,
+                o.customerType, o.city, o.location, o.locationCode, o.salesPerson, o.createdBy,
                 o.orderDate, o.deliveryDate, o.status, o.statusName, o.itemCount,
                 o.subtotal, o.discount, o.tax, o.total,
                 o.paymentMethod,
@@ -323,6 +330,9 @@ public class SalesController : ApiControllerBase
                         packing = i.Product.Packing,
                         qty = i.Quantity,
                         rate = i.UnitPrice,
+                        /* The original price the margin sits on (migration 42);
+                           null on older lines. */
+                        basePrice = i.BasePrice,
                         discountPercent = i.DiscountPercent,
                         taxPercent = i.TaxPercent,
                         lineTotal = i.LineTotal
@@ -536,11 +546,21 @@ public class SalesController : ApiControllerBase
             }
             else
             {
+                /* The two approvers -- either may confirm and invoice it now
+                   (the owner, 30 Sep) -- get the amount. The order desk is told
+                   it exists but sees no money (26 Sep), so its copy has none. */
                 await _push.NotifyRolesAsync(
-                    new[] { "super-admin", "order-dept" },
+                    new[] { "super-admin", "accountant" },
                     NotificationKinds.OrderCreated,
-                    $"Order created by {takenBy}",
-                    $"{order.OrderNo} -- {customerName}, PKR {order.TotalAmount:N0}.",
+                    $"New order from {takenBy}",
+                    $"{order.OrderNo} -- {customerName}, PKR {order.TotalAmount:N0}. Waiting to be confirmed and invoiced.",
+                    url: $"/sales/orders/{order.OrderId}",
+                    exceptUserId: CurrentUserId());
+                await _push.NotifyRolesAsync(
+                    new[] { "order-dept" },
+                    NotificationKinds.OrderCreated,
+                    $"New order from {takenBy}",
+                    $"{order.OrderNo} -- {customerName}. It can be packed once it is invoiced.",
                     url: $"/sales/orders/{order.OrderId}",
                     exceptUserId: CurrentUserId());
             }
@@ -767,6 +787,9 @@ public class SalesController : ApiControllerBase
                 ProductId = l.ProductId,
                 Quantity = l.Qty,
                 UnitPrice = l.Rate,
+                /* Kept only when it makes sense -- a base above the rate would
+                   be a negative margin, which the order form never sends. */
+                BasePrice = l.BasePrice is decimal b && b >= 0m && b <= l.Rate ? Money(b) : null,
                 DiscountPercent = l.DiscountPercent,
                 TaxPercent = l.TaxPercent,
                 LineTotal = Money(net + net * (l.TaxPercent / 100m))
@@ -783,9 +806,154 @@ public class SalesController : ApiControllerBase
     /// is captured per line at invoice time: the margin reports need what the
     /// item cost THAT DAY, and Product.CostPrice moves.
     /// </summary>
+    /// <summary>
+    /// Takes an order's bill back out of the books when the order leaves the
+    /// chain before the goods have left (the owner, 30 Sep: declined, cancelled
+    /// or over-limit orders must disappear from the customer's ledger).
+    ///
+    /// The invoice row stays, marked VOID -- its number may already be on paper
+    /// -- but its journal entry is deleted, lines and item detail with it, so
+    /// the customer's ledger and balance read as if it was never billed. The
+    /// same reasoning as LedgerPosting.RepostSalesInvoiceAsync: the entry is
+    /// the system's mirror of one document, not something a person wrote, so a
+    /// reversal pair would only fill the statement with lines that say nothing.
+    ///
+    /// Any receipt already allocated to the bill is un-allocated, not undone:
+    /// the money did arrive, so it stays on the customer's account as a credit.
+    /// A closed month is refused -- its figures must not move.
+    /// </summary>
+    private async Task<string?> VoidOrderInvoice(SalesOrder order)
+    {
+        var inv = await _db.SalesInvoices.FirstOrDefaultAsync(i => i.OrderId == order.OrderId);
+        if (inv is null) return null;
+
+        var voided = await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "VOID");
+        if (voided is null) return "No VOID invoice status is configured.";
+        if (inv.StatusId == voided.StatusId) return null;
+
+        await using var tx = await _db.Database.BeginTransactionAsync();
+
+        if (inv.EntryId is int entryId)
+        {
+            var entry = await _db.JournalEntries.Include(e => e.Period)
+                .FirstOrDefaultAsync(e => e.EntryId == entryId);
+            if (entry is not null)
+            {
+                if (entry.Period.IsClosed)
+                    return $"{inv.InvoiceNo}'s entry {entry.EntryNo} sits in {entry.Period.PeriodName}, which is closed. " +
+                           "Reopen the month, or raise a sales return instead.";
+                if (entry.ReversedByEntryId is not null ||
+                    await _db.JournalEntries.AnyAsync(e => e.ReversedByEntryId == entryId))
+                    return $"{inv.InvoiceNo}'s entry {entry.EntryNo} is part of a reversal, so it cannot be removed by hand here.";
+
+                inv.EntryId = null;
+                await _db.SaveChangesAsync();
+                /* Lines and LedgerEntryItem rows go with it (ON DELETE CASCADE). */
+                _db.JournalEntries.Remove(entry);
+            }
+        }
+
+        var allocations = await _db.VoucherAllocations.Where(a => a.SalesInvoiceId == inv.InvoiceId).ToListAsync();
+        _db.VoucherAllocations.RemoveRange(allocations);
+
+        /* Its lines go too, so reports that read invoice lines directly (sales
+           by product, product history) stop counting it; ReinstateOrderInvoice
+           rebuilds them from the order if it is billed again. */
+        var items = await _db.SalesInvoiceItems.Where(i => i.InvoiceId == inv.InvoiceId).ToListAsync();
+        _db.SalesInvoiceItems.RemoveRange(items);
+
+        inv.StatusId = voided.StatusId;
+        inv.PdfUrl = null;          // the stored copy no longer describes a live bill
+        await _db.SaveChangesAsync();
+        await tx.CommitAsync();
+
+        await Log("INVOICE_VOIDED", "SalesInvoice", inv.InvoiceNo,
+            $"{order.OrderNo} left the chain; its entry was taken out of the customer's ledger" +
+            (allocations.Count > 0 ? $" and {allocations.Count} receipt allocation(s) released as credit." : "."), 2);
+        return null;
+    }
+
+    /// <summary>
+    /// Brings a voided bill back when its order is invoiced again: the lines and
+    /// totals are rebuilt from the order as it stands now and it is posted to
+    /// the customer's ledger afresh (VoidOrderInvoice is the other half).
+    /// </summary>
+    private async Task<string?> ReinstateOrderInvoice(SalesOrder order, SalesInvoice inv)
+    {
+        var issued = await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "ISSUED");
+        if (issued is null) return "No ISSUED invoice status is configured.";
+
+        var lines = await _db.SalesOrderItems.AsNoTracking()
+            .Where(i => i.OrderId == order.OrderId).OrderBy(i => i.LineNo).ToListAsync();
+        if (lines.Count == 0) return $"{order.OrderNo} has no lines, so there is nothing to invoice.";
+
+        await using var tx = await _db.Database.BeginTransactionAsync();
+
+        short n = 1;
+        foreach (var l in lines)
+        {
+            var cost = await _db.Products.Where(p => p.ProductId == l.ProductId)
+                .Select(p => p.CostPrice).FirstAsync();
+            _db.SalesInvoiceItems.Add(new SalesInvoiceItem
+            {
+                InvoiceId = inv.InvoiceId,
+                LineNo = n++,
+                ProductId = l.ProductId,
+                Quantity = l.Quantity,
+                UnitPrice = l.UnitPrice,
+                DiscountPercent = l.DiscountPercent,
+                TaxPercent = l.TaxPercent,
+                UnitCost = cost,
+                LineTotal = l.LineTotal
+            });
+        }
+
+        inv.CustomerUserId = order.CustomerUserId;
+        inv.LocationId = order.LocationId;
+        inv.Subtotal = order.Subtotal;
+        inv.DiscountAmount = order.DiscountAmount;
+        inv.TaxAmount = order.TaxAmount;
+        inv.TotalAmount = order.TotalAmount;
+        inv.StatusId = issued.StatusId;
+        inv.EntryId = null;
+        inv.PdfUrl = null;
+        await _db.SaveChangesAsync();
+
+        var unposted = await LedgerPosting.PostSalesInvoiceAsync(_db, inv.InvoiceId, CurrentUserId());
+        if (unposted is not null) return unposted;      // disposing the transaction rolls it all back
+
+        await tx.CommitAsync();
+        return null;
+    }
+
     private async Task<SalesInvoice> RaiseInvoiceForOrder(
         SalesOrder order, IReadOnlyList<OrderLineRequest> lines, int methodId, DateOnly? dueDate)
     {
+        /* One order has one invoice (a unique key on OrderId). If this order's
+           bill was voided when it left the chain, every road that bills it
+           again -- the Invoiced step, the Invoice button, clearing a credit
+           hold with "invoice it" -- brings that same bill back rather than
+           colliding with it. */
+        var dead = await _db.SalesInvoices.IgnoreQueryFilters()
+            .FirstOrDefaultAsync(i => i.OrderId == order.OrderId);
+        if (dead is not null)
+        {
+            var why = await ReinstateOrderInvoice(order, dead);
+            if (why is not null) throw new InvalidOperationException(why);
+
+            var invoicedStatus = await _db.OrderStatuses.FirstOrDefaultAsync(s => s.StatusKey == "INVOICED");
+            var liveOrder = await _db.SalesOrders.FirstAsync(o => o.OrderId == order.OrderId);
+            var nowKey = await _db.OrderStatuses.AsNoTracking()
+                .Where(s => s.StatusId == liveOrder.StatusId).Select(s => s.StatusKey).FirstAsync();
+            if (invoicedStatus is not null &&
+                OrderWorkflow.Step(nowKey) is int at && at < OrderWorkflow.Step(OrderWorkflow.Invoiced))
+            {
+                liveOrder.StatusId = invoicedStatus.StatusId;
+                await _db.SaveChangesAsync();
+            }
+            return dead;
+        }
+
         var status = await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "ISSUED")
                      ?? await _db.InvoiceStatuses.FirstAsync(s => s.StatusKey == "DRAFT");
 
@@ -948,7 +1116,7 @@ public class SalesController : ApiControllerBase
             var lines = await _db.SalesOrderItems.AsNoTracking()
                 .Where(i => i.OrderId == id).OrderBy(i => i.LineNo)
                 .Select(i => new OrderLineRequest(
-                    i.ProductId, i.Quantity, i.UnitPrice, i.DiscountPercent, i.TaxPercent))
+                    i.ProductId, i.Quantity, i.UnitPrice, i.DiscountPercent, i.TaxPercent, i.BasePrice))
                 .ToListAsync();
 
             if (lines.Count == 0)
@@ -1016,7 +1184,7 @@ public class SalesController : ApiControllerBase
 
     /// <summary>Replace an order's lines and details.</summary>
     [HttpPut("orders/{id:int}")]
-    public async Task<IActionResult> UpdateOrder(int id, [FromBody] OrderRequest body)
+    public async Task<IActionResult> UpdateOrder(int id, [FromBody] OrderEditRequest body)
     {
         try
         {
@@ -1067,10 +1235,31 @@ public class SalesController : ApiControllerBase
                     message = $"{order.OrderNo} is {order.Status.StatusName.ToLowerInvariant()} and cannot be edited."
                 });
 
-            var invalid = await ValidateOrderRequest(body);
+            /* THE EDIT SCREEN SENDS THE PRICE IN THREE PARTS -- original price,
+               the salesperson's margin, and the final price they add up to (the
+               owner, 30 September). PriceEditedLines checks that the three agree
+               and turns each line into the ordinary OrderLineRequest at the
+               FINAL price, with no discount and no tax: both boxes came off the
+               edit screen the same day, so an edited order and its invoice are
+               always 0 / 0. From there on this is the same order every other
+               path writes, checked by the same ValidateOrderRequest -- which is
+               also where the 10% margin cap is enforced for a salesperson (or
+               the order desk) editing on an approved request. The Super Admin
+               and the accountant are not capped, exactly as when an order is
+               created. */
+            if (body.Lines is null || body.Lines.Count == 0)
+                return BadRequest(new { message = "An order needs at least one line." });
+
+            var (priced, priceProblem) = PriceEditedLines(body.Lines);
+            if (priced is null) return BadRequest(new { message = priceProblem });
+
+            var invalid = await ValidateOrderRequest(new OrderRequest(
+                body.CustomerId, body.LocationId, body.SalesPersonUserId,
+                body.OrderDate, body.DeliveryDate, body.DueDate, body.MethodId,
+                body.Notes, body.SaveAsDraft, body.RaiseInvoice, priced));
             if (invalid is not null) return BadRequest(new { message = invalid });
 
-            var (subtotal, discount, tax, total) = Totals(body.Lines);
+            var (subtotal, discount, tax, total) = Totals(priced);
 
             await using var tx = await _db.Database.BeginTransactionAsync();
 
@@ -1092,12 +1281,14 @@ public class SalesController : ApiControllerBase
             _db.SalesOrderItems.RemoveRange(order.SalesOrderItems);
             await _db.SaveChangesAsync();
 
+            /* Every line is stored at its FINAL price (original + margin) --
+               that is the price the customer pays and the one the invoice, the
+               ledger and every report read. Discount and tax are 0 by
+               construction (PriceEditedLines), so the line total is simply
+               quantity x final price. */
             short n = 1;
-            foreach (var l in body.Lines)
+            foreach (var l in priced)
             {
-                var gross = l.Qty * l.Rate;
-                var disc = gross * (l.DiscountPercent / 100m);
-                var net = gross - disc;
                 _db.SalesOrderItems.Add(new SalesOrderItem
                 {
                     OrderId = order.OrderId,
@@ -1105,13 +1296,15 @@ public class SalesController : ApiControllerBase
                     ProductId = l.ProductId,
                     Quantity = l.Qty,
                     UnitPrice = l.Rate,
-                    DiscountPercent = l.DiscountPercent,
-                    TaxPercent = l.TaxPercent,
-                    LineTotal = Money(net + net * (l.TaxPercent / 100m))
+                    BasePrice = l.BasePrice,        // the original, so the margin survives a reload
+                    DiscountPercent = 0m,
+                    TaxPercent = 0m,
+                    LineTotal = Money(l.Qty * l.Rate)
                 });
             }
 
-            /* The invoice follows the order. */
+            /* The invoice follows the order: same lines, same quantities (a 20
+               cut to 10 is billed as 10), same totals. */
             var invoice = await _db.SalesInvoices
                 .Include(i => i.SalesInvoiceItems)
                 .FirstOrDefaultAsync(i => i.OrderId == id);
@@ -1126,15 +1319,38 @@ public class SalesController : ApiControllerBase
                 invoice.TaxAmount = tax;
                 invoice.TotalAmount = total;
 
+                /* WHAT EACH ITEM COST ON THE DAY IT WAS BILLED survives the
+                   edit. The rebuilt lines used to be written without a UnitCost
+                   at all, so every edited invoice read as 100% margin on the
+                   margin reports (UnitCost is captured at invoice time on
+                   purpose -- see RaiseInvoiceForOrder -- because
+                   Product.CostPrice moves). An item that was already on the bill
+                   keeps its captured cost; an item added by this edit is costed
+                   today, which is when it joined the bill. A captured cost of 0
+                   (written by the old rebuild) is treated as missing. */
+                var costOnBill = invoice.SalesInvoiceItems
+                    .Where(i => i.UnitCost > 0m)
+                    .GroupBy(i => i.ProductId)
+                    .ToDictionary(g => g.Key, g => g.First().UnitCost);
+                var costToday = priced.Select(l => l.ProductId)
+                    .Where(p => !costOnBill.ContainsKey(p))
+                    .Distinct()
+                    .ToList();
+                if (costToday.Count > 0)
+                {
+                    var today = await _db.Products.AsNoTracking()
+                        .Where(p => costToday.Contains(p.ProductId))
+                        .Select(p => new { p.ProductId, p.CostPrice })
+                        .ToListAsync();
+                    foreach (var c in today) costOnBill[c.ProductId] = c.CostPrice;
+                }
+
                 _db.SalesInvoiceItems.RemoveRange(invoice.SalesInvoiceItems);
                 await _db.SaveChangesAsync();
 
                 short m = 1;
-                foreach (var l in body.Lines)
+                foreach (var l in priced)
                 {
-                    var gross = l.Qty * l.Rate;
-                    var disc = gross * (l.DiscountPercent / 100m);
-                    var net = gross - disc;
                     _db.SalesInvoiceItems.Add(new SalesInvoiceItem
                     {
                         InvoiceId = invoice.InvoiceId,
@@ -1142,9 +1358,10 @@ public class SalesController : ApiControllerBase
                         ProductId = l.ProductId,
                         Quantity = l.Qty,
                         UnitPrice = l.Rate,
-                        DiscountPercent = l.DiscountPercent,
-                        TaxPercent = l.TaxPercent,
-                        LineTotal = Money(net + net * (l.TaxPercent / 100m))
+                        DiscountPercent = 0m,
+                        TaxPercent = 0m,
+                        UnitCost = costOnBill.GetValueOrDefault(l.ProductId),
+                        LineTotal = Money(l.Qty * l.Rate)
                     });
                 }
             }
@@ -1154,12 +1371,18 @@ public class SalesController : ApiControllerBase
             await _db.SaveChangesAsync();
 
             /* The invoice's entry follows the invoice (LedgerPosting explains
-               why in place). A closed month leaves the books alone and says so
-               in the log -- the edit itself still stands. */
+               why in place): the same journal entry is rewritten to the new
+               total, so the customer's ledger shows the edited amount under the
+               same entry number. A closed month leaves the books alone -- the
+               edit itself still stands, and the person who saved it is TOLD
+               (below, in the reply), not just the log: an invoice that moved
+               while its ledger entry did not is exactly what the accountant
+               has to go and correct by hand. */
+            string? ledgerNotMoved = null;
             if (invoice is not null)
             {
-                var notMoved = await LedgerPosting.RepostSalesInvoiceAsync(_db, invoice.InvoiceId, CurrentUserId());
-                if (notMoved is not null) _logger.LogWarning("{Why}", notMoved);
+                ledgerNotMoved = await LedgerPosting.RepostSalesInvoiceAsync(_db, invoice.InvoiceId, CurrentUserId());
+                if (ledgerNotMoved is not null) _logger.LogWarning("{Why}", ledgerNotMoved);
             }
 
             await tx.CommitAsync();
@@ -1196,10 +1419,20 @@ public class SalesController : ApiControllerBase
             {
                 id = order.OrderId,
                 orderNo = order.OrderNo,
+                invoiceId = invoice?.InvoiceId,
                 invoiceRebuilt = invoice?.InvoiceNo,
+                total,
+                /* True when there is an invoice and its ledger entry now carries
+                   the new total; false when the month was closed (ledgerNote
+                   says which entry and why). Null when there is no invoice yet
+                   -- nothing is on the ledger until the order is billed. */
+                ledgerUpdated = invoice is null ? (bool?)null : ledgerNotMoved is null,
+                ledgerNote = ledgerNotMoved,
                 message = invoice is null
                     ? $"{order.OrderNo} updated."
-                    : $"{order.OrderNo} updated, and {invoice.InvoiceNo} was rebuilt to match."
+                    : ledgerNotMoved is null
+                        ? $"{order.OrderNo} updated. {invoice.InvoiceNo} and the customer's ledger were updated to match."
+                        : $"{order.OrderNo} updated and {invoice.InvoiceNo} rebuilt, but the ledger was NOT moved: {ledgerNotMoved}"
             });
         }
         catch (Exception ex)
@@ -1207,6 +1440,89 @@ public class SalesController : ApiControllerBase
             return Fail(ex, $"update order {id}");
         }
     }
+
+    /// <summary>
+    /// Turns the edit screen's lines -- original price, margin, final price --
+    /// into ordinary order lines at the final price, or says what is wrong.
+    ///
+    /// The rules (the owner, 30 September): final price = original price +
+    /// margin; the margin may be 0; nothing may be negative. Compared with one
+    /// paisa of slack, the same allowance SalesRateOutOfRange gives: the screen
+    /// rounds each figure to the paisa and a check that refuses what its own
+    /// screen produced is worse than none.
+    ///
+    /// The margin PERCENT is not taken from the browser: it is margin over
+    /// original price, always derivable, and a third copy of the same fact is
+    /// one more thing that can disagree.
+    ///
+    /// Tolerant of a client that sends only <c>rate</c> (the edit screen before
+    /// 30 September): the rate is read as the final price and, with no original
+    /// price given, the whole of it is taken as the original with no margin.
+    ///
+    /// Discount and tax are always 0 on the way out -- those boxes are gone from
+    /// the edit screen, and an edited order is billed at exactly quantity x
+    /// final price.
+    /// </summary>
+    private static (List<OrderLineRequest>? Lines, string? Problem) PriceEditedLines(
+        IReadOnlyList<OrderEditLineRequest> lines)
+    {
+        var priced = new List<OrderLineRequest>(lines.Count);
+        for (var i = 0; i < lines.Count; i++)
+        {
+            var l = lines[i];
+            var at = $"Line {i + 1}";
+
+            if (l.FinalPrice is null && l.Rate is null)
+                return (null, $"{at}: the final selling price is missing.");
+            var final = l.FinalPrice ?? l.Rate ?? 0m;
+
+            /* Whichever two of the three were sent decide the third. */
+            var margin = l.MarginPrice ?? (l.OriginalPrice is decimal given ? final - given : 0m);
+            var original = l.OriginalPrice ?? final - margin;
+
+            if (original < 0m)
+                return (null, $"{at}: the original price cannot be negative.");
+            if (margin < 0m)
+                return (null, $"{at}: the margin cannot be negative. It can be 0; "
+                              + "to sell below the original price, lower the original price.");
+            if (final < 0m)
+                return (null, $"{at}: the final price cannot be negative.");
+            if (Math.Abs(original + margin - final) > 0.01m)
+                return (null, $"{at}: the final price ({final:0.00}) must be the original price "
+                              + $"({original:0.00}) plus the margin ({margin:0.00}), which is {Money(original + margin):0.00}.");
+
+            priced.Add(new OrderLineRequest(l.ProductId, l.Qty, Money(final), 0m, 0m, Money(original)));
+        }
+        return (priced, null);
+    }
+
+    /// <summary>
+    /// One line as the order edit screen sends it. <c>OriginalPrice</c>
+    /// is the per-unit base (the product's selling price, or whatever the
+    /// Super Admin / accountant corrected it to), <c>MarginPrice</c> the
+    /// salesperson's margin per unit, <c>FinalPrice</c> their sum -- the
+    /// price the customer pays and the only one of the three written to the
+    /// row (SalesOrderItem.UnitPrice / SalesInvoiceItem.UnitPrice): there are no
+    /// original-price or margin columns on an order line, so on reload the edit
+    /// screen reads the original back as the product's selling price and the
+    /// margin as the difference. <c>Rate</c> is the pre-30-September
+    /// name for the final price, still read so an old tab does not break.
+    /// Any discount or tax a client sends is ignored.
+    /// </summary>
+    public record OrderEditLineRequest(
+        int ProductId, int Qty,
+        decimal? OriginalPrice, decimal? MarginPrice, decimal? FinalPrice,
+        decimal? Rate);
+
+    /// <summary>
+    /// PUT /sales/orders/{id}: the same header as <see cref="OrderRequest"/>,
+    /// with lines priced in three parts. OrderDate, SaveAsDraft, RaiseInvoice
+    /// and DueDate are read and ignored by UpdateOrder, as before.
+    /// </summary>
+    public record OrderEditRequest(
+        int CustomerId, int? LocationId, int? SalesPersonUserId,
+        DateOnly? OrderDate, DateOnly? DeliveryDate, DateOnly? DueDate, int MethodId,
+        string? Notes, bool SaveAsDraft, bool RaiseInvoice, List<OrderEditLineRequest> Lines);
 
     /// <summary>Delete an order outright. Super Admin, or an approved request.</summary>
     [HttpDelete("orders/{id:int}")]
@@ -1362,7 +1678,7 @@ public class SalesController : ApiControllerBase
 
             var rows = await _db.OrderChangeRequests.AsNoTracking()
                 .Where(r => r.Status == status)
-                .OrderBy(r => r.CreatedAt)
+                .OrderByDescending(r => r.CreatedAt).ThenByDescending(r => r.RequestId)
                 .Select(r => new
                 {
                     id = r.RequestId,
@@ -1522,6 +1838,17 @@ public class SalesController : ApiControllerBase
             if (role == OrderWorkflow.RoleSales && order.SalesPersonUserId != CurrentUserId())
                 return StatusCode(403, new { message = "This is not your order." });
 
+            /* THE ORDER DESK PACKS ONLY WHAT HAS BEEN BILLED (the owner, 30 Sep).
+               It sees every order on its Packing screen, including ones the
+               admin or the accountant have not yet confirmed and invoiced --
+               and trying to send one of those out gets these exact words, the
+               owner's, rather than the generic "your role cannot move" below. */
+            if (role == OrderWorkflow.RoleOrderDept &&
+                status.StatusKey is OrderWorkflow.Dispatched or OrderWorkflow.AtOrderDept &&
+                current.StatusKey is OrderWorkflow.Draft or OrderWorkflow.Submitted
+                    or OrderWorkflow.Confirmed or OrderWorkflow.CreditHold)
+                return BadRequest(new { message = "This order is not invoiced by super admin or accountant" });
+
             if (!OrderWorkflow.CanMove(role, current.StatusKey, status.StatusKey))
                 return StatusCode(403, new
                 {
@@ -1534,12 +1861,37 @@ public class SalesController : ApiControllerBase
             if (status.StatusKey == OrderWorkflow.Declined && string.IsNullOrWhiteSpace(body.Reason))
                 return BadRequest(new { message = "Declining an order needs a reason." });
 
-            if (body.StatusKey == OrderWorkflow.Cancelled &&
-                await _db.SalesInvoices.AnyAsync(i => i.OrderId == id))
-                return BadRequest(new
+            /* ─────────── OFF THE CHAIN, OUT OF THE LEDGER ───────────────
+
+               The owner, 30 Sep: an order declined, cancelled or put on hold
+               for crossing the limit must no longer stand in the customer's
+               ledger -- it is there only while the order is confirmed and
+               invoiced. Until DISPATCHED nothing physical has happened, so the
+               bill is voided and its entry removed (VoidOrderInvoice). This
+               used to refuse outright ("raise a sales return"), which is right
+               only once the goods have left -- and that part stays. */
+            var leavesTheChain = status.StatusKey is OrderWorkflow.Cancelled
+                or OrderWorkflow.Declined or OrderWorkflow.CreditHold;
+            if (leavesTheChain)
+            {
+                var goodsLeft = current.StatusKey is OrderWorkflow.Dispatched
+                    or OrderWorkflow.Delivered or OrderWorkflow.Returned;
+                var hasBill = await _db.SalesInvoices
+                    .AnyAsync(i => i.OrderId == id && i.Status.StatusKey != "VOID");
+
+                if (goodsLeft && hasBill)
+                    return BadRequest(new
+                    {
+                        message = $"{order.OrderNo} has already been dispatched, so the goods have left. " +
+                                  "Raise a sales return instead."
+                    });
+
+                if (hasBill)
                 {
-                    message = "This order has already been invoiced. Raise a sales return instead of cancelling it."
-                });
+                    var notVoided = await VoidOrderInvoice(order);
+                    if (notVoided is not null) return BadRequest(new { message = notVoided });
+                }
+            }
 
             /* ─────────── DISPATCHED IS WHERE THE STOCK LEAVES ───────────────
 
@@ -1609,6 +1961,16 @@ public class SalesController : ApiControllerBase
                     {
                         if (!dispatchQty.TryGetValue(over.ProductId, out var requested))
                             return BadRequest(new { message = $"Product {over.ProductId} is not on {order.OrderNo}." });
+                        /* The order desk no longer changes quantities (the owner,
+                           30 Sep): it packs the order as billed. A change is the
+                           admin's or the accountant's, on the order's Edit screen,
+                           which rebuilds the invoice and the ledger with it. */
+                        if (role == OrderWorkflow.RoleOrderDept && over.Qty != requested)
+                            return BadRequest(new
+                            {
+                                message = "The order department packs the order as invoiced. " +
+                                          "Ask the Super Admin or the accountant to edit the quantities."
+                            });
                         if (over.Qty <= 0)
                             return BadRequest(new { message = "A dispatched quantity must be above zero." });
                         if (over.Qty > requested)
@@ -1681,8 +2043,28 @@ public class SalesController : ApiControllerBase
 
             if (status.StatusKey == OrderWorkflow.Invoiced)
             {
-                billedInvoice = await _db.SalesInvoices
+                billedInvoice = await _db.SalesInvoices.IgnoreQueryFilters()
                     .FirstOrDefaultAsync(i => i.OrderId == id);
+
+                /* A bill voided when the order left the chain (cancelled,
+                   declined, held) comes back to life when the order is billed
+                   again: same number, rebuilt from the order as it stands, and
+                   posted to the customer's ledger afresh. A second number for
+                   the same order would be two bills for one sale. */
+                if (billedInvoice is not null &&
+                    await _db.InvoiceStatuses.AnyAsync(s => s.StatusId == billedInvoice.StatusId && s.StatusKey == "VOID"))
+                {
+                    if (current.StatusKey is "CANCELLED" or "CREDIT_HOLD")
+                        return BadRequest(new
+                        {
+                            message = $"{order.OrderNo} is {current.StatusName.ToLowerInvariant()}. " +
+                                      "Put it back on the chain before billing it."
+                        });
+                    var notBack = await ReinstateOrderInvoice(order, billedInvoice);
+                    if (notBack is not null) return BadRequest(new { message = notBack });
+                    await Log("INVOICE_REINSTATED", "SalesInvoice", billedInvoice.InvoiceNo,
+                        $"billed again for {order.OrderNo}, {billedInvoice.TotalAmount:N0}", 2);
+                }
 
                 alreadyInvoiced = billedInvoice is not null;
 
@@ -1705,7 +2087,7 @@ public class SalesController : ApiControllerBase
                     var billLines = await _db.SalesOrderItems.AsNoTracking()
                         .Where(i => i.OrderId == id).OrderBy(i => i.LineNo)
                         .Select(i => new OrderLineRequest(
-                            i.ProductId, i.Quantity, i.UnitPrice, i.DiscountPercent, i.TaxPercent))
+                            i.ProductId, i.Quantity, i.UnitPrice, i.DiscountPercent, i.TaxPercent, i.BasePrice))
                         .ToListAsync();
 
                     if (billLines.Count == 0)
@@ -1855,7 +2237,8 @@ public class SalesController : ApiControllerBase
                nothing was short -- "when items are dispatched ... the sales
                invoice for that order must be updated" was not conditioned on a
                shortage. Every other status change still just ensures the plain
-               bill exists. */
+               bill exists. (Since 30 Sep the appended page itself is no longer
+               drawn -- InvoicePdf.Render -- so the rebuild is the plain bill.) */
             Bill? bill = null;
             if (dispatchFrom is not null)
             {
@@ -1980,7 +2363,7 @@ public class SalesController : ApiControllerBase
         {
             var rows = await _db.SalesOrders.AsNoTracking()
                 .Where(o => o.Status.StatusKey == "CREDIT_HOLD")
-                .OrderBy(o => o.OrderDate)
+                .OrderByDescending(o => o.OrderDate).ThenByDescending(o => o.OrderId)
                 .Select(o => new
                 {
                     id = o.OrderId,
@@ -2089,7 +2472,7 @@ public class SalesController : ApiControllerBase
                 var lines = await _db.SalesOrderItems.AsNoTracking()
                     .Where(i => i.OrderId == id).OrderBy(i => i.LineNo)
                     .Select(i => new OrderLineRequest(
-                        i.ProductId, i.Quantity, i.UnitPrice, i.DiscountPercent, i.TaxPercent))
+                        i.ProductId, i.Quantity, i.UnitPrice, i.DiscountPercent, i.TaxPercent, i.BasePrice))
                     .ToListAsync();
 
                 if (lines.Count > 0)
@@ -3389,8 +3772,10 @@ public class SalesController : ApiControllerBase
             {
                 if (!await _db.SalesOrders.AnyAsync(o => o.OrderId == body.OrderId))
                     return BadRequest(new { message = "That order does not exist." });
-                if (await _db.SalesInvoices.AnyAsync(i => i.OrderId == body.OrderId))
-                    return BadRequest(new { message = "That order has already been invoiced." });
+                /* IgnoreQueryFilters: a voided bill still holds the order's one
+                   invoice slot (unique OrderId) -- bill it from the order instead. */
+                if (await _db.SalesInvoices.IgnoreQueryFilters().AnyAsync(i => i.OrderId == body.OrderId))
+                    return BadRequest(new { message = "That order has already been invoiced. Bill it from the order." });
             }
 
             var status = await _db.InvoiceStatuses.FirstOrDefaultAsync(s => s.StatusKey == "ISSUED")
@@ -4561,8 +4946,11 @@ public class SalesController : ApiControllerBase
         decimal TaxPercent { get; }
     }
 
+    /* BasePrice (30 Sep): the original price per unit the margin sits on --
+       optional, so every older caller and positional construction still works. */
     public record OrderLineRequest(
-        int ProductId, int Qty, decimal Rate, decimal DiscountPercent, decimal TaxPercent) : ILine;
+        int ProductId, int Qty, decimal Rate, decimal DiscountPercent, decimal TaxPercent,
+        decimal? BasePrice = null) : ILine;
 
     /* LocationId is NULLABLE, and SalesPersonUserId is IGNORED.
 

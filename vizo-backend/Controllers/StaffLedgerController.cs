@@ -163,7 +163,7 @@ public class StaffLedgerController : ApiControllerBase
 
             var total = await shaped.CountAsync();
             var totalPayable = await shaped.SumAsync(x => (decimal?)x.balance) ?? 0m;
-            var items = await shaped.OrderBy(x => x.name).Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
+            var items = await shaped.OrderByDescending(x => x.id).Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
 
             return Ok(new { total, page, pageSize, totalPayable, items });
         }

@@ -40,7 +40,7 @@ public class NotificationController : ControllerBase
 
             var items = await _db.Notifications
                 .Where(n => n.UserId == me)
-                .OrderByDescending(n => n.CreatedAt)
+                .OrderByDescending(n => n.CreatedAt).ThenByDescending(n => n.NotificationId)
                 .Take(take)
                 .Select(n => new
                 {

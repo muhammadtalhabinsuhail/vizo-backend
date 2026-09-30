@@ -132,8 +132,9 @@ public class ConfirmReminderService : BackgroundService
               $"PKR {total:N0} in total. {string.Join(", ", lead)}" +
               (rest > 0 ? $" and {rest} more." : ".");
 
+        /* The accountant may confirm too since 30 Sep, so the nudge reaches both. */
         await push.NotifyRolesAsync(
-            new[] { OrderWorkflow.RoleAdmin },
+            new[] { OrderWorkflow.RoleAdmin, OrderWorkflow.RoleAccountant },
             NotificationKinds.OrderCreated,
             due.Count == 1 ? "Order still waiting to be confirmed" : "Orders waiting to be confirmed",
             body,

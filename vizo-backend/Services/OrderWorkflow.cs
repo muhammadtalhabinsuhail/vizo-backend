@@ -99,9 +99,35 @@ public static class OrderWorkflow
         // Sales writes the order and sends it in.
         (Draft,       Submitted,   new[] { RoleSales, RoleOrderDept }),
 
-        // Only the admin decides whether it goes ahead.
-        (Submitted,   Confirmed,   new[] { RoleAdmin }),
-        (Submitted,   Declined,    new[] { RoleAdmin }),
+        /* THE ADMIN OR THE ACCOUNTANT DECIDES WHETHER IT GOES AHEAD (the
+           owner, 30 Sep: "super admin aur accountant ... in dono mein se koi
+           bhi confirmed aur invoiced kar sakta hai"). It was the admin alone,
+           which left every order waiting on one person while the accountant --
+           who bills it one step later anyway -- could only watch. */
+        (Submitted,   Confirmed,   new[] { RoleAdmin, RoleAccountant }),
+        (Submitted,   Declined,    new[] { RoleAdmin, RoleAccountant }),
+        (CreditHold,  Confirmed,   new[] { RoleAccountant }),
+
+        /* TAKING AN ORDER OFF THE CHAIN -- declined, cancelled, or put on hold
+           for crossing the customer's limit -- is the accountant's as well as
+           the admin's, up to the moment the goods leave. Before that nothing
+           physical has happened, so the bill is simply voided and its entry
+           taken out of the customer's ledger (SalesController.VoidOrderInvoice).
+           After Dispatched the stock is gone and it is a sales return instead,
+           which is why DISPATCHED and DELIVERED are not on this list. */
+        (Submitted,   CreditHold,  new[] { RoleAccountant }),
+        (Submitted,   Cancelled,   new[] { RoleAccountant }),
+        (Confirmed,   Declined,    new[] { RoleAccountant }),
+        (Confirmed,   Cancelled,   new[] { RoleAccountant }),
+        (Confirmed,   CreditHold,  new[] { RoleAccountant }),
+        (Invoiced,    Declined,    new[] { RoleAccountant }),
+        (Invoiced,    Cancelled,   new[] { RoleAccountant }),
+        (Invoiced,    CreditHold,  new[] { RoleAccountant }),
+        (AtOrderDept, Declined,    new[] { RoleAccountant }),
+        (AtOrderDept, Cancelled,   new[] { RoleAccountant }),
+        (AtOrderDept, CreditHold,  new[] { RoleAccountant }),
+        (CreditHold,  Declined,    new[] { RoleAccountant }),
+        (CreditHold,  Cancelled,   new[] { RoleAccountant }),
 
         /* BILLING IT IS THE BACK OFFICE'S JOB, NOT THE REP'S.
 
@@ -121,7 +147,7 @@ public static class OrderWorkflow
            step in between rather than four. Deliberately NOT from CONFIRMED:
            picking stock against an order the office has not yet billed is how
            goods leave with no invoice behind them. */
-        (Invoiced,    AtOrderDept, new[] { RoleOrderDept }),
+        (Invoiced,    AtOrderDept, new[] { RoleOrderDept, RoleAccountant }),
 
         /* THE PACKING SCREEN DISPATCHES DIRECTLY FROM INVOICED, SKIPPING THE
            STOP AT AT_ORDER_DEPT.
@@ -272,9 +298,11 @@ public static class OrderWorkflow
         string statusKey, string orderNo, string customer, string actor)
         => statusKey switch
         {
+            /* Both approvers hear about a new order, because either may now
+               confirm it (the owner, 30 Sep). */
             Submitted => (NotificationKinds.OrderCreated,
-                new[] { RoleAdmin },
-                $"Order submitted by {actor}",
+                new[] { RoleAdmin, RoleAccountant },
+                $"New order from {actor}",
                 $"{orderNo} -- {customer}. Waiting for you to confirm or decline it."),
 
             Confirmed => (NotificationKinds.OrderConfirmed,
@@ -305,13 +333,21 @@ public static class OrderWorkflow
                 $"Order invoiced by {actor}",
                 $"{orderNo} -- {customer} has been invoiced. The order department can pick it."),
 
-            /* The order desk has it and is working on it. The rep wants to be
-               able to tell the customer; the rep is added by the caller through
+            /* "PROCESSING IN ORDER DEPT" IS THE ORDER DESK'S CUE (the owner,
+               30 Sep): the admin or the accountant sets it, and the desk must
+               be told, because that is what puts the order on its Packing
+               screen as "Ready for packing". The rep wants to be able to tell
+               the customer; the rep is added by the caller through
                alsoUserIds. */
             AtOrderDept => (NotificationKinds.OrderPacked,
-                new[] { RoleAdmin, RoleSales },
-                $"Order taken up by {actor}",
-                $"{orderNo} -- {customer} is being processed in the order department."),
+                new[] { RoleAdmin, RoleOrderDept, RoleSales },
+                $"Ready for packing -- sent by {actor}",
+                $"{orderNo} -- {customer} is ready for packing in the order department."),
+
+            Cancelled => (NotificationKinds.OrderConfirmed,
+                new[] { RoleAdmin, RoleAccountant, RoleSales },
+                $"Order cancelled by {actor}",
+                $"{orderNo} -- {customer} was cancelled."),
 
             Dispatched => (NotificationKinds.OrderDispatched,
                 new[] { RoleAdmin, RoleSales, RoleAccountant },

@@ -37,7 +37,7 @@ public class AdminCouriersController : AdminControllerBase
         try
         {
             return Ok(await _db.Couriers
-                    .OrderBy(c => c.CourierId)
+                    .OrderByDescending(c => c.CourierId)
                     .Select(c => new
                     {
                         id = c.CourierId,

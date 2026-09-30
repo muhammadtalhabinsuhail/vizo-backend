@@ -61,7 +61,7 @@ public class AdminAuditLogController : AdminControllerBase
             var total = await query.CountAsync();
 
             var items = await query
-                .OrderByDescending(a => a.LoggedAt)
+                .OrderByDescending(a => a.LoggedAt).ThenByDescending(a => a.LogId)
                 .Skip((page - 1) * pageSize).Take(pageSize)
                 .Select(a => new
                 {

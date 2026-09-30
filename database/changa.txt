@@ -90,6 +90,13 @@
  G11 When the old-system (FoxPro) customer file is ready: Customer Ledgers ->
      Import -> download the template, fill it, upload, check the preview, import.
 
+ G13 (30 Sep) BEFORE THE NEXT API DEPLOY run on live:
+       42_accountant_approves_and_seen_markers.sql
+     It gives the accountant orders.approve, creates UserSeenMarker (the sidebar
+     badges) and adds SalesOrderItem.BasePrice. Without it the API's badge,
+     order-create and order-detail calls fail. Safe to run twice. Everyone signs
+     out and back in afterwards (the accountant's new right rides in the token).
+
  G12 (27 Sep, rounds D/E -- details at the top of NOTES-d/e1/e2/e3.md)
        - STAFF PASSWORDS: 7 of 11 staff still sign in with Vizo@1234, the other
          4 with the seed passwords. Set a temporary password per person

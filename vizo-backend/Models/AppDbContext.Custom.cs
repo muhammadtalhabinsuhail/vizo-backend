@@ -254,6 +254,17 @@ public partial class AppDbContext
                they went to. See Models/SalesInvoice.Custom.cs and
                database/18_sales_scope_returns_and_places.sql. */
             entity.Property(e => e.PdfDeliverable).HasDefaultValue(false);
+
+            /* A VOIDED BILL IS NOT A BILL (30 Sep). An order declined, cancelled
+               or held before its goods left has its invoice voided and taken
+               out of the books (SalesController.VoidOrderInvoice). Filtered
+               here, once, so that every list, report, balance, credit-limit
+               check and the "Post them now" backfill stops counting it --
+               rather than adding `!= "VOID"` to forty queries and missing one.
+               The one place that must still find it -- billing the same order
+               again, which brings the same number back -- asks with
+               IgnoreQueryFilters(). */
+            entity.HasQueryFilter(e => e.Status.StatusKey != "VOID");
         });
 
         modelBuilder.Entity<PaymentMethod>(entity =>

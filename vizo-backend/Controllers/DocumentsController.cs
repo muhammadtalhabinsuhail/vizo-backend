@@ -222,7 +222,7 @@ public class DocumentsController : ApiControllerBase
 
             var total = await rows.CountAsync();
             var items = await rows
-                .OrderByDescending(f => f.GeneratedAt)
+                .OrderByDescending(f => f.GeneratedAt).ThenByDescending(f => f.FileId)
                 .Skip((page - 1) * pageSize).Take(pageSize)
                 .Select(f => new
                 {

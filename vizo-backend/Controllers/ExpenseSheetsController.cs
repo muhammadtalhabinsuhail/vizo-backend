@@ -122,7 +122,6 @@ public class ExpenseSheetsController : ApiControllerBase
 
             var items = await rows
                 .OrderByDescending(s => s.SheetDate)
-                .ThenBy(s => s.Location.LocationName)
                 .ThenByDescending(s => s.SheetId)
                 .Skip((page - 1) * pageSize).Take(pageSize)
                 .Select(s => new

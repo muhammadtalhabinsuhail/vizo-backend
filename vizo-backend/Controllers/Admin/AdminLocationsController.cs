@@ -38,7 +38,7 @@ public class AdminLocationsController : AdminControllerBase
         {
             return Ok(await _db.Locations
                     .Where(l => includeInactive || l.IsActive)
-                    .OrderBy(l => l.LocationId)
+                    .OrderByDescending(l => l.LocationId)
                     .Select(l => new
                     {
                         id = l.LocationId,

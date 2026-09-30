@@ -108,7 +108,7 @@ public class InventoryController : ApiControllerBase
             var total = await rows.CountAsync();
 
             var items = await rows
-                .OrderBy(p => p.ProductName)
+                .OrderByDescending(p => p.CreatedAt).ThenByDescending(p => p.ProductId)
                 .Skip((page - 1) * pageSize).Take(pageSize)
                 .Select(p => new
                 {
@@ -685,7 +685,7 @@ public class InventoryController : ApiControllerBase
         try
         {
             return Ok(await _db.Categories.AsNoTracking()
-                .OrderBy(c => c.CategoryName)
+                .OrderByDescending(c => c.CategoryId)
                 .Select(c => new
                 {
                     id = c.CategoryId,
@@ -787,7 +787,7 @@ public class InventoryController : ApiControllerBase
         try
         {
             return Ok(await _db.Brands.AsNoTracking()
-                .OrderBy(b => b.BrandName)
+                .OrderByDescending(b => b.BrandId)
                 .Select(b => new
                 {
                     id = b.BrandId,

@@ -34,6 +34,24 @@ namespace vizo_backend.Controllers;
 /// from either one, so there is no long "take up the order" click this screen
 /// would otherwise be missing.
 ///
+/// EVERY ORDER IS LISTED, NOT ONLY THE READY ONES (the owner, 30 September).
+/// The desk kept being asked "where is so-and-so's order?" about orders that
+/// were not invoiced yet, and a screen that only showed the ready ones could
+/// not answer -- the order simply was not in any of the three boxes. So the
+/// dropdowns now hold every salesperson, every customer and every order, each
+/// order carrying its status, and the READY rule moved from "what is shown"
+/// to "what may be dispatched": the page refuses to dispatch anything not at
+/// INVOICED or AT_ORDER_DEPT, and so does SalesController.SetOrderStatus.
+///
+/// QUANTITIES ARE NOT THE DESK'S TO CHANGE ANY MORE (same day). The lines on
+/// this screen are read-only and an order goes out exactly as ordered; the
+/// Super Admin or the accountant corrects an order on its own edit screen.
+///
+/// NO MONEY FOR THE ORDER DESK (26 September, B's HideMoneyFromOrderDesk):
+/// the order's total and the line prices come back as 0 for the order-dept
+/// role, with moneyHidden = true, the same way DispatchController does it.
+/// The Super Admin, who can open this screen too, still sees them.
+///
 /// Controller-only by design: no DTOs, no services, no interfaces, no
 /// repositories. Every action is wrapped in try/catch and reports via Fail().
 /// </summary>
@@ -56,76 +74,88 @@ public class PackingController : ApiControllerBase
     // ══════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Only salespeople and customers who currently have something ready to
-    /// pack. A full staff list or a full customer list would be true every
-    /// day of the year and useful on none of them -- the point of these two
-    /// boxes is to narrow the third one down, and there is nothing to narrow
-    /// towards a name with an empty queue.
+    /// EVERY salesperson and EVERY customer (the owner, 30 September) -- not
+    /// only the ones with something ready to pack, which is what these two
+    /// boxes used to hold. The desk has to be able to find any order, and an
+    /// order that is not invoiced yet belongs to a rep and a shop that the
+    /// old "ready only" lists simply did not contain.
+    ///
+    /// count is still "how many are ready to pack right now" (INVOICED plus
+    /// AT_ORDER_DEPT) -- the one number the page's subtitle shows.
     /// </summary>
     [HttpGet("lookups")]
     public async Task<IActionResult> Lookups()
     {
         try
         {
-            var readyOrders = _db.SalesOrders.AsNoTracking()
-                .Where(o => Ready.Contains(o.Status.StatusKey));
-
-            var repIds = await readyOrders
-                .Where(o => o.SalesPersonUserId != null)
-                .Select(o => o.SalesPersonUserId!.Value)
-                .Distinct()
-                .ToListAsync();
-
-            /* "assigned to the sales role" -- literally. A ready order's
+            /* "assigned to the sales role" -- literally. An order's
                SalesPersonUserId is usually a rep, but not always (an order
                keyed in on somebody's behalf still carries who keyed it in),
                and this box must never offer a name that is not really a
-               salesperson. The customer list below still tags itself with
-               the order's true credited id, whatever role that person holds --
-               only the dropdown's OWN contents are narrowed here. */
+               salesperson. Every active rep, plus any rep since switched off
+               who still has orders on the books -- their orders do not stop
+               existing when they leave. (The page adds the credited person of
+               an order it opens if they are not in this list, so the box never
+               shows blank.) */
             var salesPeople = await _db.Employees.AsNoTracking()
-                .Where(e => repIds.Contains(e.UserId) && e.User.Role.RoleKey == "sales")
+                .Where(e => e.User.Role.RoleKey == OrderWorkflow.RoleSales
+                            && (e.User.IsActive || e.SalesOrders.Any()))
                 .OrderBy(e => e.User.FullName)
                 .Select(e => new { id = e.UserId, name = e.User.FullName })
                 .ToListAsync();
+            var salesIds = salesPeople.Select(r => r.id).ToHashSet();
 
-            /* One row per customer with a ready order, and EVERY rep credited
-               with one of their ready orders -- not the customer's assigned rep
-               (Party.SalesPersonUserId), which can differ from who actually
-               wrote a given order, and not always exactly one: the same shop
-               can have one order from its usual rep and another keyed in by
-               somebody else. The reverse flow ("pick the customer, the
-               salesperson sets itself") only guesses when there is exactly one
-               name to guess -- with more than one it leaves the box open and
-               the order list, filtered on the customer alone, already shows
-               every rep's order for them. */
-            var pairs = await readyOrders
+            /* Which rep(s) each customer belongs to, for the narrowing. Every
+               rep credited with one of their orders -- not only the customer's
+               assigned rep (Party.SalesPersonUserId), which can differ from
+               who actually wrote a given order, and not always exactly one:
+               the same shop can have one order from its usual rep and another
+               keyed in by somebody else. Without the order pairs, "Pack" on an
+               order written by a rep other than the assigned one would set a
+               customer the rep box then filtered out of its own list. The
+               reverse flow ("pick the customer, the salesperson sets itself")
+               only guesses when there is exactly one name to guess. */
+            var pairs = await _db.SalesOrders.AsNoTracking()
                 .Where(o => o.SalesPersonUserId != null)
-                .Select(o => new { o.CustomerUserId, o.SalesPersonUserId })
+                .Select(o => new { o.CustomerUserId, RepId = o.SalesPersonUserId!.Value })
                 .Distinct()
                 .ToListAsync();
+            var orderReps = pairs.GroupBy(x => x.CustomerUserId)
+                .ToDictionary(g => g.Key, g => g.Select(x => x.RepId).ToList());
 
-            var customerIds = pairs.Select(x => x.CustomerUserId).Distinct().ToList();
-            var names = await _db.Parties.AsNoTracking()
-                .Where(p => customerIds.Contains(p.UserId))
-                .Select(p => new { p.UserId, name = (p.DisplayName ?? p.LegalName) })
-                .ToDictionaryAsync(p => p.UserId, p => p.name);
-
-            var customers = pairs.GroupBy(x => x.CustomerUserId)
-                .Select(g => new
+            /* Every active customer (the same set the desk's New Order screen
+               offers, OrderLookups below), plus any shop that has an order at
+               all -- a customer switched off since still has orders to find. */
+            var raw = await _db.Parties.AsNoTracking()
+                .Where(p => ((p.User.RoleId == 5 || p.User.RoleId == 7) && p.User.IsActive && p.PartyCode != "VZ-C-WALKIN")
+                            || p.SalesOrders.Any())
+                .OrderBy(p => p.DisplayName ?? p.LegalName)
+                .Select(p => new
                 {
-                    id = g.Key,
-                    name = names.GetValueOrDefault(g.Key, $"Customer {g.Key}"),
-                    repIds = g.Select(x => x.SalesPersonUserId!.Value).Distinct().ToList()
+                    id = p.UserId,
+                    name = p.DisplayName ?? p.LegalName,
+                    p.SalesPersonUserId,
+                    p.CreatedByUserId
                 })
-                .OrderBy(c => c.name)
-                .ToList();
+                .ToListAsync();
+
+            var customers = raw.Select(c => new
+            {
+                c.id,
+                c.name,
+                /* Assigned rep first -- it is the one the reverse fill picks
+                   when it is the only one. */
+                repIds = new[] { c.SalesPersonUserId, c.CreatedByUserId }
+                    .Where(r => r is int v && salesIds.Contains(v)).Select(r => r!.Value)
+                    .Concat(orderReps.GetValueOrDefault(c.id) ?? new List<int>())
+                    .Distinct().ToList()
+            }).ToList();
 
             return Ok(new
             {
                 salesPeople,
                 customers,
-                count = await readyOrders.CountAsync()
+                count = await _db.SalesOrders.CountAsync(o => Ready.Contains(o.Status.StatusKey))
             });
         }
         catch (Exception ex)
@@ -138,10 +168,23 @@ public class PackingController : ApiControllerBase
     //  THE ORDER DROPDOWN
     // ══════════════════════════════════════════════════════════════════
 
+    /// <summary>How many NOT-ready orders the order dropdown carries at most. See GetPackableOrders.</summary>
+    private const int OtherOrdersCap = 300;
+
     /// <summary>
-    /// Orders ready to pack, narrowed by whichever of the two upstream boxes
-    /// is filled in. Neither is required -- an empty order dropdown with
-    /// nothing picked above it is still every order waiting on the order desk.
+    /// Every order, whatever its status (the owner, 30 September), narrowed by
+    /// whichever of the two upstream boxes is filled in. Neither is required.
+    ///
+    /// READY ONES FIRST, oldest first -- they are the queue, and the oldest has
+    /// waited longest -- then everything else, newest first. Every ready order
+    /// always comes back; the rest are capped at OtherOrdersCap, because "every
+    /// order" unnarrowed is years of history, and a dropdown of thousands is a
+    /// screen that never opens on a phone. Picking a salesperson or a customer
+    /// narrows it to what is actually looked for; truncated says the cap was
+    /// hit, so the page can say so rather than pretend the list is complete.
+    ///
+    /// Each row carries its status so the desk can tell at a glance which ones
+    /// can be packed. total is 0 for the order desk (moneyHidden).
     /// </summary>
     [HttpGet("orders")]
     public async Task<IActionResult> GetPackableOrders(
@@ -149,14 +192,35 @@ public class PackingController : ApiControllerBase
     {
         try
         {
-            var rows = _db.SalesOrders.AsNoTracking()
-                .Where(o => Ready.Contains(o.Status.StatusKey));
+            /* A local, not CurrentRole() inside a query (trap 27). */
+            var noMoney = CurrentRole() == OrderWorkflow.RoleOrderDept;
 
+            var rows = _db.SalesOrders.AsNoTracking().AsQueryable();
             if (salesPersonId is not null) rows = rows.Where(o => o.SalesPersonUserId == salesPersonId);
             if (customerId is not null) rows = rows.Where(o => o.CustomerUserId == customerId);
 
-            var items = await rows
+            /* Two cheap id queries decide WHICH orders and in what order; the
+               one heavy projection below then runs once over just those ids,
+               instead of being written out twice for the two halves. */
+            var readyIds = await rows
+                .Where(o => Ready.Contains(o.Status.StatusKey))
                 .OrderBy(o => o.OrderDate).ThenBy(o => o.OrderId)
+                .Select(o => o.OrderId)
+                .ToListAsync();
+            var otherIds = await rows
+                .Where(o => !Ready.Contains(o.Status.StatusKey))
+                .OrderByDescending(o => o.OrderDate).ThenByDescending(o => o.OrderId)
+                .Select(o => o.OrderId)
+                .Take(OtherOrdersCap + 1)
+                .ToListAsync();
+            var truncated = otherIds.Count > OtherOrdersCap;
+            if (truncated) otherIds.RemoveAt(otherIds.Count - 1);
+
+            var ids = readyIds.Concat(otherIds).ToList();
+            var position = ids.Select((id, i) => (id, i)).ToDictionary(x => x.id, x => x.i);
+
+            var fetched = await _db.SalesOrders.AsNoTracking()
+                .Where(o => ids.Contains(o.OrderId))
                 .Select(o => new
                 {
                     id = o.OrderId,
@@ -182,7 +246,18 @@ public class PackingController : ApiControllerBase
                 })
                 .ToListAsync();
 
-            return Ok(new { count = items.Count, items });
+            var items = fetched
+                .OrderBy(o => position[o.id])
+                .Select(o => new
+                {
+                    o.id, o.orderNo, o.customerId, o.customerName, o.repId, o.repName,
+                    o.status, o.statusName, o.orderDate,
+                    total = noMoney ? 0m : o.total,
+                    o.itemCount, o.totalUnits, o.thumbnails
+                })
+                .ToList();
+
+            return Ok(new { count = items.Count, ready = readyIds.Count, truncated, moneyHidden = noMoney, items });
         }
         catch (Exception ex)
         {
@@ -198,15 +273,24 @@ public class PackingController : ApiControllerBase
     /// (Product.SalePrice, what the Super Admin set), never the order line's
     /// own Rate. "The Order Department must only view the base selling price
     /// defined by the Super Admin," in the owner's own words -- a rep's margin
-    /// is not this screen's business.
+    /// is not this screen's business. For the order desk itself the price and
+    /// the total come back as 0 (moneyHidden) -- no money for the desk at all
+    /// since 26 September; the Super Admin on this screen still sees them.
+    ///
+    /// ANY STATUS since 30 September, not only the ready ones: the Pack button
+    /// on the recent list opens any order, and the page shows its lines and
+    /// its status either way. Whether it may be DISPATCHED is a separate
+    /// question, asked by the page and by SalesController.SetOrderStatus.
     /// </summary>
     [HttpGet("orders/{id:int}")]
     public async Task<IActionResult> GetPackableOrder(int id)
     {
         try
         {
+            var noMoney = CurrentRole() == OrderWorkflow.RoleOrderDept;
+
             var order = await _db.SalesOrders.AsNoTracking()
-                .Where(o => o.OrderId == id && Ready.Contains(o.Status.StatusKey))
+                .Where(o => o.OrderId == id)
                 .Select(o => new
                 {
                     id = o.OrderId,
@@ -236,15 +320,21 @@ public class PackingController : ApiControllerBase
                 .FirstOrDefaultAsync();
 
             if (order is null)
-                return NotFound(new { message = $"Order {id} is not waiting to be packed." });
+                return NotFound(new { message = $"No order with id {id}." });
 
             return Ok(new
             {
                 order.id, order.orderNo, order.customerId, order.customerName,
                 order.repId, order.repName, order.status, order.statusName,
-                order.locationId, order.orderDate, order.total,
+                order.locationId, order.orderDate,
+                total = noMoney ? 0m : order.total,
                 lineTotal = order.lines.Sum(l => (int?)l.qty) ?? 0,
-                order.lines
+                moneyHidden = noMoney,
+                lines = order.lines.Select(l => new
+                {
+                    l.orderItemId, l.productId, l.name, l.sku, l.imageUrl, l.packing, l.qty,
+                    price = noMoney ? 0m : l.price
+                }).ToList()
             });
         }
         catch (Exception ex)
@@ -265,12 +355,19 @@ public class PackingController : ApiControllerBase
     ///
     /// NO MONEY on these rows, on purpose: order no, date, salesperson,
     /// customer, status and how many items. The order desk sees no totals,
-    /// balances or payments anywhere (the same day's rule); the Packing detail
-    /// is the one place it sees a price, and that is the Super Admin's base
-    /// price, never a rep's.
+    /// balances or payments anywhere (the same day's rule). Since 30 September
+    /// the Packing detail (orders/{id}) zeroes its base prices for the desk as
+    /// well; the read-only page below (recent/{id}) still carries them.
     ///
     /// Capped at 300 rows -- a week of this business is a few dozen orders, and
     /// the cap is what stops a busy week turning into a page that never loads.
+    ///
+    /// PLUS every order sitting at AT_ORDER_DEPT, however old (30 September).
+    /// That status is the Super Admin or the accountant handing an order to
+    /// the desk -- pending work, not history -- and an order handed over on
+    /// the eighth day after it was written would otherwise never appear here
+    /// at all. The page lifts those rows into their own "Ready for packing"
+    /// group at the top of the list.
     /// </summary>
     [HttpGet("recent")]
     public async Task<IActionResult> GetRecentOrders([FromQuery] int days = 7)
@@ -281,8 +378,11 @@ public class PackingController : ApiControllerBase
             var since = Today().AddDays(-(days - 1));
 
             var items = await _db.SalesOrders.AsNoTracking()
-                .Where(o => o.CreatedAt >= since)
-                .OrderByDescending(o => o.CreatedAt).ThenByDescending(o => o.OrderId)
+                .Where(o => o.CreatedAt >= since || o.Status.StatusKey == OrderWorkflow.AtOrderDept)
+                /* Handed-over orders first, so the 300 cap can never cut the
+                   one kind of row this list must not lose. */
+                .OrderByDescending(o => o.Status.StatusKey == OrderWorkflow.AtOrderDept)
+                .ThenByDescending(o => o.CreatedAt).ThenByDescending(o => o.OrderId)
                 .Take(300)
                 .Select(o => new
                 {

@@ -122,7 +122,8 @@ public class CustomerLedgerController : ApiControllerBase
                 "balance" => shaped.OrderByDescending(x => x.balance).ThenBy(x => x.name),
                 "code" => shaped.OrderBy(x => x.code),
                 "limit" => shaped.OrderByDescending(x => x.creditLimit).ThenBy(x => x.name),
-                _ => shaped.OrderBy(x => x.name)
+                "name" => shaped.OrderBy(x => x.name).ThenByDescending(x => x.id),
+                _ => shaped.OrderByDescending(x => x.id)
             };
 
             var items = await shaped.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();

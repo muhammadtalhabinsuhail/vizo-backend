@@ -41,7 +41,7 @@ public class AdminRolesController : AdminControllerBase
         try
         {
             return Ok(await _db.Roles
-                    .OrderBy(r => r.RoleId)
+                    .OrderByDescending(r => r.RoleId)
                     .Select(r => new
                     {
                         id = r.RoleId,

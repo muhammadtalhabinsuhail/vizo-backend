@@ -2,6 +2,22 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
+ 30 SEPTEMBER -- found and NOT changed:
+   - /packing/orders/[id] (the read-only order page the Packing list links to)
+     still shows base prices and a "Total at base price" to the order desk.
+   - The Super Admin can still edit a DISPATCHED order; a quantity cut there
+     does not return stock, and DispatchedQty is lost when lines are rewritten.
+   - Lowering an invoiced order's total does not trim receipts already
+     allocated to its invoice (the customer ends up with credit; correct in
+     sum, untidy per invoice).
+   - A customer has no "created by", so the new-customers badge also counts
+     customers the viewer created.
+   - Credit-hold and order-change-request queues were flipped to newest first
+     with the other lists; the Dispatch queue stays by due date. Say if either
+     should go back.
+   - The Packing salesperson box lists sales-role people; an order keyed by the
+     admin or the desk shows its creator only when picked with Pack.
+
  27 SEPTEMBER (rounds D, E1, E2, E3 — Confirm Collections, the Account List,
  printing, sign-in/backups, delivery/visits/reports, the app shell): what was
  found and not changed is in the "Found, not changed" section of NOTES-d.md,

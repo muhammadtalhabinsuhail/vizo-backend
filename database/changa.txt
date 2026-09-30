@@ -91,7 +91,7 @@
      Import -> download the template, fill it, upload, check the preview, import.
 
  G13 (30 Sep) DONE 30 Sep 15:11 on live Neon, after a backup
-     (D:\Maindvpos-testdb\LIVE-BACKUP-before-migration42-2026-09-30_1511.dump)
+     (D:\Main\advpos-testdb\LIVE-BACKUP-before-migration42-2026-09-30_1511.dump)
      and a rehearsal on a restore of it. It was:
        42_accountant_approves_and_seen_markers.sql
      It gives the accountant orders.approve, creates UserSeenMarker (the sidebar

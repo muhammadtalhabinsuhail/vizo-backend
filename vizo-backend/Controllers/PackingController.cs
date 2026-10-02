@@ -29,10 +29,10 @@ namespace vizo_backend.Controllers;
 /// desk adjust (SalesController.SetOrderStatus). One action that changes an
 /// order's status belongs in one place.
 ///
-/// "READY TO PACK" means the order sits at INVOICED or AT_ORDER_DEPT. Both are
-/// offered, on purpose: OrderWorkflow now lets the order desk dispatch straight
-/// from either one, so there is no long "take up the order" click this screen
-/// would otherwise be missing.
+/// "READY TO PACK" means the order sits at AT_ORDER_DEPT for the order desk
+/// (since 2 October -- the Super Admin or the accountant hands it over), and at
+/// INVOICED or AT_ORDER_DEPT for the Super Admin and the accountant. See
+/// ReadyFor.
 ///
 /// EVERY ORDER IS LISTED, NOT ONLY THE READY ONES (the owner, 30 September).
 /// The desk kept being asked "where is so-and-so's order?" about orders that
@@ -40,8 +40,9 @@ namespace vizo_backend.Controllers;
 /// not answer -- the order simply was not in any of the three boxes. So the
 /// dropdowns now hold every salesperson, every customer and every order, each
 /// order carrying its status, and the READY rule moved from "what is shown"
-/// to "what may be dispatched": the page refuses to dispatch anything not at
-/// INVOICED or AT_ORDER_DEPT, and so does SalesController.SetOrderStatus.
+/// to "what may be dispatched": the page refuses to dispatch anything that is
+/// not ready for the person asking (ReadyFor), and so does
+/// SalesController.SetOrderStatus.
 ///
 /// QUANTITIES ARE NOT THE DESK'S TO CHANGE ANY MORE (same day). The lines on
 /// this screen are read-only and an order goes out exactly as ordered; the
@@ -66,8 +67,25 @@ public class PackingController : ApiControllerBase
     {
     }
 
-    /// <summary>The two statuses this screen will pick an order up from. See the class comment.</summary>
-    private static readonly string[] Ready = { OrderWorkflow.Invoiced, OrderWorkflow.AtOrderDept };
+    /// <summary>
+    /// The statuses this screen counts as READY TO PACK, for the person asking.
+    ///
+    /// Since 2 October the order department may pack and dispatch only an order
+    /// the Super Admin or the accountant has moved on to AT_ORDER_DEPT
+    /// ("Processing in Order Dept") -- an INVOICED order is billed but not yet
+    /// handed over, and SalesController.SetOrderStatus refuses the desk on it.
+    /// So for the desk "ready" is that one status, and the subtitle count, the
+    /// "ready to pack" group of the order box and its ordering all agree with
+    /// what the dispatch will actually accept. The Super Admin and the
+    /// accountant may still send an INVOICED order straight out, so for them
+    /// both statuses count, as before.
+    ///
+    /// Read into a local before any query that uses it (trap 27: no
+    /// CurrentRole() inside an expression EF has to translate).
+    /// </summary>
+    private string[] ReadyFor() => CurrentRole() == OrderWorkflow.RoleOrderDept
+        ? new[] { OrderWorkflow.AtOrderDept }
+        : new[] { OrderWorkflow.Invoiced, OrderWorkflow.AtOrderDept };
 
     // ══════════════════════════════════════════════════════════════════
     //  LOOKUPS -- the sales and customer dropdowns
@@ -80,8 +98,8 @@ public class PackingController : ApiControllerBase
     /// order that is not invoiced yet belongs to a rep and a shop that the
     /// old "ready only" lists simply did not contain.
     ///
-    /// count is still "how many are ready to pack right now" (INVOICED plus
-    /// AT_ORDER_DEPT) -- the one number the page's subtitle shows.
+    /// count is still "how many are ready to pack right now" -- for the person
+    /// asking (ReadyFor) -- the one number the page's subtitle shows.
     /// </summary>
     [HttpGet("lookups")]
     public async Task<IActionResult> Lookups()
@@ -151,11 +169,12 @@ public class PackingController : ApiControllerBase
                     .Distinct().ToList()
             }).ToList();
 
+            var ready = ReadyFor();
             return Ok(new
             {
                 salesPeople,
                 customers,
-                count = await _db.SalesOrders.CountAsync(o => Ready.Contains(o.Status.StatusKey))
+                count = await _db.SalesOrders.CountAsync(o => ready.Contains(o.Status.StatusKey))
             });
         }
         catch (Exception ex)
@@ -194,6 +213,7 @@ public class PackingController : ApiControllerBase
         {
             /* A local, not CurrentRole() inside a query (trap 27). */
             var noMoney = CurrentRole() == OrderWorkflow.RoleOrderDept;
+            var ready = ReadyFor();
 
             var rows = _db.SalesOrders.AsNoTracking().AsQueryable();
             if (salesPersonId is not null) rows = rows.Where(o => o.SalesPersonUserId == salesPersonId);
@@ -203,12 +223,12 @@ public class PackingController : ApiControllerBase
                one heavy projection below then runs once over just those ids,
                instead of being written out twice for the two halves. */
             var readyIds = await rows
-                .Where(o => Ready.Contains(o.Status.StatusKey))
+                .Where(o => ready.Contains(o.Status.StatusKey))
                 .OrderBy(o => o.OrderDate).ThenBy(o => o.OrderId)
                 .Select(o => o.OrderId)
                 .ToListAsync();
             var otherIds = await rows
-                .Where(o => !Ready.Contains(o.Status.StatusKey))
+                .Where(o => !ready.Contains(o.Status.StatusKey))
                 .OrderByDescending(o => o.OrderDate).ThenByDescending(o => o.OrderId)
                 .Select(o => o.OrderId)
                 .Take(OtherOrdersCap + 1)

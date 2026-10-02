@@ -158,7 +158,7 @@ public class DeliveryController : ApiControllerBase
                    collected, and it has collected nothing until the goods are
                    handed over -- carrying COD, not settled, back office only. */
                 canConfirm = d.deliveredDate == null && d.status != "RETURNED_TO_SENDER" &&
-                             (role == d.confirmedByRole || role == OrderWorkflow.RoleAdmin),
+                             MayConfirm(role, d.confirmedByRole),
                 canSettleCod = mayHandleCod && d.deliveredDate != null && d.codAmount > 0 && !d.codSettled
             }).ToList();
 
@@ -215,6 +215,20 @@ public class DeliveryController : ApiControllerBase
     /// for it -- and moves the ORDER to Delivered with it, so the order screen
     /// and the delivery screen stop disagreeing about the same parcel.
     /// </summary>
+    /// <summary>
+    /// Who may mark a delivery delivered. The channel names its confirmer
+    /// (DeliveryChannel.ConfirmedByRole) and the Super Admin may always -- but
+    /// NEVER the order department (the owner, 2 Oct: "Mark Delivered ka status
+    /// order department update nahi kar sakta"). The three channels that name
+    /// the order department as their confirmer are taken over by the
+    /// accountant, so none of them is left with nobody able to confirm.
+    /// </summary>
+    private static bool MayConfirm(string role, string channelConfirmer) =>
+        role == OrderWorkflow.RoleAdmin ||
+        (role != OrderWorkflow.RoleOrderDept &&
+         (role == channelConfirmer ||
+          (channelConfirmer == OrderWorkflow.RoleOrderDept && role == OrderWorkflow.RoleAccountant)));
+
     [HttpPost("{id:int}/confirm")]
     public async Task<IActionResult> ConfirmDelivery(int id, [FromBody] ConfirmDeliveryRequest? body)
     {
@@ -235,12 +249,14 @@ public class DeliveryController : ApiControllerBase
             var myRole = User.FindFirst(System.Security.Claims.ClaimTypes.Role)?.Value;
             var owner = delivery.Channel.ConfirmedByRole.RoleKey;
 
-            if (myRole != owner && myRole != "super-admin")
+            if (!MayConfirm(myRole ?? "", owner))
                 return StatusCode(403, new
                 {
-                    message = $"{delivery.Channel.ChannelName} deliveries are confirmed by " +
-                              $"{delivery.Channel.ConfirmedByRole.RoleName}, not by you.",
-                    requiredRole = owner
+                    message = myRole == OrderWorkflow.RoleOrderDept
+                        ? "The order department cannot mark a delivery as delivered. The accountant or the Super Admin does."
+                        : $"{delivery.Channel.ChannelName} deliveries are confirmed by " +
+                          $"{(owner == OrderWorkflow.RoleOrderDept ? "the accountant" : delivery.Channel.ConfirmedByRole.RoleName)}, not by you.",
+                    requiredRole = owner == OrderWorkflow.RoleOrderDept ? OrderWorkflow.RoleAccountant : owner
                 });
 
             /* The day it arrived: not in the future, and not before it left. */

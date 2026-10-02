@@ -240,43 +240,12 @@ public class DispatchController : ApiControllerBase
             if (order.Deliveries.Any())
                 return BadRequest(new { message = $"{order.OrderNo} already has a delivery booked." });
 
-            var channel = await _db.DeliveryChannels
-                .FirstOrDefaultAsync(c => c.ChannelId == body.ChannelId && c.IsActive);
-            if (channel is null) return BadRequest(new { message = "Pick a valid delivery channel." });
-
-            if (channel.RequiresBilty && string.IsNullOrWhiteSpace(body.TrackingNo))
-                return BadRequest(new
-                {
-                    message = $"{channel.ChannelName} needs a bilty or tracking number before it can be booked."
-                });
-
-            if (body.CourierId is not null &&
-                !await _db.Couriers.AnyAsync(c => c.CourierId == body.CourierId && c.IsActive))
-                return BadRequest(new { message = "Pick a valid courier." });
-
-            /* The desk books without seeing money, so it cannot type the COD:
-               for it the server charges exactly what the queue would have
-               suggested -- whatever is unpaid on the order, nothing on credit. */
-            var codAmount = body.CodAmount;
-            if (CurrentRole() == OrderWorkflow.RoleOrderDept)
-            {
-                var o = await _db.SalesOrders.AsNoTracking().Where(x => x.OrderId == id)
-                    .Select(x => new
-                    {
-                        method = x.Method.MethodKey,
-                        total = x.TotalAmount,
-                        paid = x.CollectionAllocations
-                            .Where(a => a.Collection.Status.StatusKey == "CONFIRMED")
-                            .Sum(a => (decimal?)a.Amount) ?? 0m
-                    })
-                    .FirstAsync();
-                codAmount = SuggestedCod(o.method, o.total, o.paid);
-            }
-
-            if (body.Parcels < 1)
-                return BadRequest(new { message = "A dispatch needs at least one parcel." });
-            if (codAmount < 0)
-                return BadRequest(new { message = "COD cannot be negative." });
+            /* The checks live in CheckBooking since 2 October, so that editing a
+               booked delivery (UpdateDelivery, below) refuses exactly what
+               booking refuses -- including the order desk's COD rule. */
+            var (channel, codAmount, problem) = await CheckBooking(id, body, null);
+            if (problem is not null || channel is null)
+                return BadRequest(new { message = problem ?? "Pick a valid delivery channel." });
 
             var booked = await _db.DeliveryStatuses.FirstOrDefaultAsync(s => s.StatusKey == "BOOKED");
             if (booked is null)
@@ -343,6 +312,299 @@ public class DispatchController : ApiControllerBase
         catch (Exception ex)
         {
             return Fail(ex, $"dispatch order {id}");
+        }
+    }
+
+    /// <summary>
+    /// The checks a booking has to pass, shared by booking (Dispatch) and by
+    /// editing a booking (UpdateDelivery) so the two can never drift apart.
+    /// Returns the channel, the COD that will actually be written, and the
+    /// sentence to refuse with (null when it passes).
+    ///
+    /// THE ORDER DESK'S COD. The desk books without seeing money, so it cannot
+    /// type the COD:
+    ///   - booking: the server charges exactly what the queue would have
+    ///     suggested -- whatever is unpaid on the order, nothing on credit;
+    ///   - editing (existingCod given): the figure already on the delivery is
+    ///     KEPT. The desk opened the form to fix a bilty or a parcel count, and
+    ///     re-working the COD behind its back would silently overwrite a figure
+    ///     the Super Admin or the accountant may have set on purpose. Whoever
+    ///     can see money changes the COD; the desk never does, in either
+    ///     direction.
+    /// </summary>
+    private async Task<(DeliveryChannel? channel, decimal cod, string? problem)> CheckBooking(
+        int orderId, DispatchRequest body, decimal? existingCod)
+    {
+        var channel = await _db.DeliveryChannels
+            .FirstOrDefaultAsync(c => c.ChannelId == body.ChannelId && c.IsActive);
+        if (channel is null) return (null, 0m, "Pick a valid delivery channel.");
+
+        if (channel.RequiresBilty && string.IsNullOrWhiteSpace(body.TrackingNo))
+            return (null, 0m, $"{channel.ChannelName} needs a bilty or tracking number before it can be booked.");
+
+        if (body.CourierId is not null &&
+            !await _db.Couriers.AnyAsync(c => c.CourierId == body.CourierId && c.IsActive))
+            return (null, 0m, "Pick a valid courier.");
+
+        var codAmount = body.CodAmount;
+        if (CurrentRole() == OrderWorkflow.RoleOrderDept)
+        {
+            if (existingCod is not null)
+            {
+                codAmount = existingCod.Value;
+            }
+            else
+            {
+                var o = await _db.SalesOrders.AsNoTracking().Where(x => x.OrderId == orderId)
+                    .Select(x => new
+                    {
+                        method = x.Method.MethodKey,
+                        total = x.TotalAmount,
+                        paid = x.CollectionAllocations
+                            .Where(a => a.Collection.Status.StatusKey == "CONFIRMED")
+                            .Sum(a => (decimal?)a.Amount) ?? 0m
+                    })
+                    .FirstAsync();
+                codAmount = SuggestedCod(o.method, o.total, o.paid);
+            }
+        }
+
+        if (body.Parcels < 1) return (null, 0m, "A dispatch needs at least one parcel.");
+        if (codAmount < 0) return (null, 0m, "COD cannot be negative.");
+
+        return (channel, codAmount, null);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ONE ORDER, FOR THE "HOW IS IT GOING" FORM -- and editing its booking
+    // ══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// One order in the same shape the queue (GetDispatchQueue) gives each row
+    /// -- so the booking form (components/delivery/dispatch-sheet.tsx) opens
+    /// on it with no second shape to maintain -- but for ANY status, plus the
+    /// delivery already booked against it, if there is one.
+    ///
+    /// Why it exists (the owner, 2 October): on the Packing page, Next used to
+    /// dispatch the order on the spot and only THEN show the booking form. Now
+    /// Next only opens the form, and the order is dispatched when the form's
+    /// own Dispatch button is pressed -- so the form has to open on an order
+    /// that is still at "Processing in Order Dept", which the queue (dispatched
+    /// orders only) does not carry. And the Packing page's Edit button reopens
+    /// the same form on a dispatched order, filled in from `delivery`.
+    ///
+    /// No money for the order desk, exactly as the queue: totals, paid and the
+    /// suggested COD are zero, and so is the booked COD; collectsCash still
+    /// says whether anything is to be taken at the door.
+    /// </summary>
+    [HttpGet("orders/{id:int}")]
+    public async Task<IActionResult> GetDispatchOrder(int id)
+    {
+        try
+        {
+            var o = await _db.SalesOrders.AsNoTracking()
+                .Where(x => x.OrderId == id)
+                .Select(x => new
+                {
+                    id = x.OrderId,
+                    orderNo = x.OrderNo,
+                    status = x.Status.StatusKey,
+                    statusName = x.Status.StatusName,
+                    customerId = x.CustomerUserId,
+                    customerName = (x.CustomerUser.DisplayName ?? x.CustomerUser.LegalName),
+                    customerPhone = x.CustomerUser.User.Phone,
+                    address = x.CustomerUser.AddressLine,
+                    city = x.CustomerUser.City.CityName,
+                    cityId = x.CustomerUser.CityId,
+                    province = x.CustomerUser.City.Province.ProvinceName,
+                    locationId = x.LocationId,
+                    locationCityId = x.Location.CityId,
+                    location = x.Location.LocationName,
+                    orderDate = x.OrderDate,
+                    deliveryDate = x.DeliveryDate,
+                    total = x.TotalAmount,
+                    paymentMethod = x.Method.MethodKey,
+                    itemCount = x.SalesOrderItems.Count,
+                    totalUnits = x.SalesOrderItems.Sum(i => (int?)i.Quantity) ?? 0,
+                    invoiceId = x.SalesInvoice != null ? (int?)x.SalesInvoice.InvoiceId : null,
+                    invoiceNo = x.SalesInvoice != null ? x.SalesInvoice.InvoiceNo : null,
+                    paidAmount = x.CollectionAllocations
+                        .Where(a => a.Collection.Status.StatusKey == "CONFIRMED")
+                        .Sum(a => (decimal?)a.Amount) ?? 0m
+                })
+                .FirstOrDefaultAsync();
+
+            if (o is null) return NotFound(new { message = $"No order with id {id}." });
+
+            /* The latest delivery -- an order normally has at most one (Dispatch
+               refuses a second), but a parcel returned to sender and re-sent
+               would leave two, and it is the newest one that is being edited. */
+            var d = await _db.Deliveries.AsNoTracking()
+                .Where(x => x.OrderId == id)
+                .OrderByDescending(x => x.DeliveryId)
+                .Select(x => new
+                {
+                    id = x.DeliveryId,
+                    deliveryNo = x.DeliveryNo,
+                    channelId = x.ChannelId,
+                    courierId = x.CourierId,
+                    trackingNo = x.TrackingNo,
+                    bookedDate = x.BookedDate,
+                    expectedDate = x.ExpectedDate,
+                    deliveredDate = x.DeliveredDate,
+                    parcels = x.Parcels,
+                    weightKg = x.WeightKg,
+                    codAmount = x.CodAmount,
+                    isCodSettled = x.IsCodSettled,
+                    bookingCharge = x.BookingCharge,
+                    notes = x.Notes,
+                    statusKey = x.Status.StatusKey,
+                    statusName = x.Status.StatusName,
+                    isOpen = x.Status.IsOpen
+                })
+                .FirstOrDefaultAsync();
+
+            var noMoney = CurrentRole() == OrderWorkflow.RoleOrderDept;
+            var suggest = await SuggestChannels(new List<(int cityId, int locationCityId)> { (o.cityId, o.locationCityId) });
+            var today = Today();
+
+            return Ok(new
+            {
+                o.id,
+                o.orderNo,
+                o.status,
+                o.statusName,
+                o.customerId,
+                o.customerName,
+                customerInitials = Initials(o.customerName),
+                o.customerPhone,
+                o.address,
+                o.city,
+                o.province,
+                o.locationId,
+                o.location,
+                o.orderDate,
+                o.deliveryDate,
+                total = noMoney ? 0m : o.total,
+                o.paymentMethod,
+                o.itemCount,
+                o.totalUnits,
+                o.invoiceId,
+                o.invoiceNo,
+                paidAmount = noMoney ? 0m : o.paidAmount,
+                suggestedCod = noMoney ? 0m : SuggestedCod(o.paymentMethod, o.total, o.paidAmount),
+                collectsCash = SuggestedCod(o.paymentMethod, o.total, o.paidAmount) > 0,
+                suggestedChannelId = suggest(o.cityId, o.locationCityId),
+                waitingDays = today.DayNumber - o.orderDate.DayNumber,
+                isLate = o.deliveryDate != null && o.deliveryDate < today,
+                moneyHidden = noMoney,
+                delivery = d is null ? null : new
+                {
+                    d.id,
+                    d.deliveryNo,
+                    d.channelId,
+                    d.courierId,
+                    d.trackingNo,
+                    d.bookedDate,
+                    d.expectedDate,
+                    d.deliveredDate,
+                    d.parcels,
+                    d.weightKg,
+                    codAmount = noMoney ? 0m : d.codAmount,
+                    d.isCodSettled,
+                    bookingCharge = noMoney ? 0m : d.bookingCharge,
+                    d.notes,
+                    d.statusKey,
+                    d.statusName,
+                    /* The same three refusals UpdateDelivery makes, so the page
+                       can say so before the form is even opened. */
+                    editable = d.isOpen && d.deliveredDate == null && !d.isCodSettled
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"load order {id} for dispatch");
+        }
+    }
+
+    /// <summary>
+    /// Changes the details of a delivery that is already booked -- the
+    /// Packing page's Edit button (the owner, 2 October): channel, carrier,
+    /// bilty / tracking, expected date, parcels, weight, booking charge, note,
+    /// and the COD for whoever may see money.
+    ///
+    /// ONLY THE PAPERWORK. The order's status is not touched (it stays
+    /// DISPATCHED), no stock moves, no second delivery is created, and nobody
+    /// is told the order "has been dispatched" again. The booked date stays
+    /// the day it was booked -- the form has no such field, and editing a
+    /// tracking number on Thursday does not mean the parcel left on Thursday.
+    ///
+    /// Refused once the delivery is closed: confirmed delivered, returned to
+    /// sender, or its COD settled -- by then the record is evidence (who
+    /// signed, what the courier paid over), not a booking to correct. The
+    /// validation is the booking's own (CheckBooking), and the order desk still
+    /// never sets the COD: its edit keeps the figure already on the delivery.
+    /// </summary>
+    [HttpPut("deliveries/{deliveryId:int}")]
+    public async Task<IActionResult> UpdateDelivery(int deliveryId, [FromBody] DispatchRequest body)
+    {
+        try
+        {
+            var delivery = await _db.Deliveries
+                .Include(d => d.Status)
+                .Include(d => d.Order).ThenInclude(o => o.Status)
+                .FirstOrDefaultAsync(d => d.DeliveryId == deliveryId);
+
+            if (delivery is null) return NotFound(new { message = $"No delivery with id {deliveryId}." });
+            if (delivery.DeliveredDate is not null || delivery.Status.StatusKey == "DELIVERED")
+                return BadRequest(new { message = $"{delivery.DeliveryNo} has already been delivered, so its details can no longer be changed." });
+            if (!delivery.Status.IsOpen)
+                return BadRequest(new { message = $"{delivery.DeliveryNo} is {delivery.Status.StatusName.ToLowerInvariant()}, so its details can no longer be changed." });
+            if (delivery.IsCodSettled)
+                return BadRequest(new { message = $"The COD on {delivery.DeliveryNo} has been settled, so its details can no longer be changed." });
+            if (delivery.Order.Status.StatusKey != OrderWorkflow.Dispatched)
+                return BadRequest(new
+                {
+                    message = $"{delivery.Order.OrderNo} is {delivery.Order.Status.StatusName.ToLowerInvariant()}, " +
+                              "so its delivery can no longer be changed here."
+                });
+
+            var (channel, codAmount, problem) = await CheckBooking(delivery.OrderId, body, delivery.CodAmount);
+            if (problem is not null || channel is null)
+                return BadRequest(new { message = problem ?? "Pick a valid delivery channel." });
+
+            delivery.ChannelId = channel.ChannelId;
+            delivery.CourierId = body.CourierId;
+            delivery.TrackingNo = string.IsNullOrWhiteSpace(body.TrackingNo) ? null : body.TrackingNo.Trim();
+            delivery.ExpectedDate = body.ExpectedDate;
+            delivery.Parcels = body.Parcels;
+            delivery.WeightKg = body.WeightKg;
+            delivery.CodAmount = codAmount;
+            /* The booking charge is the courier's own figure the form sends with
+               the carrier picked -- a carrier changed here brings its charge with
+               it, the same as at booking. */
+            delivery.BookingCharge = body.BookingCharge;
+            delivery.Notes = string.IsNullOrWhiteSpace(body.Notes) ? null : body.Notes.Trim();
+
+            await _db.SaveChangesAsync();
+
+            await Log("DELIVERY_UPDATED", "Delivery", delivery.DeliveryNo,
+                $"{delivery.Order.OrderNo}: {channel.ChannelName}" +
+                $"{(delivery.TrackingNo is null ? "" : $" / {delivery.TrackingNo}")}, " +
+                $"{delivery.Parcels} {(delivery.Parcels == 1 ? "parcel" : "parcels")}", 1);
+
+            return Ok(new
+            {
+                id = delivery.OrderId,
+                deliveryId = delivery.DeliveryId,
+                deliveryNo = delivery.DeliveryNo,
+                message = $"{delivery.DeliveryNo} updated -- {delivery.Order.OrderNo} going via {channel.ChannelName}."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"update delivery {deliveryId}");
         }
     }
 

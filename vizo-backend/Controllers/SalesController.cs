@@ -1849,6 +1849,14 @@ public class SalesController : ApiControllerBase
                     or OrderWorkflow.Confirmed or OrderWorkflow.CreditHold)
                 return BadRequest(new { message = "This order is not invoiced by super admin or accountant" });
 
+            /* ...AND ONLY WHAT HAS BEEN RELEASED TO IT (the owner, 2 Oct): an
+               invoiced order waits until the admin or the accountant sets
+               "Processing in Order Dept"; only then may the desk pack it. */
+            if (role == OrderWorkflow.RoleOrderDept &&
+                status.StatusKey is OrderWorkflow.Dispatched or OrderWorkflow.AtOrderDept &&
+                current.StatusKey == OrderWorkflow.Invoiced)
+                return BadRequest(new { message = "This order has not been moved to Processing in Order Dept by super admin or accountant" });
+
             if (!OrderWorkflow.CanMove(role, current.StatusKey, status.StatusKey))
                 return StatusCode(403, new
                 {

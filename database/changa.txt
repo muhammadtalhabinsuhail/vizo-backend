@@ -90,6 +90,15 @@
  G11 When the old-system (FoxPro) customer file is ready: Customer Ledgers ->
      Import -> download the template, fill it, upload, check the preview, import.
 
+ G14 (2 Oct) BEFORE THE NEXT API DEPLOY run on live:
+       43_collection_deposit_account.sql
+     (adds "Collection"."DepositAccountId"; the new Collect modal writes it).
+     After the deploy, as Super Admin: Setup -> Couriers. Open every courier in
+     "No parent category" or marked "Also under ..." and pick its ONE category
+     (Karachi own team / Online / Local cargo / Heavy logistics). On the copy:
+     courier 8 (Pak International Cargo) was under both Local cargo and Heavy
+     logistics. The dispatch form lists a courier only under its category.
+
  G13 (30 Sep) DONE 30 Sep 15:11 on live Neon, after a backup
      (D:\Main\advpos-testdb\LIVE-BACKUP-before-migration42-2026-09-30_1511.dump)
      and a rehearsal on a restore of it. It was:

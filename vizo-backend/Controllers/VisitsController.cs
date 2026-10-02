@@ -304,8 +304,9 @@ public class VisitsController : ApiControllerBase
             var visitDay = DateOnly.FromDateTime(visitedAt);
             if (body.NextFollowUpDate is DateOnly next && next < visitDay)
                 return BadRequest(new { message = "The follow-up cannot be before the visit." });
-            if (outcome.OutcomeKey == "FOLLOWUP" && body.NextFollowUpDate is null)
-                return BadRequest(new { message = "A follow-up needs the date you will go back." });
+            /* "Go back on" is off the Log Visit form (the owner, 2 Oct), so a
+               Follow-up visit no longer has to carry a date. One sent by an
+               older screen is still kept. */
 
             /* WHERE. Optional -- a phone that refuses location must not stop the
                log -- but when it is sent it has to be a real place on the globe. */

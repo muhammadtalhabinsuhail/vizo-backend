@@ -199,6 +199,9 @@ public class CollectionDeskController : ApiControllerBase
                 receipts,
                 account,
                 methods = await ReceivingMethodsAsync(),
+                /* Every Cash & Bank account in the chart -- what the Collect
+                   modal now offers (the owner, 2 Oct). */
+                accounts = await CashBankAccountsAsync(),
                 collectors = await CollectorsAsync(),
                 defaultCollectorId = await _db.SalesOrders.AsNoTracking().Where(o => o.OrderId == orderId)
                     .Select(o => _db.Employees.Any(e => e.UserId == o.SalesPersonUserId) ? (int?)o.SalesPersonUserId : null)
@@ -259,6 +262,44 @@ public class CollectionDeskController : ApiControllerBase
         return result;
     }
 
+    /* THE ACCOUNTS MONEY CAN BE RECEIVED INTO (the owner, 2 Oct): every active,
+       postable account whose type is "Cash & Bank", from the chart itself -- a
+       bank added on the Account List shows here with no code change. It
+       replaces the fixed method list on the Collect modal. */
+    private const string CashBankType = "Cash & Bank";
+
+    private async Task<List<CashBankAccount>> CashBankAccountsAsync() =>
+        (await _db.Accounts.AsNoTracking()
+            .Where(a => a.IsActive && !a.IsGroup && a.AccountType.TypeName == CashBankType)
+            .OrderBy(a => a.AccountCode)
+            .Select(a => new { a.AccountId, a.AccountCode, a.AccountName })
+            .ToListAsync())
+        .Select(a => new CashBankAccount(a.AccountId, a.AccountCode, a.AccountName, IsCashAccount(a.AccountCode, a.AccountName)))
+        .ToList();
+
+    /* Notes and coins, as against a bank or a wallet: Cash on Hand (1101), the
+       shop tills (1102), anything the chart names "Cash ...". A cash receipt
+       needs no reference and posts as a Cash Receipt; the rest as Bank Receipts. */
+    public static bool IsCashAccount(string code, string name) =>
+        code == LedgerPosting.CashOnHandCode || code == "1102" ||
+        name.StartsWith("Cash", StringComparison.OrdinalIgnoreCase);
+
+    public record CashBankAccount(int Id, string Code, string Name, bool IsCash);
+
+    /* The method a collection is filed under, worked out from the account it
+       went into: the old fixed mapping where the account is one of those
+       (1110 BANK, 1111 MEEZAN ...), otherwise CASH for a till and BANK for any
+       other bank or wallet; CHEQUE when it was paid by cheque. The column is
+       NOT NULL and the reports group by it, so it is still filled. */
+    private async Task<PaymentMethod?> MethodForAccountAsync(CashBankAccount acc, bool byCheque)
+    {
+        var methods = await _db.PaymentMethods.AsNoTracking().Where(m => m.IsActive).ToListAsync();
+        if (byCheque) return methods.FirstOrDefault(m => m.MethodKey == "CHEQUE");
+        var exact = methods.FirstOrDefault(m => m.MethodKey != "PETTY_CASH" && m.MethodKey != "CHEQUE"
+                                                && LedgerPosting.CashAccountCodeFor(m.MethodKey) == acc.Code);
+        return exact ?? methods.FirstOrDefault(m => m.MethodKey == (acc.IsCash ? "CASH" : "BANK"));
+    }
+
     /* Who physically took the money: staff with an Employee row (the FK). */
     private async Task<List<object>> CollectorsAsync() =>
         (await _db.Employees.AsNoTracking()
@@ -287,11 +328,28 @@ public class CollectionDeskController : ApiControllerBase
             if (body.Amount > row.balance)
                 return BadRequest(new { message = $"{row.orderNo} only owes {row.balance:N2}. Collect that much or less." });
 
-            var method = await _db.PaymentMethods.AsNoTracking().FirstOrDefaultAsync(m => m.MethodId == body.MethodId && m.IsActive);
-            if (method is null || LedgerPosting.CashAccountCodeFor(method.MethodKey) is null)
-                return BadRequest(new { message = "Pick how the money came in." });
-            if (method.MethodKey != "CASH" && string.IsNullOrWhiteSpace(body.ReferenceNo))
-                return BadRequest(new { message = $"{method.MethodName} needs its reference (transaction, slip or cheque number)." });
+            /* THE ACCOUNT IT WENT INTO, picked from the chart (2 Oct). An older
+               screen that still sends only a method is served as before. */
+            PaymentMethod? method;
+            CashBankAccount? deposit = null;
+            if (body.DepositAccountId is int accId)
+            {
+                deposit = (await CashBankAccountsAsync()).FirstOrDefault(a => a.Id == accId);
+                if (deposit is null)
+                    return BadRequest(new { message = "Pick a Cash & Bank account the money went into." });
+                method = await MethodForAccountAsync(deposit, body.ByCheque == true);
+                if (method is null) return BadRequest(new { message = "No payment method is configured for that account." });
+                if (!deposit.IsCash && string.IsNullOrWhiteSpace(body.ReferenceNo))
+                    return BadRequest(new { message = $"Money into {deposit.Name} needs its reference (transaction, slip or cheque number)." });
+            }
+            else
+            {
+                method = await _db.PaymentMethods.AsNoTracking().FirstOrDefaultAsync(m => m.MethodId == body.MethodId && m.IsActive);
+                if (method is null || LedgerPosting.CashAccountCodeFor(method.MethodKey) is null)
+                    return BadRequest(new { message = "Pick the account the money went into." });
+                if (method.MethodKey != "CASH" && string.IsNullOrWhiteSpace(body.ReferenceNo))
+                    return BadRequest(new { message = $"{method.MethodName} needs its reference (transaction, slip or cheque number)." });
+            }
 
             var date = body.CollectedOn ?? Today();
             if (date > Today()) return BadRequest(new { message = "Money cannot be received on a date that has not come yet." });
@@ -313,6 +371,7 @@ public class CollectionDeskController : ApiControllerBase
                 CollectedOn = date,
                 Amount = body.Amount,
                 MethodId = method.MethodId,
+                DepositAccountId = deposit?.Id,
                 ReferenceNo = Clean(body.ReferenceNo, 50),
                 BankName = Clean(body.BankName, 60),
                 ChequeDate = method.MethodKey == "CHEQUE" ? body.ChequeDate : null,
@@ -412,7 +471,10 @@ public class CollectionDeskController : ApiControllerBase
         return s.Length <= max ? s : s[..max];
     }
 
+    /* DepositAccountId + ByCheque (2 Oct): the account picked from the chart.
+       MethodId is read only when no account is sent (an older screen). */
     public record CollectRequest(
-        int OrderId, decimal Amount, int MethodId, DateOnly? CollectedOn, int? CollectedByUserId,
-        string? ReferenceNo, string? BankName, DateOnly? ChequeDate, string? Note);
+        int OrderId, decimal Amount, int? MethodId, DateOnly? CollectedOn, int? CollectedByUserId,
+        string? ReferenceNo, string? BankName, DateOnly? ChequeDate, string? Note,
+        int? DepositAccountId = null, bool? ByCheque = null);
 }

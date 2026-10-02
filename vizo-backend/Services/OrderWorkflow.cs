@@ -147,7 +147,11 @@ public static class OrderWorkflow
            step in between rather than four. Deliberately NOT from CONFIRMED:
            picking stock against an order the office has not yet billed is how
            goods leave with no invoice behind them. */
-        (Invoiced,    AtOrderDept, new[] { RoleOrderDept, RoleAccountant }),
+        /* ONLY THE ADMIN OR THE ACCOUNTANT RELEASES AN ORDER TO THE FLOOR (the
+           owner, 2 Oct): until one of them sets "Processing in Order Dept", the
+           order department cannot start packing it. The desk used to be able
+           to take it up itself, and to dispatch straight from Invoiced. */
+        (Invoiced,    AtOrderDept, new[] { RoleAccountant }),
 
         /* THE PACKING SCREEN DISPATCHES DIRECTLY FROM INVOICED, SKIPPING THE
            STOP AT AT_ORDER_DEPT.
@@ -162,7 +166,7 @@ public static class OrderWorkflow
            two roles as the step already below this one, because "who may
            dispatch" was already answered once and should not need answering
            twice for the same order two lines apart. */
-        (Invoiced,    Dispatched,  new[] { RoleOrderDept, RoleAccountant }),
+        (Invoiced,    Dispatched,  new[] { RoleAccountant }),
 
         /* SENDING IT OUT. The owner named three roles for this one, because it
            is the step that takes the stock off the shelf and somebody has to be
@@ -331,7 +335,7 @@ public static class OrderWorkflow
             Invoiced => (NotificationKinds.InvoiceRaised,
                 new[] { RoleAdmin, RoleAccountant, RoleOrderDept },
                 $"Order invoiced by {actor}",
-                $"{orderNo} -- {customer} has been invoiced. The order department can pick it."),
+                $"{orderNo} -- {customer} has been invoiced. Set it to Processing in Order Dept to release it for packing."),
 
             /* "PROCESSING IN ORDER DEPT" IS THE ORDER DESK'S CUE (the owner,
                30 Sep): the admin or the accountant sets it, and the desk must

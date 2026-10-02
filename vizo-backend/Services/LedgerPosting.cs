@@ -449,8 +449,22 @@ public static class LedgerPosting
         if (c is null) return $"No collection {collectionId}.";
         if (c.VoucherId is not null || c.Status.StatusKey != "CONFIRMED" || c.Amount <= 0) return null;
 
+        /* Into the account picked on the Collect modal when there is one
+           (migration 43); otherwise through the method's fixed account, as
+           every collection before 2 Oct did. */
         var cashCode = CashAccountCodeFor(c.Method.MethodKey) ?? CashOnHandCode;
-        var cash = await AccountIdAsync(db, cashCode);
+        int? cash;
+        if (c.DepositAccountId is int depositId)
+        {
+            var dep = await db.Accounts.AsNoTracking()
+                .Where(a => a.AccountId == depositId && !a.IsGroup && a.IsActive)
+                .Select(a => new { a.AccountId, a.AccountCode, a.AccountName }).FirstOrDefaultAsync();
+            if (dep is null) return "The account this collection was received into is no longer open.";
+            cash = dep.AccountId;
+            cashCode = Controllers.CollectionDeskController.IsCashAccount(dep.AccountCode, dep.AccountName)
+                ? CashOnHandCode : dep.AccountCode;
+        }
+        else cash = await AccountIdAsync(db, cashCode);
         var ar = await AccountIdAsync(db, ReceivableCode);
         if (cash is null || ar is null) return $"Accounts {cashCode} and 1130 must be in the chart.";
 

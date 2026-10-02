@@ -2,6 +2,17 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
+ 2 OCTOBER -- found and NOT changed:
+   - Packing's Dispatch is two calls (status, then booking). If the booking
+     fails the goods have left but no courier is booked; the form says so and
+     Edit (or the Dispatch screen) books it. One server transaction would need
+     SetOrderStatus's stock code moved into a shared service.
+   - The Packing week list drops a dispatched order older than 7 days, so its
+     Edit is then reached by picking it in the three boxes.
+   - The thermal receipt rewrites the finished PDF to an 80 mm page and Courier
+     (PdfCanvas only makes A4 Helvetica). Print on the real printer once.
+   - "Download bill" on the order page still downloads the A4 invoice.
+
  30 SEPTEMBER -- found and NOT changed:
    - /packing/orders/[id] (the read-only order page the Packing list links to)
      still shows base prices and a "Total at base price" to the order desk.

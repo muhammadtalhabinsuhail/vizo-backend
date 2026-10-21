@@ -35,8 +35,10 @@
 /// ─────────────────────────── AND WHO MOVES IT ──────────────────────────────
 ///
 /// One rule above all the others: THE SUPER ADMIN CAN SET ANY STATUS, in any
-/// direction, at any time. Dispatched back to Submitted is allowed. Everybody
-/// else may only make the one move that is theirs, from the step before it.
+/// direction, at any time. Dispatched back to Submitted is allowed. Since
+/// 21 Oct THE ACCOUNTANT MAY MOVE IT ALONG THE CHAIN THE SAME WAY (see
+/// MayMoveAnywhere). Everybody else may only make the one move that is theirs,
+/// from the step before it.
 ///
 /// This lives in one class rather than being scattered through the controller
 /// because the same rules answer three different questions -- may this person
@@ -191,6 +193,13 @@ public static class OrderWorkflow
         if (roleKey == RoleAdmin) return true;
         if (from == to) return false;
 
+        /* The accountant may now put an order on any step of the chain, from
+           any step -- see MayMoveAnywhere. The moves OFF the chain (declined,
+           cancelled, held) stay in the table below, so they keep exactly the
+           limits they had: nothing here lets the accountant cancel an order
+           whose goods have already left. */
+        if (MayMoveAnywhere(roleKey) && Chain.Contains(to) && from != Returned) return true;
+
         return Moves.Any(m => m.From == from && m.To == to && m.Roles.Contains(roleKey));
     }
 
@@ -203,7 +212,7 @@ public static class OrderWorkflow
     /// </summary>
     public static string? NextFor(string roleKey, string currentStatus)
     {
-        if (roleKey == RoleAdmin)
+        if (MayMoveAnywhere(roleKey))
         {
             /* A declined or cancelled order has no natural "next"; the admin
                uses the dropdown to put it wherever they want. */
@@ -238,6 +247,18 @@ public static class OrderWorkflow
                 .ToList();
         }
 
+        /* The accountant: every step of the chain, forward or backward, plus
+           whichever of declined / cancelled / held the table still gives them
+           from here (none, once the goods have left). */
+        if (MayMoveAnywhere(roleKey))
+        {
+            if (currentStatus == Returned) return new List<string>();
+            var offChain = Moves
+                .Where(m => m.From == currentStatus && m.Roles.Contains(roleKey) && !Chain.Contains(m.To))
+                .Select(m => m.To);
+            return Chain.Where(s => s != currentStatus).Concat(offChain).Distinct().ToList();
+        }
+
         return Moves
             .Where(m => m.From == currentStatus && m.Roles.Contains(roleKey))
             .Select(m => m.To)
@@ -249,6 +270,18 @@ public static class OrderWorkflow
     /// A salesperson may only create an order as a draft or submit it. Anything
     /// further is somebody else's decision to make.
     /// </summary>
+    /// <summary>
+    /// May this role put an order on any step of the chain, forward or
+    /// backward?
+    ///
+    /// The Super Admin always could. The accountant may too since 21 Oct (the
+    /// owner: "accountant can update status forward and backward ... as you did
+    /// for admin panel") -- they run the orders day to day, and a misclick one
+    /// step too far used to need the owner to put it back.
+    /// </summary>
+    public static bool MayMoveAnywhere(string roleKey) =>
+        roleKey is RoleAdmin or RoleAccountant;
+
     public static bool CanCreateWithStatus(string roleKey, string statusKey) =>
         roleKey == RoleAdmin || statusKey is Draft or Submitted;
 

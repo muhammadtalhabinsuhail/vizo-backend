@@ -610,7 +610,7 @@ public class SalesController : ApiControllerBase
     /// The checks an order has to pass, whether it is being created or edited.
     /// Returns the message to refuse with, or null when it is sound.
     /// </summary>
-    private async Task<string?> ValidateOrderRequest(OrderRequest body)
+    private async Task<string?> ValidateOrderRequest(OrderRequest body, int? orderId = null)
     {
         if (body.Lines is null || body.Lines.Count == 0)
             return "An order needs at least one line.";
@@ -676,6 +676,28 @@ public class SalesController : ApiControllerBase
                 return $"{product.ProductName}: {l.Rate:0.00} is not allowed. The rate is fixed at {floor:0.00}; "
                      + $"a salesperson can add up to {MaxSalesMarginPercent}% margin on top of it, "
                      + $"so the highest price is {ceiling:0.00}.";
+        }
+
+        /* NO MORE THAN CAN BE ORDERED (the owner, 21 Oct): a salesperson -- and
+           the order desk keying an order in for one -- may order up to the
+           most that is still available of each item, and no more. The screen
+           stops them first and says the number in pieces; this is the rule.
+           Lines for the same item are added together, and an order being
+           edited does not count against itself. The Super Admin and the
+           accountant are not held to it: they may know stock is on its way,
+           and Confirm checks the order department in any case. */
+        if (marginCapped)
+        {
+            var maxQty = await StockAvailability.MaxOrderableAsync(_db, wanted, orderId);
+            foreach (var g in body.Lines.GroupBy(l => l.ProductId))
+            {
+                var asked = g.Sum(l => l.Qty);
+                var most = maxQty.GetValueOrDefault(g.Key);
+                if (asked > most)
+                    return most <= 0
+                        ? $"{known[g.Key].ProductName} cannot be ordered right now. You can order at most 0 PCS."
+                        : $"{known[g.Key].ProductName}: you can order at most {most} PCS.";
+            }
         }
 
         return null;
@@ -1256,7 +1278,7 @@ public class SalesController : ApiControllerBase
             var invalid = await ValidateOrderRequest(new OrderRequest(
                 body.CustomerId, body.LocationId, body.SalesPersonUserId,
                 body.OrderDate, body.DeliveryDate, body.DueDate, body.MethodId,
-                body.Notes, body.SaveAsDraft, body.RaiseInvoice, priced));
+                body.Notes, body.SaveAsDraft, body.RaiseInvoice, priced), id);
             if (invalid is not null) return BadRequest(new { message = invalid });
 
             var (subtotal, discount, tax, total) = Totals(priced);
@@ -1869,6 +1891,58 @@ public class SalesController : ApiControllerBase
             if (status.StatusKey == OrderWorkflow.Declined && string.IsNullOrWhiteSpace(body.Reason))
                 return BadRequest(new { message = "Declining an order needs a reason." });
 
+            /* ─────────── CONFIRMING NEEDS THE ORDER DEPARTMENT TO HAVE IT ───────────
+
+               The owner, 21 Oct: accounts sees each item's stock at the three
+               places before confirming (GET orders/{id}/stock), and "the system
+               validates stock availability in order department before final
+               confirmation to prevent incorrect stock allocation". The order
+               department is where it is packed from; if it is short, the
+               stock is moved there first (a transfer) and then the order is
+               confirmed.
+
+               Asked whenever an order is first put on the confirmed part of the
+               chain -- Confirmed, or straight past it to Invoiced or Processing
+               -- by anybody, the Super Admin included. An order moving BACK to
+               one of those steps was confirmed already and is not asked again;
+               Dispatched has its own check against the place it leaves from. */
+            var confirming = status.StatusKey is OrderWorkflow.Confirmed
+                    or OrderWorkflow.Invoiced or OrderWorkflow.AtOrderDept
+                && current.StatusKey is not (OrderWorkflow.Confirmed or OrderWorkflow.Invoiced
+                    or OrderWorkflow.AtOrderDept or OrderWorkflow.Dispatched or OrderWorkflow.Delivered);
+            if (confirming)
+            {
+                var deptIds = (await StockAvailability.PlacesAsync(_db))
+                    .Where(p => p.Kind == StockAvailability.DepartmentKind).Select(p => p.Id).ToList();
+                var wantLines = await _db.SalesOrderItems.AsNoTracking()
+                    .Where(l => l.OrderId == id)
+                    .GroupBy(l => new { l.ProductId, l.Product.ProductName })
+                    .Select(g => new { g.Key.ProductId, g.Key.ProductName, Qty = g.Sum(l => l.Quantity) })
+                    .ToListAsync();
+                var atDept = await StockAvailability.OnHandAsync(
+                    _db, wantLines.Select(l => l.ProductId).ToList(), deptIds);
+
+                var deptShort = wantLines
+                    .Select(l => new
+                    {
+                        name = l.ProductName,
+                        needed = l.Qty,
+                        onHand = deptIds.Sum(d => atDept.GetValueOrDefault((l.ProductId, d)))
+                    })
+                    .Where(x => x.onHand < x.needed)
+                    .Select(x => new { x.name, x.needed, x.onHand, shortBy = x.needed - x.onHand, sku = (string?)null })
+                    .ToList();
+
+                if (deptShort.Count > 0)
+                    return BadRequest(new
+                    {
+                        message = $"The order department does not have enough of {deptShort.Count} " +
+                                  $"{(deptShort.Count == 1 ? "item" : "items")} for {order.OrderNo}. " +
+                                  "Move the stock there first, then confirm.",
+                        shortages = deptShort
+                    });
+            }
+
             /* ─────────── OFF THE CHAIN, OUT OF THE LEDGER ───────────────
 
                The owner, 30 Sep: an order declined, cancelled or put on hold
@@ -2345,13 +2419,81 @@ public class SalesController : ApiControllerBase
                     name = names.FirstOrDefault(n => n.StatusKey == k)?.StatusName ?? k,
                     step = OrderWorkflow.Step(k)
                 }),
-                canSetAnything = role == OrderWorkflow.RoleAdmin,
+                canSetAnything = OrderWorkflow.MayMoveAnywhere(role),
                 isMine = mine
             });
         }
         catch (Exception ex)
         {
             return Fail(ex, $"read the workflow for order {id}");
+        }
+    }
+
+    /// <summary>
+    /// Every line of the order beside what each selling place holds of it --
+    /// Shop 2, the Warehouse and the Order Department (the owner, 21 Oct).
+    ///
+    /// Drawn by the Confirm dialog, so accounts can see whether the order can
+    /// be met and from where before saying yes, and by both dispatch forms, so
+    /// the order desk sees what the place it is sending from actually holds.
+    /// A salesperson is refused: they are shown the most they may order, never
+    /// the stock itself (StockAvailability).
+    /// </summary>
+    [HttpGet("orders/{id:int}/stock")]
+    public async Task<IActionResult> GetOrderStock(int id)
+    {
+        try
+        {
+            if (CurrentRole() == OrderWorkflow.RoleSales)
+                return StatusCode(403, new { message = "Stock levels are not shown to the sales panel." });
+
+            var order = await _db.SalesOrders.AsNoTracking()
+                .Where(o => o.OrderId == id)
+                .Select(o => new { o.OrderId, o.OrderNo })
+                .FirstOrDefaultAsync();
+            if (order is null) return NotFound(new { message = $"No order with id {id}." });
+
+            var lines = await _db.SalesOrderItems.AsNoTracking()
+                .Where(l => l.OrderId == id)
+                .OrderBy(l => l.LineNo)
+                .Select(l => new
+                {
+                    l.ProductId, l.Quantity,
+                    sku = l.Product.Sku, name = l.Product.ProductName, imageUrl = l.Product.ImageUrl
+                })
+                .ToListAsync();
+
+            var places = await StockAvailability.PlacesAsync(_db);
+            var onHand = await StockAvailability.OnHandAsync(
+                _db, lines.Select(l => l.ProductId).Distinct().ToList(), places.Select(p => p.Id).ToList());
+
+            var deptIds = places.Where(p => p.Kind == StockAvailability.DepartmentKind).Select(p => p.Id).ToList();
+
+            return Ok(new
+            {
+                orderNo = order.OrderNo,
+                places = places.Select(p => new { id = p.Id, name = p.Name, kind = p.Kind }),
+                lines = lines.Select(l =>
+                {
+                    var atDept = deptIds.Sum(d => onHand.GetValueOrDefault((l.ProductId, d)));
+                    return new
+                    {
+                        productId = l.ProductId,
+                        l.sku, l.name, l.imageUrl,
+                        ordered = l.Quantity,
+                        stock = places.Select(p => new { locationId = p.Id, qty = onHand.GetValueOrDefault((l.ProductId, p.Id)) }),
+                        orderDept = atDept,
+                        orderDeptShort = Math.Max(0, l.Quantity - atDept)
+                    };
+                }),
+                /* Confirm is refused while this is false (SetOrderStatus). */
+                orderDeptCovers = lines.All(l =>
+                    deptIds.Sum(d => onHand.GetValueOrDefault((l.ProductId, d))) >= l.Quantity)
+            });
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex, $"read the stock for order {id}");
         }
     }
 
@@ -3594,6 +3736,12 @@ public class SalesController : ApiControllerBase
                carry no limits, balances or cost (HideMoneyFromOrderDesk). */
             var noMoney = HideMoneyFromOrderDesk();
 
+            /* A SALESPERSON IS NOT SHOWN THE STOCK (the owner, 21 Oct): only
+               the most they may order of each item, in pieces -- maxOrderable
+               below. The two stock figures go out empty for them. */
+            var hideStock = CurrentRole() == OrderWorkflow.RoleSales;
+            var maxOrderable = await StockAvailability.MaxOrderableAsync(_db);
+
             var commonTax = await _db.Products.AsNoTracking()
                 .Where(p => p.IsActive)
                 .GroupBy(p => p.TaxRatePercent)
@@ -3723,15 +3871,20 @@ public class SalesController : ApiControllerBase
                            tell different stories about the same item. */
                         dutyPrice = noMoney ? 0m : p.DutyPrice,
                         taxRatePercent = p.TaxRatePercent,
-                        totalStock = p.StockBalances.Sum(s => (int?)s.Quantity) ?? 0,
+                        totalStock = hideStock ? (int?)null : p.StockBalances.Sum(s => (int?)s.Quantity) ?? 0,
                         /* Stock at the till the operator is standing at, when the
                            screen says which one that is. */
-                        stockHere = locationId == null
+                        stockHere = locationId == null || hideStock
                             ? (int?)null
                             : p.StockBalances.Where(s => s.LocationId == locationId)
                                              .Sum(s => (int?)s.Quantity) ?? 0
                     })
                     .ToListAsync(),
+
+                /* ProductId -> the most that may still be ordered, in pieces
+                   (StockAvailability.MaxOrderableAsync). The order form stops
+                   a quantity above it; ValidateOrderRequest refuses one. */
+                maxOrderable,
 
                 walkInCustomerId = walkInId,
                 defaultTaxPercent = commonTax ?? 0m,

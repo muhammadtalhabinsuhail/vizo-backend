@@ -1846,10 +1846,25 @@ public class AccountingController : ApiControllerBase
 
             var type = await _db.VoucherTypes.FirstOrDefaultAsync(t => t.VoucherTypeId == body.VoucherTypeId);
             if (type is null) return BadRequest(new { message = "Pick a valid voucher type." });
+
+            /* Wallet receipts and wallet payments are retired (the owner,
+               21 Oct). The two types stay in the table for the old vouchers
+               that point at them; nothing new may be written as one. */
+            if (type.TypeCode is "WR" or "WP")
+                return BadRequest(new { message = $"{type.TypeName} vouchers are no longer used. Pick another type." });
+
             if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
                 return BadRequest(new { message = "Pick a valid location." });
-            if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
+            var payMethod = await _db.PaymentMethods.AsNoTracking()
+                .FirstOrDefaultAsync(m => m.MethodId == body.MethodId);
+            if (payMethod is null)
                 return BadRequest(new { message = "Pick a valid payment method." });
+
+            /* A cash receipt is cash in hand -- never "Credit" (the owner,
+               21 Oct). Marking one Credit posted money into the cash account
+               that had not arrived. */
+            if (type.TypeCode == "CR" && payMethod.MethodKind == "credit")
+                return BadRequest(new { message = $"A cash receipt cannot use {payMethod.MethodName}. Pick Cash or a bank." });
             if (body.PartyId is not null && !await _db.Parties.AnyAsync(p => p.UserId == body.PartyId))
                 return BadRequest(new { message = "Pick a valid party." });
             if (body.CashBankAccountId is not null &&
@@ -3654,12 +3669,19 @@ public class AccountingController : ApiControllerBase
     private async Task<string?> ValidateVoucher(VoucherRequest body)
     {
         if (body.Amount <= 0) return "A voucher needs an amount above zero.";
-        if (!await _db.VoucherTypes.AnyAsync(t => t.VoucherTypeId == body.VoucherTypeId))
-            return "Pick a valid voucher type.";
+        var type = await _db.VoucherTypes.AsNoTracking()
+            .FirstOrDefaultAsync(t => t.VoucherTypeId == body.VoucherTypeId);
+        if (type is null) return "Pick a valid voucher type.";
+        /* The same two rules CreateVoucher applies (the owner, 21 Oct). */
+        if (type.TypeCode is "WR" or "WP")
+            return $"{type.TypeName} vouchers are no longer used. Pick another type.";
         if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
             return "Pick a valid location.";
-        if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
-            return "Pick a valid payment method.";
+        var method = await _db.PaymentMethods.AsNoTracking()
+            .FirstOrDefaultAsync(m => m.MethodId == body.MethodId);
+        if (method is null) return "Pick a valid payment method.";
+        if (type.TypeCode == "CR" && method.MethodKind == "credit")
+            return $"A cash receipt cannot use {method.MethodName}. Pick Cash or a bank.";
         if (body.PartyId is not null && !await _db.Parties.AnyAsync(p => p.UserId == body.PartyId))
             return "Pick a valid party.";
         if (body.CashBankAccountId is not null

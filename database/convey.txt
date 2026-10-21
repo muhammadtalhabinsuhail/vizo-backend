@@ -2,6 +2,36 @@
  CONVEY  —  things you should know, that I did not change on my own
 ═══════════════════════════════════════════════════════════════════════════════
 
+ 21 OCTOBER -- found and NOT changed:
+   - 🔴 MOVING AN ORDER BACK FROM DISPATCHED (or Delivered) DOES NOT PUT THE
+     STOCK BACK. SetOrderStatus takes the goods off the shelf on the way INTO
+     Dispatched and never returns them on the way out; dispatching it a second
+     time takes them off again. True for the Super Admin since 22 Sep -- and
+     the accountant can now make the same backward move (owner's request), so
+     it will happen more often. Fix: on leaving DISPATCHED/DELIVERED for an
+     earlier step, put each line's DispatchedQty back on order.LocationId
+     (a RETURN movement through StockBatches) and clear DispatchedQty. Not done
+     because it changes the Super Admin's behaviour too -- say the word.
+   - The Super Admin dashboard's quick Confirm (owner-decisions.tsx) and the
+     credit-hold release still confirm in one press, with no stock table. The
+     API now refuses both when the order department is short, with its message
+     in the toast; only the order page shows the three-place table first.
+   - "Max orderable" (what a rep may still order) = stock at every active
+     selling place (Shop 2 + Warehouse + Order Dept) MINUS what open orders
+     (submitted .. processing, and limit-cross) already hold. Confirm then
+     needs the ORDER DEPARTMENT alone to cover it. So a rep can order stock
+     that sits in the warehouse, and accounts must transfer it to the order
+     department before confirming -- that is the owner's flow as written. Say
+     if the rep's limit should be the order department only.
+   - The order desk keying an order in for a rep is held to the same limit as
+     the rep (the API groups them as it does for the 10% margin cap). The
+     Super Admin and the accountant are not limited.
+   - Two old Wallet Receipt vouchers exist (Easypaisa, JazzCash), so the WR/WP
+     types are left in "VoucherType"; only new ones are refused.
+   - The local Postgres on this machine no longer accepts the password in
+     appsettings.Development.json (scram auth since the Windows change). The
+     21 Oct tests ran on a throwaway server in the session scratchpad instead.
+
  2 OCTOBER -- found and NOT changed:
    - Packing's Dispatch is two calls (status, then booking). If the booking
      fails the goods have left but no courier is booked; the form says so and

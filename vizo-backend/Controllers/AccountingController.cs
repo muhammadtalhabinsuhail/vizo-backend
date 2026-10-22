@@ -29,7 +29,7 @@ namespace vizo_backend.Controllers;
 [Route("api/accounting")]
 [ApiController]
 [Authorize(Policy = "Accountant")]
-public class AccountingController : ApiControllerBase
+public partial class AccountingController : ApiControllerBase
 {
     private readonly PushNotificationService _push;
 
@@ -39,6 +39,30 @@ public class AccountingController : ApiControllerBase
         : base(db, cfg, logger, env) => _push = push;
 
     private const string Posted = "POSTED";
+
+    /* PAYMENTS AND JOURNAL VOUCHERS ARE THE SUPER ADMIN'S (the owner, 22 Oct):
+       "cash payment, bank payment and general voucher will be done by only
+       super admin ... any payment or JV entries must not be seen by
+       accountant, only he will see all receipts". So for everybody else the
+       voucher list, the voucher page and every voucher action see receipts
+       only -- a payment voucher simply does not exist for them. */
+    private bool SeesPayments() => CurrentRole() == "super-admin";
+
+    private const string ReceiptsOnly =
+        "Payment and journal vouchers are the Super Admin's. Accounts records receipts only.";
+
+    /// <summary>
+    /// Null when this person may touch the voucher; otherwise the 404 to answer
+    /// with -- a payment voucher is "not found" for the accountant, not
+    /// "forbidden", because they are not meant to know it is there.
+    /// </summary>
+    private async Task<IActionResult?> HiddenVoucher(int id)
+    {
+        if (SeesPayments()) return null;
+        var isReceipt = await _db.Vouchers.AsNoTracking()
+            .Where(v => v.VoucherId == id).Select(v => (bool?)v.VoucherType.IsReceipt).FirstOrDefaultAsync();
+        return isReceipt == false ? NotFound(new { message = $"No voucher with id {id}." }) : null;
+    }
 
     /* The real "AccountGroup".GroupName values on this database. They are
        plural and they are not the words you would guess -- "Capital" rather
@@ -532,6 +556,7 @@ public class AccountingController : ApiControllerBase
             if (pageSize is < 1 or > 500) pageSize = 50;
 
             var rows = _db.Vouchers.AsNoTracking().AsQueryable();
+            if (!SeesPayments()) rows = rows.Where(v => v.VoucherType.IsReceipt);
 
             if (!string.IsNullOrWhiteSpace(status)) rows = rows.Where(v => v.Status.StatusKey == status);
             if (!string.IsNullOrWhiteSpace(type)) rows = rows.Where(v => v.VoucherType.TypeCode == type);
@@ -614,6 +639,8 @@ public class AccountingController : ApiControllerBase
     {
         try
         {
+            if (await HiddenVoucher(id) is IActionResult hidden) return hidden;
+
             var v = await _db.Vouchers.AsNoTracking()
                 .Where(x => x.VoucherId == id)
                 .Select(x => new
@@ -1852,6 +1879,8 @@ public class AccountingController : ApiControllerBase
                that point at them; nothing new may be written as one. */
             if (type.TypeCode is "WR" or "WP")
                 return BadRequest(new { message = $"{type.TypeName} vouchers are no longer used. Pick another type." });
+            if (!type.IsReceipt && !SeesPayments())
+                return StatusCode(403, new { message = ReceiptsOnly });
 
             if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
                 return BadRequest(new { message = "Pick a valid location." });
@@ -1964,6 +1993,8 @@ public class AccountingController : ApiControllerBase
     {
         try
         {
+            if (await HiddenVoucher(id) is IActionResult hidden) return hidden;
+
             var v = await _db.Vouchers.Include(x => x.Status)
                 .FirstOrDefaultAsync(x => x.VoucherId == id);
             if (v is null) return NotFound(new { message = $"No voucher with id {id}." });
@@ -3315,6 +3346,8 @@ public class AccountingController : ApiControllerBase
     {
         try
         {
+            if (await HiddenVoucher(id) is IActionResult hidden) return hidden;
+
             var v = await _db.Vouchers
                 .Include(x => x.Status)
                 .Include(x => x.VoucherAllocations)
@@ -3406,6 +3439,8 @@ public class AccountingController : ApiControllerBase
     {
         try
         {
+            if (await HiddenVoucher(id) is IActionResult hidden) return hidden;
+
             var v = await _db.Vouchers
                 .Include(x => x.Status)
                 .Include(x => x.VoucherAllocations)
@@ -3449,6 +3484,8 @@ public class AccountingController : ApiControllerBase
     {
         try
         {
+            if (await HiddenVoucher(id) is IActionResult hidden) return hidden;
+
             if (string.IsNullOrWhiteSpace(body?.Reason))
                 return BadRequest(new { message = "Cancelling a voucher needs a reason." });
 
@@ -3675,6 +3712,8 @@ public class AccountingController : ApiControllerBase
         /* The same two rules CreateVoucher applies (the owner, 21 Oct). */
         if (type.TypeCode is "WR" or "WP")
             return $"{type.TypeName} vouchers are no longer used. Pick another type.";
+        if (!type.IsReceipt && !SeesPayments())
+            return ReceiptsOnly;
         if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
             return "Pick a valid location.";
         var method = await _db.PaymentMethods.AsNoTracking()

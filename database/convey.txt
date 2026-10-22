@@ -3,13 +3,13 @@
 ═══════════════════════════════════════════════════════════════════════════════
 
  22 OCTOBER -- found and NOT changed:
-   - "JV entries must not be seen by the accountant": done for vouchers and the
-     Voucher Book. BUT /accounting/journal-entries is still open to the
-     accountant, and every JV the book writes is a journal entry, so the
-     accountant can still read them there (with every system entry -- sales,
-     receipts, expenses). Hiding that page from the accountant is one line in
-     proxy.ts plus the API policy; not done because it takes the whole journal
-     away from them. Say the word.
+   - DONE later the same day (owner said yes): Journal Entries is the Super
+     Admin's -- page (proxy.ts), menu, palette, all eight API actions (403),
+     and journal-entry / payment-voucher PDFs. Links to an entry from vouchers,
+     expenses, day sheets and purchase orders show the number as plain text for
+     everyone else (components/accounting/journal-link.tsx). The accountant
+     still has the ledgers, statements and trial balance -- each line there is
+     still visible as a ledger line, by design.
    - Payments the accountant records some other way are untouched: Expenses
      (paid from cash/bank) and supplier payments on purchase invoices still
      work for the accountant.

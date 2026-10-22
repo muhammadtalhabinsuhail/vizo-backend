@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -58,6 +58,21 @@ public class DocumentsController : ApiControllerBase
             "purchase-order" or "purchase-invoice" or "goods-receipt" or "purchase-return" or
             "voucher" or "journal-entry" or "expense" or "party-statement" or "sales-return";
 
+    /// <summary>
+    /// Journal entries, and payment or journal vouchers, are the Super Admin's
+    /// alone (the owner, 22 Oct) -- the same rule the accounting API applies,
+    /// so the PDF is not a side door to a page the screen hides.
+    /// </summary>
+    private async Task<bool> OwnerOnlyDocument(string kind, int id)
+    {
+        if (CurrentRole() == "super-admin") return false;
+        var k = kind.ToLowerInvariant();
+        if (k == "journal-entry") return true;
+        if (k != "voucher") return false;
+        return await _db.Vouchers.AsNoTracking()
+            .AnyAsync(v => v.VoucherId == id && !v.VoucherType.IsReceipt);
+    }
+
     // ══════════════════════════════════════════════════════════════════
     //  RENDER  /  ARCHIVE
     // ══════════════════════════════════════════════════════════════════
@@ -72,6 +87,8 @@ public class DocumentsController : ApiControllerBase
                 return NotFound(new { message = $"'{kind}' is not a document this system prints." });
             if (MoneyKindForOrderDesk(kind))
                 return StatusCode(403, new { message = "The Order Department does not see money documents." });
+            if (await OwnerOnlyDocument(kind, id))
+                return StatusCode(403, new { message = "That document is the Super Admin's." });
 
             var doc = await DocumentBuilder.BuildAsync(_db, kind, id);
             if (doc is null) return NotFound(new { message = $"No {kind.Replace('-', ' ')} with id {id}." });
@@ -102,6 +119,8 @@ public class DocumentsController : ApiControllerBase
                 return NotFound(new { message = $"'{kind}' is not a document this system prints." });
             if (MoneyKindForOrderDesk(kind))
                 return StatusCode(403, new { message = "The Order Department does not see money documents." });
+            if (await OwnerOnlyDocument(kind, id))
+                return StatusCode(403, new { message = "That document is the Super Admin's." });
 
             var key = id.ToString();
 
@@ -152,6 +171,8 @@ public class DocumentsController : ApiControllerBase
                 return NotFound(new { message = $"'{kind}' is not a document this system prints." });
             if (MoneyKindForOrderDesk(kind))
                 return StatusCode(403, new { message = "The Order Department does not see money documents." });
+            if (await OwnerOnlyDocument(kind, id))
+                return StatusCode(403, new { message = "That document is the Super Admin's." });
 
             var file = await DocumentArchive.EnsureAsync(_db, _cfg, _logger, kind, id, CurrentUserId());
 
@@ -184,6 +205,8 @@ public class DocumentsController : ApiControllerBase
                 return NotFound(new { message = $"'{kind}' is not a document this system prints." });
             if (MoneyKindForOrderDesk(kind))
                 return StatusCode(403, new { message = "The Order Department does not see money documents." });
+            if (await OwnerOnlyDocument(kind, id))
+                return StatusCode(403, new { message = "That document is the Super Admin's." });
 
             var row = await DocumentArchive.FindAsync(_db, kind, id.ToString());
             return row is null

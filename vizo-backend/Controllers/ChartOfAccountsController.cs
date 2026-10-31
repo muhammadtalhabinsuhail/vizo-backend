@@ -73,7 +73,14 @@ public class ChartOfAccountsController : ApiControllerBase
                         typeId = a.AccountTypeId, groupId = a.AccountType.GroupId
                     })
                     .ToListAsync(),
-                systemCodes = SystemCodes.OrderBy(c => c)
+                systemCodes = SystemCodes.OrderBy(c => c),
+                /* For "Salary account of": an expense account can be a member
+                   of staff's own salary account (the owner, 1 Nov). */
+                staff = await _db.StaffMembers.AsNoTracking()
+                    .Where(s => s.IsActive)
+                    .OrderBy(s => s.FullName)
+                    .Select(s => new { id = s.StaffId, name = s.FullName, code = s.StaffCode, salaryAccountId = s.SalaryAccountId })
+                    .ToListAsync()
             });
         }
         catch (Exception ex)
@@ -102,8 +109,12 @@ public class ChartOfAccountsController : ApiControllerBase
                 CurrencyCode = "PKR",
                 IsActive = true
             };
+            await using var tx = await _db.Database.BeginTransactionAsync();
             _db.Accounts.Add(acc);
             await _db.SaveChangesAsync();
+            var linkError = await LinkStaff(acc, body);
+            if (linkError is not null) return BadRequest(new { message = linkError });
+            await tx.CommitAsync();
             await Log("ACCOUNT_CREATED", "Account", acc.AccountCode, acc.AccountName, 2);
             return Ok(new { id = acc.AccountId, message = $"{acc.AccountCode} {acc.AccountName} added to the chart." });
         }
@@ -138,6 +149,8 @@ public class ChartOfAccountsController : ApiControllerBase
                 acc.IsActive = body.IsActive.Value;
             }
             await _db.SaveChangesAsync();
+            var linkError = await LinkStaff(acc, body);
+            if (linkError is not null) return BadRequest(new { message = linkError });
             await Log("ACCOUNT_EDITED", "Account", acc.AccountCode, acc.AccountName, 2);
             return Ok(new { id, message = $"{acc.AccountCode} {acc.AccountName} saved." });
         }
@@ -248,7 +261,38 @@ public class ChartOfAccountsController : ApiControllerBase
         return false;
     }
 
+    /// <summary>
+    /// Makes this account a member of staff's salary account, or no longer
+    /// anybody's (the owner, 1 Nov: "SHAHAB SALARY ... connected with the staff
+    /// ledger"). Only a postable expense account can be one; a person has at
+    /// most one, and an account belongs to at most one person.
+    /// </summary>
+    private async Task<string?> LinkStaff(Account acc, AccountRequest body)
+    {
+        if (body.StaffId is null && body.UnlinkStaff != true) return null;
+
+        var current = await _db.StaffMembers.Where(s => s.SalaryAccountId == acc.AccountId).ToListAsync();
+        if (body.UnlinkStaff == true)
+        {
+            foreach (var s in current) s.SalaryAccountId = null;
+            await _db.SaveChangesAsync();
+            return null;
+        }
+
+        var isExpense = !acc.IsGroup && await _db.AccountTypes
+            .AnyAsync(t => t.AccountTypeId == acc.AccountTypeId && t.Group.GroupName == "Expenses");
+        if (!isExpense) return "Only an expense account that takes postings can be a salary account.";
+
+        var person = await _db.StaffMembers.FirstOrDefaultAsync(s => s.StaffId == body.StaffId);
+        if (person is null) return "Pick a member of staff from the Staff Ledgers.";
+
+        foreach (var s in current.Where(s => s.StaffId != person.StaffId)) s.SalaryAccountId = null;
+        person.SalaryAccountId = acc.AccountId;
+        await _db.SaveChangesAsync();
+        return null;
+    }
+
     public record AccountRequest(
         string? Code, string? Name, int AccountTypeId, int? ParentId, bool IsGroup,
-        decimal OpeningBalance, bool? IsActive);
+        decimal OpeningBalance, bool? IsActive, int? StaffId = null, bool? UnlinkStaff = null);
 }

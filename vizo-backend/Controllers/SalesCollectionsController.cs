@@ -20,6 +20,15 @@ namespace vizo_backend.Controllers;
 /// Until it is confirmed, CollectionReminderService keeps reminding the rep to
 /// hand the money in.
 ///
+/// WHICH ORDERS (the owner, 1 Nov): every live order of the rep's customers,
+/// whatever its status -- a delivered order is the usual case, but a rep can
+/// take money against one still on its way, softly (the screen says it is not
+/// delivered yet; nothing is refused). Cancelled, declined and returned orders
+/// are not offered. An order paid in full drops off; one part-paid shows what
+/// is still left, and can take another collection. "Left" is the order's total
+/// (its invoice's, once there is one) less what accounts confirmed and what
+/// reps already hold against it.
+///
 /// The list shows every collection that is the rep's: the ones they filed, and
 /// any the accountant collected directly against one of their orders -- so a
 /// payment confirmed without the rep ever filing it still shows here.
@@ -36,7 +45,7 @@ public class SalesCollectionsController : ApiControllerBase
 {
     private readonly PushNotificationService _push;
 
-    private static readonly string[] NotCollectable = { "CANCELLED", "DECLINED", "RETURNED", "DRAFT" };
+    private static readonly string[] NotCollectable = { "CANCELLED", "DECLINED", "RETURNED" };
 
     public SalesCollectionsController(AppDbContext db, IConfiguration cfg,
         ILogger<SalesCollectionsController> logger, IWebHostEnvironment env, PushNotificationService push)
@@ -45,17 +54,50 @@ public class SalesCollectionsController : ApiControllerBase
     /// <summary>The rep's own id, or null for the Super Admin, who sees everybody's.</summary>
     private int? Mine() => CurrentRole() == OrderWorkflow.RoleSales ? CurrentUserId() : null;
 
-    /// <summary>Invoiced orders still collectable, limited to the rep's customers and orders.</summary>
+    /// <summary>Live orders, any status, limited to the rep's customers and orders.</summary>
     private IQueryable<SalesOrder> OpenOrders()
     {
         var rows = _db.SalesOrders.AsNoTracking()
-            .Where(o => o.SalesInvoice != null && !NotCollectable.Contains(o.Status.StatusKey));
+            .Where(o => !NotCollectable.Contains(o.Status.StatusKey));
         if (Mine() is int me)
             rows = rows.Where(o => o.SalesPersonUserId == me
                                    || o.CustomerUser.SalesPersonUserId == me
                                    || o.CustomerUser.CreatedByUserId == me);
         return rows;
     }
+
+    private sealed record OrderRow(
+        int id, string orderNo, string status, string statusName, DateOnly orderDate,
+        int customerId, string customerName, string customerCode, string? city,
+        int? invoiceId, string? invoiceNo, DateOnly? invoiceDate, DateOnly? dueDate,
+        decimal total, decimal received, decimal awaiting)
+    {
+        public decimal balance => Math.Max(0, total - received);
+        public decimal collectable => Math.Max(0, total - received - awaiting);
+    }
+
+    /// <summary>
+    /// What each order is worth and what has come in against it, with or
+    /// without an invoice. Received = confirmed collections on the order, plus
+    /// posted receipts allocated to its invoice that are not a collection's own.
+    /// </summary>
+    private static IQueryable<OrderRow> Project(IQueryable<SalesOrder> rows) =>
+        rows.Select(o => new OrderRow(
+            o.OrderId, o.OrderNo, o.Status.StatusKey, o.Status.StatusName, o.OrderDate,
+            o.CustomerUserId, o.CustomerUser.DisplayName ?? o.CustomerUser.LegalName,
+            o.CustomerUser.PartyCode, o.CustomerUser.City.CityName,
+            o.SalesInvoice != null ? o.SalesInvoice.InvoiceId : (int?)null,
+            o.SalesInvoice != null ? o.SalesInvoice.InvoiceNo : null,
+            o.SalesInvoice != null ? o.SalesInvoice.InvoiceDate : (DateOnly?)null,
+            o.SalesInvoice != null ? o.SalesInvoice.DueDate : (DateOnly?)null,
+            o.SalesInvoice != null ? o.SalesInvoice.TotalAmount : o.TotalAmount,
+            (o.CollectionAllocations.Where(a => a.Collection.Status.StatusKey == "CONFIRMED").Sum(a => (decimal?)a.Amount) ?? 0m)
+              + (o.SalesInvoice != null
+                  ? o.SalesInvoice.VoucherAllocations
+                      .Where(v => v.Voucher.Status.StatusKey == "POSTED" && !v.Voucher.Collections.Any())
+                      .Sum(v => (decimal?)v.Amount) ?? 0m
+                  : 0m),
+            o.CollectionAllocations.Where(a => a.Collection.Status.StatusKey == "AWAITING").Sum(a => (decimal?)a.Amount) ?? 0m));
 
     // ══════════════════════════════════════════════════════════════════
     //  THE LIST
@@ -133,15 +175,15 @@ public class SalesCollectionsController : ApiControllerBase
     //  THE DROPDOWNS
     // ══════════════════════════════════════════════════════════════════
 
-    /// <summary>Customers with something still owing on an invoiced order.</summary>
+    /// <summary>The rep's customers with something still to collect on a live order.</summary>
     [HttpGet("customers")]
     public async Task<IActionResult> Customers()
     {
         try
         {
-            var rows = await CollectionDeskController.Project(OpenOrders()).ToListAsync();
+            var rows = await Project(OpenOrders()).ToListAsync();
             var customers = rows
-                .Where(r => r.balance - r.awaiting > 0)
+                .Where(r => r.collectable > 0)
                 .GroupBy(r => new { r.customerId, r.customerName, r.customerCode, r.city })
                 .Select(g => new
                 {
@@ -150,7 +192,7 @@ public class SalesCollectionsController : ApiControllerBase
                     code = g.Key.customerCode,
                     city = g.Key.city,
                     openOrders = g.Count(),
-                    owed = g.Sum(r => r.balance),
+                    owed = g.Sum(r => r.collectable),
                     awaiting = g.Sum(r => r.awaiting)
                 })
                 .OrderBy(c => c.name)
@@ -169,9 +211,8 @@ public class SalesCollectionsController : ApiControllerBase
     {
         try
         {
-            var rows = await CollectionDeskController.Project(OpenOrders().Where(o => o.CustomerUserId == customerId))
-                .ToListAsync();
-            var open = rows.Where(r => r.balance - r.awaiting > 0).ToList();
+            var rows = await Project(OpenOrders().Where(o => o.CustomerUserId == customerId)).ToListAsync();
+            var open = rows.Where(r => r.collectable > 0).ToList();
             var ids = open.Select(r => r.id).ToList();
 
             var items = await _db.SalesOrderItems.AsNoTracking()
@@ -182,20 +223,25 @@ public class SalesCollectionsController : ApiControllerBase
 
             return Ok(new
             {
-                items = open.OrderBy(r => r.invoiceDate).ThenBy(r => r.id).Select(r => new
+                /* Delivered first -- that is when the money is due -- then oldest. */
+                items = open.OrderByDescending(r => r.status == OrderWorkflow.Delivered).ThenBy(r => r.orderDate).ThenBy(r => r.id).Select(r => new
                 {
                     id = r.id,
                     orderNo = r.orderNo,
+                    status = r.status,
+                    statusName = r.statusName,
+                    delivered = r.status == OrderWorkflow.Delivered,
+                    orderDate = r.orderDate,
                     invoiceNo = r.invoiceNo,
                     invoiceDate = r.invoiceDate,
                     dueDate = r.dueDate,
                     total = r.total,
-                    received = r.collected + r.viaVouchers,
+                    received = r.received,
                     awaiting = r.awaiting,
-                    balance = Math.Max(0, r.balance),
+                    balance = r.balance,
                     /* What can still be collected: owed, less what reps already
                        hold against it and accounts has not confirmed yet. */
-                    collectable = Math.Max(0, r.balance - r.awaiting),
+                    collectable = r.collectable,
                     lines = items.Where(l => l.OrderId == r.id)
                         .Select(l => new { l.name, l.qty, l.rate, l.total }).ToList()
                 })
@@ -218,11 +264,10 @@ public class SalesCollectionsController : ApiControllerBase
         {
             if (body.Amount <= 0) return BadRequest(new { message = "Enter the amount you collected." });
 
-            var row = await CollectionDeskController.Project(OpenOrders().Where(o => o.OrderId == body.OrderId))
-                .FirstOrDefaultAsync();
-            if (row is null) return BadRequest(new { message = "Pick one of your invoiced orders that still owes money." });
+            var row = await Project(OpenOrders().Where(o => o.OrderId == body.OrderId)).FirstOrDefaultAsync();
+            if (row is null) return BadRequest(new { message = "Pick one of your orders that still owes money." });
 
-            var collectable = row.balance - row.awaiting;
+            var collectable = row.collectable;
             if (collectable <= 0)
                 return BadRequest(new { message = $"Nothing more can be collected on {row.orderNo} -- it is paid, or the rest is already waiting to be confirmed." });
             if (body.Amount > collectable)

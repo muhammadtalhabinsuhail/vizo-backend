@@ -67,6 +67,8 @@ public static class LedgerPosting
     public const string OutputTaxCode = "2110";
     public const string StaffPayablesCode = "2140";
     public const string SalaryExpenseCode = "5101";
+    /// <summary>The heading vendor accounts for expenses are opened under (database/48).</summary>
+    public const string ExpenseVendorsCode = "2170";
     public const string CashOnHandCode = "1101";
 
     private const string Posted = "POSTED";

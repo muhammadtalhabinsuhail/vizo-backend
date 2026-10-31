@@ -26,6 +26,12 @@ namespace vizo_backend.Controllers;
 ///                                                  short-paid day reduces the cost)
 ///   Adjustment         either side, against any account the accountant picks
 ///
+/// A member of staff may have THEIR OWN salary account ("Shahab Salary",
+/// "StaffMember"."SalaryAccountId", database/48 -- the owner, 1 Nov). Their
+/// salary, bonus and deduction rows and the salary run post to it instead of
+/// 5101; and an expense booked to it on the day sheet reaches this ledger
+/// (ExpenseSheetsController.Approve).
+///
 /// So the ledger's balance is in the liability's own sense: CREDIT = salary we
 /// still owe them, DEBIT = an advance they still owe us. The screen and the
 /// PDF say which in words.
@@ -152,6 +158,9 @@ public class StaffLedgerController : ApiControllerBase
                 category = s.Category.CategoryName,
                 phone = s.Phone,
                 monthlySalary = s.MonthlySalary,
+                salaryAccountId = s.SalaryAccountId,
+                salaryAccount = s.SalaryAccountId == null ? null
+                    : _db.Accounts.Where(a => a.AccountId == s.SalaryAccountId).Select(a => a.AccountCode + " " + a.AccountName).FirstOrDefault(),
                 hasLogin = s.UserId != null,
                 role = s.UserId == null ? null
                     : _db.Users.Where(u => u.UserId == s.UserId).Select(u => u.Role.RoleName).FirstOrDefault(),
@@ -221,8 +230,13 @@ public class StaffLedgerController : ApiControllerBase
             var error = await ValidateStaff(body, null);
             if (error is not null) return BadRequest(new { message = error });
 
+            await using var tx = await _db.Database.BeginTransactionAsync();
+            var (salaryAccountId, salaryError) = await ResolveSalaryAccount(body, body.FullName!.Trim(), null);
+            if (salaryError is not null) return BadRequest(new { message = salaryError });
+
             var s = new StaffMember
             {
+                SalaryAccountId = salaryAccountId,
                 StaffCode = string.IsNullOrWhiteSpace(body.Code) ? await NextStaffCode() : body.Code.Trim().ToUpperInvariant(),
                 FullName = body.FullName!.Trim(),
                 Phone = Clean(body.Phone),
@@ -238,6 +252,7 @@ public class StaffLedgerController : ApiControllerBase
             };
             _db.StaffMembers.Add(s);
             await _db.SaveChangesAsync();
+            await tx.CommitAsync();
             await Log("STAFF_ADDED", "StaffMember", s.StaffCode, s.FullName, 1);
 
             return Ok(new { id = s.StaffId, code = s.StaffCode, message = $"{s.FullName} added as {s.StaffCode}." });
@@ -268,6 +283,12 @@ public class StaffLedgerController : ApiControllerBase
             s.Notes = Clean(body.Notes);
             if (body.IsActive is bool active) s.IsActive = active;
             if (body.UserId is not null || body.UnlinkUser == true) s.UserId = body.UnlinkUser == true ? null : body.UserId;
+            if (body.SalaryAccountId is not null || body.CreateSalaryAccount == true || body.UnlinkSalaryAccount == true)
+            {
+                var (salaryAccountId, salaryError) = await ResolveSalaryAccount(body, s.FullName, id);
+                if (salaryError is not null) return BadRequest(new { message = salaryError });
+                s.SalaryAccountId = salaryAccountId;
+            }
             await _db.SaveChangesAsync();
             await Log("STAFF_UPDATED", "StaffMember", s.StaffCode, s.FullName, 1);
             return Ok(new { id, message = $"{s.FullName} saved." });
@@ -300,6 +321,40 @@ public class StaffLedgerController : ApiControllerBase
         }
         return null;
     }
+
+    /// <summary>
+    /// The salary account the request asks for: a new "{Name} Salary" expense
+    /// account under 5000 (CreateSalaryAccount), an existing expense account
+    /// nobody else is linked to (SalaryAccountId), or none (UnlinkSalaryAccount).
+    /// </summary>
+    private async Task<(int? Id, string? Error)> ResolveSalaryAccount(StaffRequest b, string name, int? staffId)
+    {
+        if (b.UnlinkSalaryAccount == true) return (null, null);
+        if (b.CreateSalaryAccount == true)
+        {
+            var (acc, error) = await ChartAccounts.OpenUnderAsync(_db, "5000", $"{name} Salary");
+            if (acc is null) return (null, error);
+            await Log("ACCOUNT_CREATED", "Account", acc.AccountCode, $"{acc.AccountName} (salary account)", 2);
+            return (acc.AccountId, null);
+        }
+        if (b.SalaryAccountId is int want)
+        {
+            var ok = await _db.Accounts.AnyAsync(a => a.AccountId == want && a.IsActive && !a.IsGroup
+                                                      && a.AccountType.Group.GroupName == "Expenses");
+            if (!ok) return (null, "A salary account must be an expense account that can take a posting.");
+            var other = await _db.StaffMembers.AsNoTracking()
+                .Where(x => x.SalaryAccountId == want && x.StaffId != staffId).Select(x => x.FullName).FirstOrDefaultAsync();
+            if (other is not null) return (null, $"That account is already {other}'s salary account.");
+            return (want, null);
+        }
+        return (null, null);
+    }
+
+    /// <summary>The expense account a person's salary posts to: their own, or 5101.</summary>
+    private async Task<int?> SalaryExpenseFor(StaffMember s) =>
+        s.SalaryAccountId is int own && await _db.Accounts.AnyAsync(a => a.AccountId == own && a.IsActive)
+            ? own
+            : await LedgerPosting.AccountIdAsync(_db, LedgerPosting.SalaryExpenseCode);
 
     // ══════════════════════════════════════════════════════════════════
     //  STATEMENT
@@ -337,6 +392,9 @@ public class StaffLedgerController : ApiControllerBase
                 id = x.StaffId, code = x.StaffCode, name = x.FullName, phone = x.Phone, cnic = x.Cnic,
                 categoryId = x.StaffCategoryId, category = x.Category.CategoryName,
                 monthlySalary = x.MonthlySalary, openingBalance = x.OpeningBalance,
+                salaryAccountId = x.SalaryAccountId,
+                salaryAccount = x.SalaryAccountId == null ? null
+                    : _db.Accounts.Where(a => a.AccountId == x.SalaryAccountId).Select(a => a.AccountCode + " " + a.AccountName).FirstOrDefault(),
                 joinedOn = x.JoinedOn, isActive = x.IsActive, notes = x.Notes, userId = x.UserId,
                 login = x.UserId == null ? null : _db.Users.Where(u => u.UserId == x.UserId)
                     .Select(u => u.Email ?? u.FullName).FirstOrDefault(),
@@ -439,7 +497,11 @@ public class StaffLedgerController : ApiControllerBase
             }
             else
             {
-                counter = await LedgerPosting.AccountIdAsync(_db, spec.DefaultCounter)
+                /* Salary, bonus and deduction go to the person's own salary
+                   account when they have one (the owner, 1 Nov). */
+                counter = (spec.DefaultCounter == LedgerPosting.SalaryExpenseCode
+                              ? await SalaryExpenseFor(s)
+                              : await LedgerPosting.AccountIdAsync(_db, spec.DefaultCounter))
                           ?? throw new InvalidOperationException($"Account {spec.DefaultCounter} is missing.");
             }
 
@@ -516,8 +578,9 @@ public class StaffLedgerController : ApiControllerBase
                     skipped.Add(s.FullName);
                     continue;
                 }
+                var own = await SalaryExpenseFor(s) ?? expense.Value;
                 var (entry, error) = await PostStaffRow(s, last, $"Salary due {first:MMM yyyy}",
-                    0m, s.MonthlySalary, staffAcc.Value, expense.Value, reference);
+                    0m, s.MonthlySalary, staffAcc.Value, own, reference);
                 if (entry is null) return BadRequest(new { message = $"{s.FullName}: {error}" });
                 posted.Add(s.FullName);
             }
@@ -757,7 +820,8 @@ public class StaffLedgerController : ApiControllerBase
     public record StaffRequest(
         string? FullName, int? CategoryId, string? Phone, string? Cnic, decimal? MonthlySalary,
         decimal? OpeningBalance, DateOnly? JoinedOn, string? Notes, string? Code,
-        int? UserId, bool? UnlinkUser, bool? IsActive);
+        int? UserId, bool? UnlinkUser, bool? IsActive,
+        int? SalaryAccountId = null, bool? CreateSalaryAccount = null, bool? UnlinkSalaryAccount = null);
 
     public record StaffRowRequest(
         DateOnly? Date, string? Type, string? Description, decimal? Debit, decimal? Credit, int? AccountId);

@@ -61,6 +61,13 @@ public class StaffMember
     [MaxLength(300)]
     public string? Notes { get; set; }
 
+    /// <summary>
+    /// This person's own salary expense account ("Shahab Salary"), if one is
+    /// linked (database/48). Expenses booked to it reach their staff ledger,
+    /// and their salary rows post to it instead of the general 5101.
+    /// </summary>
+    public int? SalaryAccountId { get; set; }
+
     [Column(TypeName = "timestamp without time zone")]
     public DateTime CreatedAt { get; set; }
 }

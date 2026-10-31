@@ -23,4 +23,11 @@ public partial class Expense
 
     [ForeignKey(nameof(SheetId))]
     public virtual ExpenseSheet? Sheet { get; set; }
+
+    /// <summary>
+    /// The vendor account (under 2170 Expense Vendors) this expense was paid
+    /// to, if one was picked (database/48). Approval posts the bill and the
+    /// payment through it, so the vendor's ledger shows both.
+    /// </summary>
+    public int? VendorAccountId { get; set; }
 }

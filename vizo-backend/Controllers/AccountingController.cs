@@ -121,6 +121,9 @@ public partial class AccountingController : ApiControllerBase
                     openingBalance = a.OpeningBalance,
                     currency = a.CurrencyCode,
                     isActive = a.IsActive,
+                    /* Whose salary account this is, if anybody's (database/48). */
+                    staffId = _db.StaffMembers.Where(s => s.SalaryAccountId == a.AccountId).Select(s => (int?)s.StaffId).FirstOrDefault(),
+                    staffName = _db.StaffMembers.Where(s => s.SalaryAccountId == a.AccountId).Select(s => s.FullName).FirstOrDefault(),
                     movement = a.JournalEntryLines
                         .Where(l => l.Entry.Status.StatusKey == Posted)
                         .Sum(l => (decimal?)(l.DebitAmount - l.CreditAmount)) ?? 0m
@@ -134,7 +137,7 @@ public partial class AccountingController : ApiControllerBase
             return Ok(accounts.Select(a => new
             {
                 a.id, a.code, a.name, a.parentId, a.accountTypeId, a.type, a.group,
-                a.isGroup, a.openingBalance, a.currency, a.isActive,
+                a.isGroup, a.openingBalance, a.currency, a.isActive, a.staffId, a.staffName,
                 balance = a.isDebitNormal
                     ? a.openingBalance + a.movement
                     : a.openingBalance - a.movement

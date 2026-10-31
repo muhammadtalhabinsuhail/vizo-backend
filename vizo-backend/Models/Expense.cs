@@ -23,8 +23,6 @@ public partial class Expense
 
     public string VendorName { get; set; } = null!;
 
-    public int MethodId { get; set; }
-
     public string? Description { get; set; }
 
     public int StatusId { get; set; }
@@ -40,8 +38,6 @@ public partial class Expense
     public virtual Account ExpenseAccount { get; set; } = null!;
 
     public virtual Location Location { get; set; } = null!;
-
-    public virtual PaymentMethod Method { get; set; } = null!;
 
     public virtual Account PaidFromAccount { get; set; } = null!;
 

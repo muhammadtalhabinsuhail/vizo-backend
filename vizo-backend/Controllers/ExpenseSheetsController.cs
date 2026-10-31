@@ -182,29 +182,19 @@ public class ExpenseSheetsController : ApiControllerBase
     {
         try
         {
-            var methods = await _db.PaymentMethods.AsNoTracking()
-                .Where(m => m.IsActive && m.MethodKind != "credit")
-                .OrderBy(m => m.MethodId)
-                .Select(m => new { id = m.MethodId, key = m.MethodKey, name = m.MethodName })
-                .ToListAsync();
-
             var heads = await _db.Accounts.AsNoTracking()
                 .Where(a => a.IsActive && !a.IsGroup && a.AccountType.Group.GroupName == "Expenses")
                 .OrderBy(a => a.AccountCode)
                 .Select(a => new { id = a.AccountId, code = a.AccountCode, name = a.AccountName })
                 .ToListAsync();
 
-            var paidFrom = (await _db.Accounts.AsNoTracking()
-                    .Where(a => a.IsActive && !a.IsGroup && a.AccountType.TypeName == "Cash & Bank")
-                    .OrderBy(a => a.AccountCode)
-                    .Select(a => new { id = a.AccountId, code = a.AccountCode, name = a.AccountName })
-                    .ToListAsync())
-                .Select(a => new
-                {
-                    a.id, a.code, a.name,
-                    defaultMethodId = DefaultMethodId(a.name, methods.Select(m => (m.id, m.key)).ToList())
-                })
-                .ToList();
+            /* No payment method on an expense (the owner, 27 Oct): the
+               paid-from account already says cash or which bank. */
+            var paidFrom = await _db.Accounts.AsNoTracking()
+                .Where(a => a.IsActive && !a.IsGroup && a.AccountType.TypeName == "Cash & Bank")
+                .OrderBy(a => a.AccountCode)
+                .Select(a => new { id = a.AccountId, code = a.AccountCode, name = a.AccountName })
+                .ToListAsync();
 
             var (allowed, defaultLocationId) = await AllowedLocationsAsync();
             var locations = await _db.Locations.AsNoTracking()
@@ -224,7 +214,7 @@ public class ExpenseSheetsController : ApiControllerBase
 
             return Ok(new
             {
-                heads, paidFrom, methods, locations, defaultLocationId, vendors,
+                heads, paidFrom, locations, defaultLocationId, vendors,
                 today = Today(),
                 canApprove = CanApprove()
             });
@@ -358,8 +348,6 @@ public class ExpenseSheetsController : ApiControllerBase
                         vendorName = l.VendorName,
                         paidFromAccountId = l.PaidFromAccountId,
                         paidFrom = l.PaidFromAccount.AccountName,
-                        methodId = l.MethodId,
-                        method = l.Method.MethodName,
                         amount = l.Amount,
                         status = l.Status.StatusKey,
                         entryId = l.EntryId,
@@ -380,7 +368,7 @@ public class ExpenseSheetsController : ApiControllerBase
                 return new
                 {
                     l.id, l.expenseNo, l.expenseAccountId, l.head, l.headCode, l.categoryName,
-                    l.description, l.vendorName, l.paidFromAccountId, l.paidFrom, l.methodId, l.method,
+                    l.description, l.vendorName, l.paidFromAccountId, l.paidFrom,
                     l.amount, l.status, l.entryId, l.entryNo, l.createdBy,
                     locked, excluded
                 };
@@ -482,11 +470,6 @@ public class ExpenseSheetsController : ApiControllerBase
             var paidFrom = await _db.Accounts.AsNoTracking()
                 .Where(a => !a.IsGroup && a.AccountType.TypeName == "Cash & Bank")
                 .ToDictionaryAsync(a => a.AccountId, a => a.AccountName);
-            var methods = await _db.PaymentMethods.AsNoTracking()
-                .Where(m => m.IsActive)
-                .Select(m => new { m.MethodId, m.MethodKey })
-                .ToListAsync();
-            var methodPairs = methods.Select(m => (m.MethodId, m.MethodKey)).ToList();
 
             var byId = sheet.Lines.ToDictionary(l => l.ExpenseId);
             var errors = new List<LineError>();
@@ -513,8 +496,6 @@ public class ExpenseSheetsController : ApiControllerBase
                     Bad("amount", "Enter an amount above zero.");
                 else if (r.Amount >= 1_000_000_000_000m)
                     Bad("amount", "That amount is too large.");
-                if (r.MethodId is > 0 && methods.All(m => m.MethodId != r.MethodId))
-                    Bad("methodId", "Pick a valid payment method.");
             }
 
             if (errors.Count > 0)
@@ -575,9 +556,6 @@ public class ExpenseSheetsController : ApiControllerBase
                    drifted from it ("Utilities (KE)" booked to Rent). */
                 line.CategoryName = head.Length > 80 ? head[..80] : head;
                 line.PaidFromAccountId = r.PaidFromAccountId;
-                line.MethodId = r.MethodId is > 0
-                    ? r.MethodId.Value
-                    : DefaultMethodId(paidFrom[r.PaidFromAccountId], methodPairs);
                 line.Amount = Math.Round(r.Amount, 2, MidpointRounding.AwayFromZero);
                 line.VendorName = r.VendorName!.Trim();
                 line.Description = string.IsNullOrWhiteSpace(r.Description) ? null : r.Description.Trim();
@@ -1008,7 +986,6 @@ public class ExpenseSheetsController : ApiControllerBase
                     PaidFromAccountId = l.PaidFromAccountId,
                     Amount = l.Amount,
                     VendorName = l.VendorName,
-                    MethodId = l.MethodId,
                     Description = l.Description,
                     StatusId = draftId,
                     CreatedByUserId = CurrentUserId()
@@ -1132,34 +1109,13 @@ public class ExpenseSheetsController : ApiControllerBase
         return (allowed, preferred);
     }
 
-    /// <summary>
-    /// The payment method a paid-from account implies, so nobody has to pick
-    /// "Cash" after picking "Cash on Hand". Read from the account's name
-    /// because the chart of accounts has no column linking the two; the grid
-    /// lets it be changed when the guess is wrong (a bank account paid by
-    /// cheque).
-    /// </summary>
-    private static int DefaultMethodId(string accountName, List<(int Id, string Key)> methods)
-    {
-        var n = accountName.ToLowerInvariant();
-        /* JazzCash before cash: "JazzCash Wallet" contains "cash". */
-        var key = n.Contains("jazz") ? "JAZZCASH"
-                : n.Contains("easypaisa") ? "EASYPAISA"
-                : n.Contains("petty") ? "PETTY_CASH"
-                : n.Contains("cash") ? "CASH"
-                : "BANK";
-        return methods.FirstOrDefault(m => m.Key == key).Id is var hit and > 0
-            ? hit
-            : methods.FirstOrDefault().Id;
-    }
-
     // ══════════════════════════ request bodies ══════════════════════════
 
     public record SheetOpenRequest(DateOnly? Date, int? LocationId);
 
     public record SheetLineRequest(
         int? Id, int ExpenseAccountId, string? Description, string? VendorName,
-        int PaidFromAccountId, int? MethodId, decimal Amount);
+        int PaidFromAccountId, decimal Amount);
 
     public record SheetSaveRequest(string? Notes, List<SheetLineRequest>? Lines);
 

@@ -43,7 +43,7 @@ public class ChartOfAccountsController : ApiControllerBase
        PurchasesController, AccountingController, StaffLedgerController ...). */
     private static readonly HashSet<string> SystemCodes = new()
     {
-        "1101", "1102", "1110", "1111", "1112", "1113", "1120", "1121", "1130", "1140",
+        "1101", "1111", "1113", "1130", "1140",
         "2101", "2110", "2111", "2120", "2140", "2150", "2160", "2161", "2162",
         "4001", "4002", "5001", "5101",
     };

@@ -722,7 +722,6 @@ public static class DocumentBuilder
                    the money went. The boolean is the thing worth reading. */
                 isReceipt = x.VoucherType.IsReceipt,
                 status = x.Status.StatusName,
-                method = x.Method.MethodName,
                 location = x.Location.LocationName,
                 party = x.PartyUser != null ? (x.PartyUser.DisplayName ?? x.PartyUser.LegalName) : null,
                 partyCode = x.PartyUser != null ? x.PartyUser.PartyCode : null,
@@ -747,7 +746,6 @@ public static class DocumentBuilder
         {
             new("Date", DocumentPdf.Day(v.VoucherDate)),
             new("Type", v.type),
-            new("Method", v.method),
             new("Location", v.location),
         };
         if (!string.IsNullOrWhiteSpace(v.account)) meta.Add(new("Cash / Bank", v.account!));
@@ -873,7 +871,6 @@ public static class DocumentBuilder
             {
                 e.ExpenseNo, e.ExpenseDate, e.CategoryName, e.Amount, e.VendorName, e.Description,
                 status = e.Status.StatusName,
-                method = e.Method.MethodName,
                 location = e.Location.LocationName,
                 expenseAccount = e.ExpenseAccount.AccountName,
                 expenseCode = e.ExpenseAccount.AccountCode,
@@ -897,7 +894,6 @@ public static class DocumentBuilder
             {
                 new DocumentPdf.Fact("Date", DocumentPdf.Day(x.ExpenseDate)),
                 new DocumentPdf.Fact("Category", x.CategoryName),
-                new DocumentPdf.Fact("Method", x.method),
                 new DocumentPdf.Fact("Location", x.location),
             },
             Columns: new[]
@@ -912,7 +908,7 @@ public static class DocumentBuilder
                     new[] { x.expenseAccount, x.Description ?? x.CategoryName, DocumentPdf.Money(x.Amount) },
                     Sub: $"DR {x.expenseCode}"),
                 new DocumentPdf.Row(
-                    new[] { x.paidFrom, $"Paid by {x.method}", $"({DocumentPdf.Money(x.Amount)})" },
+                    new[] { x.paidFrom, "Paid from", $"({DocumentPdf.Money(x.Amount)})" },
                     Sub: $"CR {x.paidFromCode}"),
             },
             Totals: new[]

@@ -40,21 +40,21 @@ public partial class AccountingController : ApiControllerBase
 
     private const string Posted = "POSTED";
 
-    /* PAYMENTS AND JOURNAL VOUCHERS ARE THE SUPER ADMIN'S (the owner, 22 Oct):
-       "cash payment, bank payment and general voucher will be done by only
-       super admin ... any payment or JV entries must not be seen by
-       accountant, only he will see all receipts". So for everybody else the
-       voucher list, the voucher page and every voucher action see receipts
-       only -- a payment voucher simply does not exist for them. */
-    private bool SeesPayments() => CurrentRole() == "super-admin";
+    /* EVERY VOUCHER TYPE FOR THE SUPER ADMIN AND THE ACCOUNTANT (the owner,
+       27 Oct): the accountant now does CR, CP, BR, BP and JV exactly as the
+       admin does -- sees them all, enters them on the form and in the Voucher
+       Book, and edits them. This replaces the 22 Oct rule that kept payments
+       and JVs to the Super Admin. The helper stays so every voucher action
+       still asks one question in one place; the controller's Accountant
+       policy already limits callers to these two roles. */
+    private bool SeesPayments() => CurrentRole() is "super-admin" or "accountant";
 
-    /* THE JOURNAL IS THE SUPER ADMIN'S TOO (the owner, 22 Oct: hide Journal
-       Entries "so they can't see JVs anywhere"). Every JV the voucher book
-       writes is a journal entry, so hiding JV vouchers alone left them one page
-       away. All eight journal-entry actions answer 403 to anybody else. The
-       ledgers, statements and trial balance are untouched -- those are where
-       the accountant reads the books. */
-    private const string JournalsOwnerOnly = "Journal entries are the Super Admin's.";
+    /* THE JOURNAL FOLLOWS THE VOUCHERS. On 22 Oct the owner hid journal
+       entries from the accountant along with JV vouchers; since 27 Oct the
+       accountant does every voucher type, JV included, so the eight
+       journal-entry actions ask SeesPayments() too -- which now lets both the
+       Super Admin and the accountant through, and anybody else is refused. */
+    private const string JournalsOwnerOnly = "Journal entries are for the Super Admin and the accountant.";
 
     private const string ReceiptsOnly =
         "Payment and journal vouchers are the Super Admin's. Accounts records receipts only.";
@@ -613,7 +613,6 @@ public partial class AccountingController : ApiControllerBase
                     partyName = v.PartyUser != null ? (v.PartyUser.DisplayName ?? v.PartyUser.LegalName) : null,
                     cashBankAccount = v.CashBankAccount != null ? v.CashBankAccount.AccountName : null,
                     amount = v.Amount,
-                    paymentMethod = v.Method.MethodKey,
                     paymentProvider = v.PaymentProvider,
                     reference = v.ReferenceNo,
                     narration = v.Narration,
@@ -670,7 +669,6 @@ public partial class AccountingController : ApiControllerBase
                     cashBankAccountId = x.CashBankAccountId,
                     cashBankAccount = x.CashBankAccount != null ? x.CashBankAccount.AccountName : null,
                     amount = x.Amount,
-                    paymentMethod = x.Method.MethodKey,
                     paymentProvider = x.PaymentProvider,
                     reference = x.ReferenceNo,
                     walletTxnId = x.WalletTxnId,
@@ -819,6 +817,18 @@ public partial class AccountingController : ApiControllerBase
                 if (c.Note.Length > 300) c.Note = c.Note[..300];
             }
 
+            /* THE ACCOUNT IT WENT INTO (the owner, 1 Nov): the accountant picks
+               Cash on Hand, Meezan, Faysal ... from the chart's Cash & Bank
+               accounts, and the receipt is posted there. Without one, the
+               collection posts through its method's account as before. */
+            if (body?.DepositAccountId is int depositId)
+            {
+                var ok = await _db.Accounts.AnyAsync(a => a.AccountId == depositId && a.IsActive && !a.IsGroup
+                                                          && a.AccountType.TypeName == "Cash & Bank");
+                if (!ok) return BadRequest(new { message = "Pick a Cash & Bank account the money went into." });
+                c.DepositAccountId = depositId;
+            }
+
             var confirmed = await _db.CollectionStatuses.FirstOrDefaultAsync(s => s.StatusKey == "CONFIRMED");
             if (confirmed is null) return BadRequest(new { message = "No CONFIRMED status is configured." });
 
@@ -852,7 +862,7 @@ public partial class AccountingController : ApiControllerBase
                 NotificationKinds.CollectionConfirmed,
                 $"Collection confirmed by {CurrentUserName()}",
                 $"{c.ReceiptNo} -- PKR {c.Amount:N0} has been confirmed.",
-                url: "/accounting/collections",
+                url: "/sales/collections",
                 exceptUserId: CurrentUserId(),
                 alsoUserIds: new[] { c.CollectedByUserId });
 
@@ -905,7 +915,6 @@ public partial class AccountingController : ApiControllerBase
                     paidFromAccount = e.PaidFromAccount.AccountName,
                     amount = e.Amount,
                     vendorName = e.VendorName,
-                    paymentMethod = e.Method.MethodKey,
                     description = e.Description,
                     status = e.Status.StatusKey,
                     statusName = e.Status.StatusName,
@@ -971,7 +980,6 @@ public partial class AccountingController : ApiControllerBase
                     paidFromAccount = x.PaidFromAccount.AccountName,
                     amount = x.Amount,
                     vendorName = x.VendorName,
-                    paymentMethod = x.Method.MethodKey,
                     description = x.Description,
                     status = x.Status.StatusKey,
                     statusName = x.Status.StatusName,
@@ -1755,7 +1763,7 @@ public partial class AccountingController : ApiControllerBase
     public record ExpenseRequest(
         DateOnly? ExpenseDate, int LocationId, string? CategoryName,
         int ExpenseAccountId, int PaidFromAccountId, decimal Amount,
-        string VendorName, int MethodId, string? Description);
+        string VendorName, string? Description);
 
     // ══════════════════════════════════════════════════════════════════
     //  CREATE  --  voucher
@@ -1896,16 +1904,8 @@ public partial class AccountingController : ApiControllerBase
 
             if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
                 return BadRequest(new { message = "Pick a valid location." });
-            var payMethod = await _db.PaymentMethods.AsNoTracking()
-                .FirstOrDefaultAsync(m => m.MethodId == body.MethodId);
-            if (payMethod is null)
-                return BadRequest(new { message = "Pick a valid payment method." });
-
-            /* A cash receipt is cash in hand -- never "Credit" (the owner,
-               21 Oct). Marking one Credit posted money into the cash account
-               that had not arrived. */
-            if (type.TypeCode == "CR" && payMethod.MethodKind == "credit")
-                return BadRequest(new { message = $"A cash receipt cannot use {payMethod.MethodName}. Pick Cash or a bank." });
+            /* No payment method on a voucher (the owner, 27 Oct): the type
+               says cash or bank and CashBankAccountId says which account. */
             if (body.PartyId is not null && !await _db.Parties.AnyAsync(p => p.UserId == body.PartyId))
                 return BadRequest(new { message = "Pick a valid party." });
             if (body.CashBankAccountId is not null &&
@@ -1935,7 +1935,6 @@ public partial class AccountingController : ApiControllerBase
                 PartyUserId = body.PartyId,
                 CashBankAccountId = body.CashBankAccountId,
                 Amount = body.Amount,
-                MethodId = body.MethodId,
                 PaymentProvider = body.PaymentProvider,
                 ReferenceNo = body.Reference,
                 WalletTxnId = body.WalletTxnId,
@@ -2095,7 +2094,6 @@ public partial class AccountingController : ApiControllerBase
                 new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 18),
                 new XlsxWriter.Column("Expense Account", "expenseAccount", XlsxWriter.CellKind.Text, 26),
                 new XlsxWriter.Column("Paid From", "paidFromAccount", XlsxWriter.CellKind.Text, 22),
-                new XlsxWriter.Column("Paid Via", "paymentMethod"),
                 new XlsxWriter.Column("Amount", "amount", XlsxWriter.CellKind.Money),
                 new XlsxWriter.Column("Status", "statusName"),
                 new XlsxWriter.Column("Entry No", "entryNo", XlsxWriter.CellKind.Text, 16),
@@ -2168,7 +2166,6 @@ public partial class AccountingController : ApiControllerBase
                 new XlsxWriter.Column("Party", "partyName", XlsxWriter.CellKind.Text, 28),
                 new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 18),
                 new XlsxWriter.Column("Cash/Bank", "cashBankAccount", XlsxWriter.CellKind.Text, 24),
-                new XlsxWriter.Column("Method", "paymentMethod"),
                 new XlsxWriter.Column("Reference", "reference", XlsxWriter.CellKind.Text, 18),
                 new XlsxWriter.Column("Amount", "amount", XlsxWriter.CellKind.Money),
                 new XlsxWriter.Column("Status", "statusName"),
@@ -2196,13 +2193,13 @@ public partial class AccountingController : ApiControllerBase
     public record VoucherAllocationRequest(int? SalesInvoiceId, int? PurchaseInvoiceId, decimal Amount);
 
     /// <summary>Optional: confirm less than the rep recorded, and/or add a note.</summary>
-    public record ConfirmCollectionRequest(decimal? Amount, string? Note);
+    public record ConfirmCollectionRequest(decimal? Amount, string? Note, int? DepositAccountId = null);
 
     public record MatchLineRequest(int StatementLineId, int? JournalEntryLineId);
 
     public record VoucherRequest(
         int VoucherTypeId, DateOnly? VoucherDate, int LocationId, int? PartyId,
-        int? CashBankAccountId, decimal Amount, int MethodId,
+        int? CashBankAccountId, decimal Amount,
         string? PaymentProvider, string? Reference, string? WalletTxnId,
         string? Narration, bool PostImmediately,
         List<VoucherAllocationRequest>? Allocations);
@@ -2682,7 +2679,6 @@ public partial class AccountingController : ApiControllerBase
             e.PaidFromAccountId = body.PaidFromAccountId;
             e.Amount = body.Amount;
             e.VendorName = body.VendorName.Trim();
-            e.MethodId = body.MethodId;
             e.Description = body.Description?.Trim();
 
             await _db.SaveChangesAsync();
@@ -3015,8 +3011,6 @@ public partial class AccountingController : ApiControllerBase
         if (string.IsNullOrWhiteSpace(body.VendorName)) return "Who was paid?";
         if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
             return "Pick a valid location.";
-        if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
-            return "Pick a valid payment method.";
         /* Not merely "a real account" -- the RIGHT KIND of account. Nothing
            stopped an expense being booked against Owner Capital before this,
            and the resulting entry balanced perfectly while saying something
@@ -3384,7 +3378,6 @@ public partial class AccountingController : ApiControllerBase
             v.PartyUserId = body.PartyId;
             v.CashBankAccountId = body.CashBankAccountId;
             v.Amount = body.Amount;
-            v.MethodId = body.MethodId;
             v.PaymentProvider = body.PaymentProvider;
             v.ReferenceNo = body.Reference;
             v.WalletTxnId = body.WalletTxnId;
@@ -3732,11 +3725,6 @@ public partial class AccountingController : ApiControllerBase
             return ReceiptsOnly;
         if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
             return "Pick a valid location.";
-        var method = await _db.PaymentMethods.AsNoTracking()
-            .FirstOrDefaultAsync(m => m.MethodId == body.MethodId);
-        if (method is null) return "Pick a valid payment method.";
-        if (type.TypeCode == "CR" && method.MethodKind == "credit")
-            return $"A cash receipt cannot use {method.MethodName}. Pick Cash or a bank.";
         if (body.PartyId is not null && !await _db.Parties.AnyAsync(p => p.UserId == body.PartyId))
             return "Pick a valid party.";
         if (body.CashBankAccountId is not null

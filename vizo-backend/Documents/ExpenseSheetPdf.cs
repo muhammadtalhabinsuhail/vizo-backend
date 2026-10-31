@@ -65,7 +65,7 @@ public static class ExpenseSheetPdf
 
     public sealed record Line(
         int No, string Head, string HeadCode, string? Description, string Vendor,
-        string PaidFrom, string Method, decimal Amount,
+        string PaidFrom, decimal Amount,
         /* A pre-sheet line that was reversed on its own: printed for the record
            and left out of every total. */
         bool Excluded);
@@ -117,7 +117,6 @@ public static class ExpenseSheetPdf
                     code = l.ExpenseAccount.AccountCode,
                     l.Description, l.VendorName, l.Amount,
                     paidFrom = l.PaidFromAccount.AccountName,
-                    method = l.Method.MethodName,
                     status = l.Status.StatusKey,
                     entryNo = l.Entry != null ? l.Entry.EntryNo : null
                 }).ToList()
@@ -150,7 +149,7 @@ public static class ExpenseSheetPdf
             s.createdBy, s.CreatedAt, s.approvedBy, s.ApprovedAt,
             s.reversedBy, s.ReversedAt, s.ReversalReason, s.Notes,
             s.lines.Select(l => new Line(
-                ++n, l.head, l.code, l.Description, l.VendorName, l.paidFrom, l.method, l.Amount,
+                ++n, l.head, l.code, l.Description, l.VendorName, l.paidFrom, l.Amount,
                 Excluded: s.status != "REVERSED" && l.status is "REVERSED" or "REJECTED" or "CANCELLED"))
                 .ToList());
 
@@ -443,7 +442,7 @@ public static class ExpenseSheetPdf
         pdf.Text(ColVendor, bottom + 10, pdf.Ellipsis(l.Vendor, 8.2, ColPaid - ColVendor - 8), 8.2, ink);
 
         pdf.Text(ColPaid, top, pdf.Ellipsis(l.PaidFrom, 8, ColAmount - 58 - ColPaid), 8, ink);
-        pdf.Text(ColPaid, sub, l.Excluded ? "reversed on its own" : l.Method, 6.8, l.Excluded ? Danger : Faint);
+        if (l.Excluded) pdf.Text(ColPaid, sub, "reversed on its own", 6.8, Danger);
 
         var amount = Money(l.Amount);
         pdf.TextRight(ColAmount, bottom + 10, amount, 8.8, ink, bold: !l.Excluded);

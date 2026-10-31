@@ -30,9 +30,9 @@ namespace vizo_backend.Controllers;
 /// two-line journal entry (type JOURNAL), because a voucher row can only name a
 /// party and a cash/bank account, and a JV names two accounts of any kind.
 ///
-/// WHO: the Super Admin may use every code. Everybody else -- the accountant --
-/// gets CR and BR only, sees only receipts in the day's list, and is refused a
-/// payment or a JV here exactly as on the single form (SeesPayments).
+/// WHO: the Super Admin and the accountant both use every code and see every
+/// entry of the day (the owner, 27 Oct; SeesPayments). There is no payment
+/// method on a row -- the code says cash or bank, the account says which.
 ///
 /// The whole table is saved in ONE transaction: a mistake on row 9 saves none
 /// of the 14, and says which row. Half a day's book is harder to put right
@@ -86,7 +86,6 @@ public partial class AccountingController
                     cash = v.CashBankAccount != null ? v.CashBankAccount.AccountCode + " " + v.CashBankAccount.AccountName : null,
                     v.Narration, v.Amount,
                     status = v.Status.StatusKey, statusName = v.Status.StatusName,
-                    method = v.Method.MethodName,
                     createdBy = v.CreatedByUser.FullName
                 })
                 .ToListAsync())
@@ -99,13 +98,13 @@ public partial class AccountingController
                            payment is the other way round. */
                         AccountCr: v.IsReceipt ? partyLabel : v.cash ?? "—",
                         AccountDr: v.IsReceipt ? v.cash ?? "—" : partyLabel,
-                        v.Narration, v.Amount, v.status, v.statusName, v.method, v.createdBy,
+                        v.Narration, v.Amount, v.status, v.statusName, v.createdBy,
                         $"/accounting/vouchers/{v.VoucherId}");
                 })
                 .ToList();
 
             /* Journal vouchers -- hand-written entries of type JOURNAL on this
-               date. The Super Admin's alone. */
+               date. */
             if (SeesPayments())
             {
                 var journals = await _db.JournalEntries.AsNoTracking()
@@ -139,7 +138,7 @@ public partial class AccountingController
                     AccountCr: Side(j.lines.Where(l => l.CreditAmount > 0)),
                     AccountDr: Side(j.lines.Where(l => l.DebitAmount > 0)),
                     j.Narration, j.lines.Sum(l => l.DebitAmount),
-                    j.status, j.statusName, null, j.createdBy,
+                    j.status, j.statusName, j.createdBy,
                     $"/accounting/journal-entries/{j.EntryId}")));
             }
 
@@ -187,7 +186,6 @@ public partial class AccountingController
 
             var allowed = (await BookCodesAsync()).Select(c => c.Code).ToHashSet();
             var types = await _db.VoucherTypes.AsNoTracking().ToDictionaryAsync(t => t.TypeCode);
-            var methods = await _db.PaymentMethods.AsNoTracking().Where(m => m.IsActive).ToListAsync();
 
             var draft = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == "DRAFT");
             var posted = await _db.PostingStatuses.FirstOrDefaultAsync(s => s.StatusKey == Posted);
@@ -276,18 +274,8 @@ public partial class AccountingController
                         row = i
                     });
 
-                /* The method follows the code when the row does not say: cash
-                   for CR/CP, the first bank method for BR/BP (receipts from the
-                   short receiving list, as on the single form). */
-                var methodId = r.MethodId ?? (code is "CR" or "CP"
-                    ? methods.FirstOrDefault(m => m.MethodKey == "CASH")?.MethodId
-                    : methods.Where(m => m.MethodKind == "bank" && (!type.IsReceipt || m.IsForReceiving))
-                             .OrderBy(m => m.MethodId).Select(m => (int?)m.MethodId).FirstOrDefault());
-                if (methodId is null)
-                    return BadRequest(new { message = $"{at}: pick a method.", row = i });
-
                 var req = new VoucherRequest(type.VoucherTypeId, body.Date, body.LocationId, r.PartyId,
-                    r.CashBankAccountId, r.Amount, methodId.Value, null, r.Reference, null,
+                    r.CashBankAccountId, r.Amount, null, r.Reference, null,
                     r.Particulars?.Trim(), body.Post, null);
                 var invalid = await ValidateVoucher(req);
                 if (invalid is not null) return BadRequest(new { message = $"{at}: {invalid}", row = i });
@@ -301,7 +289,6 @@ public partial class AccountingController
                     PartyUserId = r.PartyId,
                     CashBankAccountId = r.CashBankAccountId,
                     Amount = r.Amount,
-                    MethodId = methodId.Value,
                     ReferenceNo = r.Reference,
                     Narration = r.Particulars?.Trim() ?? "",
                     StatusId = body.Post ? posted.StatusId : draft.StatusId,
@@ -374,10 +361,10 @@ public partial class AccountingController
     public record VoucherBookLine(
         string Kind, int Id, string No, string Code, string AccountCr, string AccountDr,
         string? Particulars, decimal Amount, string Status, string StatusName,
-        string? Method, string? CreatedBy, string Url);
+        string? CreatedBy, string Url);
 
     public record VoucherBookRow(
-        string Code, int? PartyId, int? CashBankAccountId, int? MethodId,
+        string Code, int? PartyId, int? CashBankAccountId,
         int? DebitAccountId, int? DebitPartyId, int? CreditAccountId, int? CreditPartyId,
         decimal Amount, string? Particulars, string? Reference);
 

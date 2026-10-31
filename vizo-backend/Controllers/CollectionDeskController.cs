@@ -112,13 +112,13 @@ public class CollectionDeskController : ApiControllerBase
         }
     }
 
-    private sealed record Row(
+    internal sealed record Row(
         int id, string orderNo, string status, string statusName, DateOnly orderDate,
         int customerId, string customerName, string customerCode, string? city, string? salesPerson,
         int invoiceId, string invoiceNo, DateOnly invoiceDate, DateOnly dueDate, decimal total,
         decimal collected, decimal viaVouchers, decimal awaiting, decimal balance);
 
-    private IQueryable<Row> Project(IQueryable<SalesOrder> rows) =>
+    internal static IQueryable<Row> Project(IQueryable<SalesOrder> rows) =>
         rows.Select(o => new
             {
                 o,
@@ -277,26 +277,30 @@ public class CollectionDeskController : ApiControllerBase
         .Select(a => new CashBankAccount(a.AccountId, a.AccountCode, a.AccountName, IsCashAccount(a.AccountCode, a.AccountName)))
         .ToList();
 
-    /* Notes and coins, as against a bank or a wallet: Cash on Hand (1101), the
-       shop tills (1102), anything the chart names "Cash ...". A cash receipt
-       needs no reference and posts as a Cash Receipt; the rest as Bank Receipts. */
+    /* Notes and coins, as against a bank: Cash on Hand (1101), or anything the
+       chart names "Cash ...". A cash receipt needs no reference and posts as a
+       Cash Receipt; the rest as Bank Receipts. */
     public static bool IsCashAccount(string code, string name) =>
-        code == LedgerPosting.CashOnHandCode || code == "1102" ||
+        code == LedgerPosting.CashOnHandCode ||
         name.StartsWith("Cash", StringComparison.OrdinalIgnoreCase);
 
     public record CashBankAccount(int Id, string Code, string Name, bool IsCash);
 
     /* The method a collection is filed under, worked out from the account it
-       went into: the old fixed mapping where the account is one of those
-       (1110 BANK, 1111 MEEZAN ...), otherwise CASH for a till and BANK for any
-       other bank or wallet; CHEQUE when it was paid by cheque. The column is
+       went into: MEEZAN for 1111, FAISAL for 1113, otherwise CASH for a till
+       and BANK for any other bank; CHEQUE when it was paid by cheque. The column is
        NOT NULL and the reports group by it, so it is still filled. */
     private async Task<PaymentMethod?> MethodForAccountAsync(CashBankAccount acc, bool byCheque)
     {
         var methods = await _db.PaymentMethods.AsNoTracking().Where(m => m.IsActive).ToListAsync();
         if (byCheque) return methods.FirstOrDefault(m => m.MethodKey == "CHEQUE");
-        var exact = methods.FirstOrDefault(m => m.MethodKey != "PETTY_CASH" && m.MethodKey != "CHEQUE"
-                                                && LedgerPosting.CashAccountCodeFor(m.MethodKey) == acc.Code);
+        /* The bank's own method (MEEZAN, FAISAL) before the generic BANK, which
+           also lands in Meezan since migration 45. */
+        var exact = methods
+            .Where(m => m.MethodKey != "PETTY_CASH" && m.MethodKey != "CHEQUE"
+                        && LedgerPosting.CashAccountCodeFor(m.MethodKey) == acc.Code)
+            .OrderBy(m => m.MethodKey == "BANK" ? 1 : 0)
+            .FirstOrDefault();
         return exact ?? methods.FirstOrDefault(m => m.MethodKey == (acc.IsCash ? "CASH" : "BANK"));
     }
 
@@ -354,7 +358,14 @@ public class CollectionDeskController : ApiControllerBase
             var date = body.CollectedOn ?? Today();
             if (date > Today()) return BadRequest(new { message = "Money cannot be received on a date that has not come yet." });
 
-            var collector = body.CollectedByUserId ?? CurrentUserId();
+            /* WHO TOOK IT. Unless the accountant says otherwise it is the
+               order's salesperson (the owner, 1 Nov): money confirmed here
+               without the rep ever filing it still shows on the rep's Payment
+               Collection page, as theirs. */
+            var orderRep = await _db.SalesOrders.AsNoTracking().Where(o => o.OrderId == row.id)
+                .Select(o => o.SalesPersonUserId).FirstOrDefaultAsync();
+            var collector = body.CollectedByUserId
+                ?? (orderRep is int rep && await _db.Employees.AnyAsync(e => e.UserId == rep) ? rep : CurrentUserId());
             if (!await _db.Employees.AnyAsync(e => e.UserId == collector))
                 return BadRequest(new { message = "Pick who took the money (a staff member)." });
 
@@ -405,7 +416,7 @@ public class CollectionDeskController : ApiControllerBase
                 (left <= 0 ? "Paid in full." : $"PKR {left:N0} still owed."),
                 url: $"/ledgers/customers/{row.customerId}",
                 exceptUserId: CurrentUserId(),
-                alsoUserIds: new[] { collector });
+                alsoUserIds: orderRep is int r2 && r2 != collector ? new[] { collector, r2 } : new[] { collector });
 
             return Ok(new
             {

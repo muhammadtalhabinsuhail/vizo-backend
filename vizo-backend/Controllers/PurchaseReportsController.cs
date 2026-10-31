@@ -426,7 +426,6 @@ public class PurchaseReportsController : ApiControllerBase
                 receipt = v.VoucherType.IsReceipt,
                 type = v.VoucherType.TypeName,
                 account = v.CashBankAccount != null ? v.CashBankAccount.AccountName : null,
-                method = v.Method.MethodName,
                 bills = v.VoucherAllocations.Where(a => a.PurchaseInvoice != null)
                     .Select(a => a.PurchaseInvoice!.InvoiceNo).ToList()
             })
@@ -453,7 +452,7 @@ public class PurchaseReportsController : ApiControllerBase
             includeItems ? b.items : null)));
         events.AddRange(vouchers.Select(v => new LedgerEvent(
             v.VoucherDate, v.receipt ? "refund" : "payment", v.VoucherNo,
-            $"{v.type} · {v.account ?? v.method}" + (string.IsNullOrWhiteSpace(v.ReferenceNo) ? "" : $" · ref {v.ReferenceNo}"),
+            $"{v.type} · {v.account ?? v.type}" + (string.IsNullOrWhiteSpace(v.ReferenceNo) ? "" : $" · ref {v.ReferenceNo}"),
             v.bills.Count == 0 ? "on account" : $"pays {string.Join(", ", v.bills)}",
             v.receipt ? 0m : v.Amount, v.receipt ? v.Amount : 0m, v.VoucherId, null)));
         events.AddRange(adjustments.Select(a => new LedgerEvent(

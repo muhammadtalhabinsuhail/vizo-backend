@@ -82,15 +82,19 @@ public static class LedgerPosting
     ///
     /// "FAISAL" is the spelling migration 21 gave the method; the bank is
     /// Faysal, and its account is 1113 (migration 30).
+    ///
+    /// THREE CASH & BANK ACCOUNTS ONLY since 1 Nov (migration 45): Cash on
+    /// Hand 1101, Meezan 1111, Faysal 1113. HBL, UBL, Cash - Shop 2 and the two
+    /// wallets were folded into them, so a generic Bank or Cheque, and the
+    /// retired wallet methods on old rows, land in Meezan.
     /// </summary>
     public static string? CashAccountCodeFor(string? methodKey) => (methodKey ?? "").ToUpperInvariant() switch
     {
         "CASH" or "PETTY_CASH" => CashOnHandCode,
-        "BANK" or "CHEQUE" => "1110",
+        "BANK" or "CHEQUE" => "1111",
         "MEEZAN" => "1111",
         "FAISAL" or "FAYSAL" => "1113",
-        "EASYPAISA" => "1120",
-        "JAZZCASH" => "1121",
+        "EASYPAISA" or "JAZZCASH" => "1111",
         _ => null
     };
 
@@ -291,7 +295,7 @@ public static class LedgerPosting
 
         /* Was it paid at the counter? The entry says so: a debit on a cash or
            bank account. Keep that half, at the new total. */
-        var cashCodes = new[] { "1101", "1102", "1110", "1111", "1112", "1113", "1120", "1121" };
+        var cashCodes = new[] { "1101", "1111", "1113" };
         var cashAccounts = await db.Accounts.AsNoTracking()
             .Where(a => cashCodes.Contains(a.AccountCode))
             .ToDictionaryAsync(a => a.AccountId, a => a.AccountCode);
@@ -302,8 +306,7 @@ public static class LedgerPosting
             var code = cashAccounts[cashLine.AccountId];
             methodKey = code switch
             {
-                "1110" => "BANK", "1111" => "MEEZAN", "1113" => "FAISAL",
-                "1120" => "EASYPAISA", "1121" => "JAZZCASH", _ => "CASH"
+                "1111" => "MEEZAN", "1113" => "FAISAL", _ => "CASH"
             };
         }
 
@@ -486,7 +489,6 @@ public static class LedgerPosting
             PartyUserId = c.CustomerUserId,
             CashBankAccountId = cash.Value,
             Amount = c.Amount,
-            MethodId = c.MethodId,
             ReferenceNo = c.ReferenceNo ?? c.ReceiptNo,
             Narration = $"Collection {c.ReceiptNo}",
             StatusId = posted.StatusId,

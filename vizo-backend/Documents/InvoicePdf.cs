@@ -294,11 +294,11 @@ public static class InvoicePdf
                its own column, and saying it twice on one line is noise. */
             pdf.Text(ColDesc, rowBottom + 4, pdf.Ellipsis(l.Sku ?? "", 7.2, nameMax), 7.2, Faint);
 
-            /* Product.Packing is how many units are in a carton, so 0 or 1
-               means the item is sold loose and there is no pack to count. */
-            pdf.TextRight(ColPack, rowBottom + 10,
-                l.Packing > 1 ? l.Packing.ToString("N0", Pk) : "-", 8.6,
-                l.Packing > 1 ? Ink : Faint);
+            /* PACKING IS THE NUMBER OF PACKINGS SENT -- the same figure as the
+               quantity (the owner, 1 Nov: "VIZO Blaze Pro V65 Handfree, qty 10
+               -> 10 packings"). It used to print Product.Packing, the units in
+               one carton, which read as a wrong count beside the quantity. */
+            pdf.TextRight(ColPack, rowBottom + 10, l.Qty.ToString("N0", Pk), 8.6, Ink);
 
             pdf.TextRight(ColQty, rowBottom + 10, l.Qty.ToString("N0", Pk), 8.6, Ink);
             pdf.TextRight(ColRate, rowBottom + 10, Money(l.Rate), 8.6, Ink);

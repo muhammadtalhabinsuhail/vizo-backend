@@ -841,10 +841,6 @@ public partial class AppDbContext : DbContext
                 .HasForeignKey(d => d.LocationId)
                 .HasConstraintName("fk_expense_location");
 
-            entity.HasOne(d => d.Method).WithMany(p => p.Expenses)
-                .HasForeignKey(d => d.MethodId)
-                .HasConstraintName("fk_expense_method");
-
             entity.HasOne(d => d.PaidFromAccount).WithMany(p => p.ExpensePaidFromAccounts)
                 .HasForeignKey(d => d.PaidFromAccountId)
                 .HasConstraintName("fk_expense_paidfrom");
@@ -2019,10 +2015,6 @@ public partial class AppDbContext : DbContext
             entity.HasOne(d => d.Location).WithMany(p => p.Vouchers)
                 .HasForeignKey(d => d.LocationId)
                 .HasConstraintName("fk_voucher_location");
-
-            entity.HasOne(d => d.Method).WithMany(p => p.Vouchers)
-                .HasForeignKey(d => d.MethodId)
-                .HasConstraintName("fk_voucher_method");
 
             entity.HasOne(d => d.PartyUser).WithMany(p => p.Vouchers)
                 .HasForeignKey(d => d.PartyUserId)

@@ -21,8 +21,6 @@ public partial class Voucher
 
     public decimal Amount { get; set; }
 
-    public int MethodId { get; set; }
-
     public string? PaymentProvider { get; set; }
 
     public string? ReferenceNo { get; set; }
@@ -46,8 +44,6 @@ public partial class Voucher
     public virtual JournalEntry? Entry { get; set; }
 
     public virtual Location Location { get; set; } = null!;
-
-    public virtual PaymentMethod Method { get; set; } = null!;
 
     public virtual Party? PartyUser { get; set; }
 

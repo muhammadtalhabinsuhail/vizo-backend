@@ -60,12 +60,13 @@ public class DocumentsController : ApiControllerBase
 
     /// <summary>
     /// Journal entries, and payment or journal vouchers, are the Super Admin's
-    /// alone (the owner, 22 Oct) -- the same rule the accounting API applies,
-    /// so the PDF is not a side door to a page the screen hides.
+    /// and the accountant's (the owner, 22 Oct, widened to the accountant on
+    /// 27 Oct) -- the same rule the accounting API applies, so the PDF is not a
+    /// side door to a page the screen hides.
     /// </summary>
     private async Task<bool> OwnerOnlyDocument(string kind, int id)
     {
-        if (CurrentRole() == "super-admin") return false;
+        if (CurrentRole() is "super-admin" or "accountant") return false;
         var k = kind.ToLowerInvariant();
         if (k == "journal-entry") return true;
         if (k != "voucher") return false;
@@ -88,7 +89,7 @@ public class DocumentsController : ApiControllerBase
             if (MoneyKindForOrderDesk(kind))
                 return StatusCode(403, new { message = "The Order Department does not see money documents." });
             if (await OwnerOnlyDocument(kind, id))
-                return StatusCode(403, new { message = "That document is the Super Admin's." });
+                return StatusCode(403, new { message = "That document is for the Super Admin and the accountant." });
 
             var doc = await DocumentBuilder.BuildAsync(_db, kind, id);
             if (doc is null) return NotFound(new { message = $"No {kind.Replace('-', ' ')} with id {id}." });
@@ -120,7 +121,7 @@ public class DocumentsController : ApiControllerBase
             if (MoneyKindForOrderDesk(kind))
                 return StatusCode(403, new { message = "The Order Department does not see money documents." });
             if (await OwnerOnlyDocument(kind, id))
-                return StatusCode(403, new { message = "That document is the Super Admin's." });
+                return StatusCode(403, new { message = "That document is for the Super Admin and the accountant." });
 
             var key = id.ToString();
 
@@ -172,7 +173,7 @@ public class DocumentsController : ApiControllerBase
             if (MoneyKindForOrderDesk(kind))
                 return StatusCode(403, new { message = "The Order Department does not see money documents." });
             if (await OwnerOnlyDocument(kind, id))
-                return StatusCode(403, new { message = "That document is the Super Admin's." });
+                return StatusCode(403, new { message = "That document is for the Super Admin and the accountant." });
 
             var file = await DocumentArchive.EnsureAsync(_db, _cfg, _logger, kind, id, CurrentUserId());
 
@@ -206,7 +207,7 @@ public class DocumentsController : ApiControllerBase
             if (MoneyKindForOrderDesk(kind))
                 return StatusCode(403, new { message = "The Order Department does not see money documents." });
             if (await OwnerOnlyDocument(kind, id))
-                return StatusCode(403, new { message = "That document is the Super Admin's." });
+                return StatusCode(403, new { message = "That document is for the Super Admin and the accountant." });
 
             var row = await DocumentArchive.FindAsync(_db, kind, id.ToString());
             return row is null

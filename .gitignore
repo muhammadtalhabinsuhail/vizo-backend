@@ -3,6 +3,6 @@ bin/
 obj/
 *.user
 .vs/
-
+appsettings.json
 # Local overrides only. appsettings.json itself IS committed, with its values.
 appsettings.Development.json

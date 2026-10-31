@@ -304,7 +304,7 @@ public class CustomerLedgerController : ApiControllerBase
             {
                 entryId = v.EntryId!.Value, v.VoucherId, v.VoucherNo,
                 account = v.CashBankAccount != null ? v.CashBankAccount.AccountName : null,
-                method = v.Method.MethodName
+                type = v.VoucherType.TypeName
             })
             .ToListAsync();
 
@@ -360,7 +360,7 @@ public class CustomerLedgerController : ApiControllerBase
             else if (vch is not null)
             {
                 kind = "receipt"; docId = vch.VoucherId;
-                particulars = $"{vch.VoucherNo} · {vch.account ?? vch.method}";
+                particulars = $"{vch.VoucherNo} · {vch.account ?? vch.type}";
             }
             else if (hand.Count > 0 || l.typeKey == "JOURNAL")
             {

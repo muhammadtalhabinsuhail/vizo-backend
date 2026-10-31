@@ -81,6 +81,9 @@ builder.Services.AddSignalR();
 /* Chases the Super Admin every six hours about orders still sitting at
    SUBMITTED. See Services/ConfirmReminderService.cs. */
 builder.Services.AddHostedService<vizo_backend.Services.ConfirmReminderService>();
+/* A rep holding collected money that accounts has not confirmed is reminded to
+   hand it in. See Services/CollectionReminderService.cs. */
+builder.Services.AddHostedService<vizo_backend.Services.CollectionReminderService>();
 
 /* ─────────────────────────── Controllers ───────────────────────── */
 builder.Services.AddControllers()
@@ -119,6 +122,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
            and only for the hub paths -- a token in a query string is a token in
            the server log, and that is a trade worth making for one endpoint
            rather than for the whole API. */
+
         options.Events = new JwtBearerEvents
         {
             OnMessageReceived = context =>
@@ -132,6 +136,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                 return Task.CompletedTask;
             }
         };
+
     });
 
 /* ───────────────────────── Authorization ───────────────────────── */

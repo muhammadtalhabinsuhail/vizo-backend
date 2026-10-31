@@ -55,6 +55,10 @@ public static class NotificationKinds
     public const string VoucherPosted      = "VOUCHER_POSTED";
     public const string VoucherCancelled   = "VOUCHER_CANCELLED";
     public const string CollectionConfirmed = "COLLECTION_CONFIRMED";
+    /// <summary>A salesperson filed a payment collection (the owner, 1 Nov).</summary>
+    public const string CollectionRecorded = "COLLECTION_RECORDED";
+    /// <summary>A rep still holds collected money nobody has confirmed.</summary>
+    public const string CollectionReminder = "COLLECTION_REMINDER";
     /// <summary>
     /// "Send Reminders" on AR Aging (27 Sep, round E): each salesperson is told
     /// which of his customers are overdue, by how much and how late; the Super
@@ -118,6 +122,8 @@ public static class NotificationKinds
         new(VoucherPosted,      "Money",  "Payment received",     "A receipt or payment was posted to the ledger."),
         new(VoucherCancelled,   "Money",  "Payment cancelled",    "A posted receipt or payment was cancelled -- the invoice is owing again.", Severe: true),
         new(CollectionConfirmed,"Money",  "Collection confirmed", "Money a rep collected has been confirmed by accounts."),
+        new(CollectionRecorded, "Money",  "Payment collected",    "A salesperson collected a payment from a customer -- waiting for accounts to confirm it."),
+        new(CollectionReminder, "Money",  "Hand in a collection", "You still hold money you collected that accounts has not confirmed."),
         new(PaymentReminder,    "Money",  "Payment reminder",     "Customers who are overdue, with how much and how many days late -- sent from AR Aging."),
 
         new(InvoiceRaised,      "Invoices", "Invoice raised",     "An invoice was generated for an order."),

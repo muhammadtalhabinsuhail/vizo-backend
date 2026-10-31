@@ -631,6 +631,13 @@ public class SalesController : ApiControllerBase
             return "Pick a valid location.";
         if (!await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId))
             return "Pick a valid payment method.";
+        /* A REP'S ORDER IS ON CREDIT (the owner, 1 Nov). Meezan and Faysal are
+           the business's own bank accounts, not a way a customer pays an
+           order; how the customer actually paid is said on the payment
+           collection, when the money is taken. */
+        if (CurrentRole() == OrderWorkflow.RoleSales &&
+            !await _db.PaymentMethods.AnyAsync(m => m.MethodId == body.MethodId && m.MethodKey == "CREDIT"))
+            return "A salesperson's order is always on credit. The payment is recorded on Payment Collection.";
 
         /* One read for every product on the order, instead of one per line: the
            existence check below and the margin check both need it. */
@@ -1910,37 +1917,62 @@ public class SalesController : ApiControllerBase
                     or OrderWorkflow.Invoiced or OrderWorkflow.AtOrderDept
                 && current.StatusKey is not (OrderWorkflow.Confirmed or OrderWorkflow.Invoiced
                     or OrderWorkflow.AtOrderDept or OrderWorkflow.Dispatched or OrderWorkflow.Delivered);
+            /* ─────────── CONFIRMING PICKS THE PLACE IT GOES OUT OF ───────────
+
+               The owner, 1 Nov: whoever confirms -- the accountant or the Super
+               Admin -- says which place the order will be dispatched from
+               (Karachi Warehouse, Karachi Order Department, Shop 2: the open,
+               sellable places). The order keeps it as its LocationId, and the
+               order department later dispatches from there without being asked.
+               That place, not only the order department, must hold enough. */
+            Location? confirmFrom = null;
             if (confirming)
             {
-                var deptIds = (await StockAvailability.PlacesAsync(_db))
-                    .Where(p => p.Kind == StockAvailability.DepartmentKind).Select(p => p.Id).ToList();
+                if (body.LocationId is null)
+                    return BadRequest(new
+                    {
+                        message = $"Say which place {order.OrderNo} will be dispatched from before confirming it.",
+                        needsLocation = true
+                    });
+                confirmFrom = await _db.Locations.FirstOrDefaultAsync(l => l.LocationId == body.LocationId);
+                if (confirmFrom is null || !confirmFrom.IsActive)
+                    return BadRequest(new { message = "Pick a place that is still open." });
+                if (confirmFrom.ExcludeFromSellable)
+                    return BadRequest(new
+                    {
+                        message = $"{confirmFrom.LocationName} holds goods that are not for sale. " +
+                                  "Pick a warehouse, an order department or a shop."
+                    });
+
                 var wantLines = await _db.SalesOrderItems.AsNoTracking()
                     .Where(l => l.OrderId == id)
                     .GroupBy(l => new { l.ProductId, l.Product.ProductName })
                     .Select(g => new { g.Key.ProductId, g.Key.ProductName, Qty = g.Sum(l => l.Quantity) })
                     .ToListAsync();
-                var atDept = await StockAvailability.OnHandAsync(
-                    _db, wantLines.Select(l => l.ProductId).ToList(), deptIds);
+                var atPlace = await StockAvailability.OnHandAsync(
+                    _db, wantLines.Select(l => l.ProductId).ToList(), new List<int> { confirmFrom.LocationId });
 
-                var deptShort = wantLines
+                var placeShort = wantLines
                     .Select(l => new
                     {
                         name = l.ProductName,
                         needed = l.Qty,
-                        onHand = deptIds.Sum(d => atDept.GetValueOrDefault((l.ProductId, d)))
+                        onHand = atPlace.GetValueOrDefault((l.ProductId, confirmFrom.LocationId))
                     })
                     .Where(x => x.onHand < x.needed)
                     .Select(x => new { x.name, x.needed, x.onHand, shortBy = x.needed - x.onHand, sku = (string?)null })
                     .ToList();
 
-                if (deptShort.Count > 0)
+                if (placeShort.Count > 0)
                     return BadRequest(new
                     {
-                        message = $"The order department does not have enough of {deptShort.Count} " +
-                                  $"{(deptShort.Count == 1 ? "item" : "items")} for {order.OrderNo}. " +
-                                  "Move the stock there first, then confirm.",
-                        shortages = deptShort
+                        message = $"{confirmFrom.LocationName} does not have enough of {placeShort.Count} " +
+                                  $"{(placeShort.Count == 1 ? "item" : "items")} for {order.OrderNo}. " +
+                                  "Pick another place, or move the stock there first.",
+                        shortages = placeShort
                     });
+
+                order.LocationId = confirmFrom.LocationId;
             }
 
             /* ─────────── OFF THE CHAIN, OUT OF THE LEDGER ───────────────
@@ -2004,15 +2036,16 @@ public class SalesController : ApiControllerBase
                         message = "Only the order department, the accountant or the Super Admin can dispatch an order."
                     });
 
-                if (body.LocationId is null)
-                    return BadRequest(new
-                    {
-                        message = "Say which place this order is going out of before dispatching it.",
-                        needsLocation = true
-                    });
+                /* The place was chosen when the order was confirmed and is the
+                   order's LocationId (the owner, 1 Nov). The order department
+                   is never asked and cannot send it from anywhere else; the
+                   Super Admin and the accountant may still name another. */
+                var fromId = role == OrderWorkflow.RoleOrderDept
+                    ? order.LocationId
+                    : body.LocationId ?? order.LocationId;
 
                 dispatchFrom = await _db.Locations
-                    .FirstOrDefaultAsync(l => l.LocationId == body.LocationId);
+                    .FirstOrDefaultAsync(l => l.LocationId == fromId);
 
                 if (dispatchFrom is null || !dispatchFrom.IsActive)
                     return BadRequest(new { message = "Pick a place that is still open." });

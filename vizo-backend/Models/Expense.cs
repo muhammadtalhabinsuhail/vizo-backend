@@ -21,8 +21,6 @@ public partial class Expense
 
     public decimal Amount { get; set; }
 
-    public string VendorName { get; set; } = null!;
-
     public string? Description { get; set; }
 
     public int StatusId { get; set; }

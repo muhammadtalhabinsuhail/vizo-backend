@@ -822,7 +822,6 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.CategoryName).HasMaxLength(80);
             entity.Property(e => e.Description).HasMaxLength(500);
             entity.Property(e => e.ExpenseNo).HasMaxLength(20);
-            entity.Property(e => e.VendorName).HasMaxLength(150);
 
             entity.HasOne(d => d.CreatedByUser).WithMany(p => p.Expenses)
                 .HasForeignKey(d => d.CreatedByUserId)

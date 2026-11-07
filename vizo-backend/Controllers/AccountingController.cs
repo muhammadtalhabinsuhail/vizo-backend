@@ -613,7 +613,10 @@ public partial class AccountingController : ApiControllerBase
                     date = v.VoucherDate,
                     location = v.Location.LocationName,
                     partyId = v.PartyUserId,
-                    partyName = v.PartyUser != null ? (v.PartyUser.DisplayName ?? v.PartyUser.LegalName) : null,
+                    staffId = v.StaffId,
+                    /* A member of staff in place of a party (database/49). */
+                    partyName = v.PartyUser != null ? (v.PartyUser.DisplayName ?? v.PartyUser.LegalName)
+                        : v.StaffId != null ? _db.StaffMembers.Where(st => st.StaffId == v.StaffId).Select(st => st.FullName).FirstOrDefault() : null,
                     cashBankAccount = v.CashBankAccount != null ? v.CashBankAccount.AccountName : null,
                     amount = v.Amount,
                     paymentProvider = v.PaymentProvider,
@@ -668,7 +671,9 @@ public partial class AccountingController : ApiControllerBase
                     locationId = x.LocationId,
                     location = x.Location.LocationName,
                     partyId = x.PartyUserId,
-                    partyName = x.PartyUser != null ? (x.PartyUser.DisplayName ?? x.PartyUser.LegalName) : null,
+                    staffId = x.StaffId,
+                    partyName = x.PartyUser != null ? (x.PartyUser.DisplayName ?? x.PartyUser.LegalName)
+                        : x.StaffId != null ? _db.StaffMembers.Where(st => st.StaffId == x.StaffId).Select(st => st.FullName).FirstOrDefault() : null,
                     cashBankAccountId = x.CashBankAccountId,
                     cashBankAccount = x.CashBankAccount != null ? x.CashBankAccount.AccountName : null,
                     amount = x.Amount,
@@ -901,7 +906,7 @@ public partial class AccountingController : ApiControllerBase
             {
                 var term = q.Trim().ToLower();
                 rows = rows.Where(e => e.ExpenseNo.ToLower().Contains(term) ||
-                                       e.VendorName.ToLower().Contains(term) ||
+                                       (e.Description ?? "").ToLower().Contains(term) ||
                                        e.CategoryName.ToLower().Contains(term));
             }
 
@@ -917,7 +922,6 @@ public partial class AccountingController : ApiControllerBase
                     expenseAccount = e.ExpenseAccount.AccountName,
                     paidFromAccount = e.PaidFromAccount.AccountName,
                     amount = e.Amount,
-                    vendorName = e.VendorName,
                     description = e.Description,
                     status = e.Status.StatusKey,
                     statusName = e.Status.StatusName,
@@ -982,7 +986,6 @@ public partial class AccountingController : ApiControllerBase
                     paidFromAccountId = x.PaidFromAccountId,
                     paidFromAccount = x.PaidFromAccount.AccountName,
                     amount = x.Amount,
-                    vendorName = x.VendorName,
                     description = x.Description,
                     status = x.Status.StatusKey,
                     statusName = x.Status.StatusName,
@@ -1744,6 +1747,12 @@ public partial class AccountingController : ApiControllerBase
                         type = p.User.RoleId == 6 ? "SUPPLIER"
                              : p.User.RoleId == 7 ? "BOTH" : "CUSTOMER"
                     })
+                    .ToListAsync(),
+                /* Staff accounts on a voucher (the owner, 8 Nov): money in from,
+                   or out to, a member of staff -- posted on 2140 for them. */
+                staff = await _db.StaffMembers.AsNoTracking()
+                    .Where(s => s.IsActive).OrderBy(s => s.FullName)
+                    .Select(s => new { id = s.StaffId, code = s.StaffCode, name = s.FullName })
                     .ToListAsync()
             });
         }
@@ -1766,7 +1775,7 @@ public partial class AccountingController : ApiControllerBase
     public record ExpenseRequest(
         DateOnly? ExpenseDate, int LocationId, string? CategoryName,
         int ExpenseAccountId, int PaidFromAccountId, decimal Amount,
-        string VendorName, string? Description);
+        string? Description);
 
     // ══════════════════════════════════════════════════════════════════
     //  CREATE  --  voucher
@@ -1911,6 +1920,10 @@ public partial class AccountingController : ApiControllerBase
                says cash or bank and CashBankAccountId says which account. */
             if (body.PartyId is not null && !await _db.Parties.AnyAsync(p => p.UserId == body.PartyId))
                 return BadRequest(new { message = "Pick a valid party." });
+            if (body.StaffId is not null && body.PartyId is not null)
+                return BadRequest(new { message = "Pick a party or a member of staff, not both." });
+            if (body.StaffId is not null && !await _db.StaffMembers.AnyAsync(s => s.StaffId == body.StaffId))
+                return BadRequest(new { message = "Pick a valid member of staff." });
             if (body.CashBankAccountId is not null &&
                 !await _db.Accounts.AnyAsync(a => a.AccountId == body.CashBankAccountId && !a.IsGroup))
                 return BadRequest(new { message = "Pick a valid cash or bank account." });
@@ -1936,6 +1949,7 @@ public partial class AccountingController : ApiControllerBase
                 VoucherDate = body.VoucherDate ?? Today(),
                 LocationId = body.LocationId,
                 PartyUserId = body.PartyId,
+                StaffId = body.StaffId,
                 CashBankAccountId = body.CashBankAccountId,
                 Amount = body.Amount,
                 PaymentProvider = body.PaymentProvider,
@@ -2093,7 +2107,7 @@ public partial class AccountingController : ApiControllerBase
                 new XlsxWriter.Column("Expense No", "expenseNo", XlsxWriter.CellKind.Text, 16),
                 new XlsxWriter.Column("Date", "expenseDate", XlsxWriter.CellKind.Date),
                 new XlsxWriter.Column("Category", "categoryName", XlsxWriter.CellKind.Text, 20),
-                new XlsxWriter.Column("Vendor", "vendorName", XlsxWriter.CellKind.Text, 28),
+                new XlsxWriter.Column("Description", "description", XlsxWriter.CellKind.Text, 32),
                 new XlsxWriter.Column("Location", "location", XlsxWriter.CellKind.Text, 18),
                 new XlsxWriter.Column("Expense Account", "expenseAccount", XlsxWriter.CellKind.Text, 26),
                 new XlsxWriter.Column("Paid From", "paidFromAccount", XlsxWriter.CellKind.Text, 22),
@@ -2205,7 +2219,7 @@ public partial class AccountingController : ApiControllerBase
         int? CashBankAccountId, decimal Amount,
         string? PaymentProvider, string? Reference, string? WalletTxnId,
         string? Narration, bool PostImmediately,
-        List<VoucherAllocationRequest>? Allocations);
+        List<VoucherAllocationRequest>? Allocations, int? StaffId = null);
 
     // ══════════════════════════════════════════════════════════════════
     //  STATEMENT PDFs
@@ -2681,17 +2695,16 @@ public partial class AccountingController : ApiControllerBase
             e.ExpenseAccountId = body.ExpenseAccountId;
             e.PaidFromAccountId = body.PaidFromAccountId;
             e.Amount = body.Amount;
-            e.VendorName = body.VendorName.Trim();
             e.Description = body.Description?.Trim();
 
             await _db.SaveChangesAsync();
-            await Log("EXPENSE_UPDATED", "Expense", e.ExpenseNo, $"{e.Amount:N2} to {e.VendorName}", 2);
+            await Log("EXPENSE_UPDATED", "Expense", e.ExpenseNo, $"{e.Amount:N2} -- {e.CategoryName}", 2);
 
             await _push.NotifyRolesAsync(
                 new[] { "super-admin" },
                 NotificationKinds.ExpenseCreated,
                 $"Expense edited by {CurrentUserName()}",
-                $"{e.ExpenseNo} -- PKR {e.Amount:N0} to {e.VendorName}.",
+                $"{e.ExpenseNo} -- PKR {e.Amount:N0} on {e.CategoryName}.",
                 url: $"/accounting/expenses/{e.ExpenseId}",
                 exceptUserId: CurrentUserId());
 
@@ -2725,13 +2738,13 @@ public partial class AccountingController : ApiControllerBase
             var no = e.ExpenseNo;
             _db.Expenses.Remove(e);
             await _db.SaveChangesAsync();
-            await Log("EXPENSE_DELETED", "Expense", no, $"{e.Amount:N2} to {e.VendorName}", 3);
+            await Log("EXPENSE_DELETED", "Expense", no, $"{e.Amount:N2} -- {e.CategoryName}", 3);
 
             await _push.NotifyRolesAsync(
                 new[] { "super-admin" },
                 NotificationKinds.ExpenseReversed,
                 $"Expense deleted by {CurrentUserName()}",
-                $"{no} -- PKR {e.Amount:N0} to {e.VendorName} was removed.",
+                $"{no} -- PKR {e.Amount:N0} on {e.CategoryName} was removed.",
                 url: "/accounting/expenses",
                 severe: true,
                 exceptUserId: CurrentUserId());
@@ -2803,7 +2816,7 @@ public partial class AccountingController : ApiControllerBase
                 NotificationKinds.ExpenseDecided,
                 $"Expense {(key == "POSTED" ? "approved" : "rejected")} by {CurrentUserName()}",
                 key == "POSTED"
-                    ? $"{e.ExpenseNo} -- PKR {e.Amount:N0} to {e.VendorName}, posted to the ledger."
+                    ? $"{e.ExpenseNo} -- PKR {e.Amount:N0} on {e.CategoryName}, posted to the ledger."
                     : $"{e.ExpenseNo} was rejected." +
                       (string.IsNullOrWhiteSpace(body.Reason) ? "" : $" Reason: {body.Reason!.Trim()}"),
                 url: $"/accounting/expenses/{e.ExpenseId}",
@@ -2850,7 +2863,7 @@ public partial class AccountingController : ApiControllerBase
             PeriodId = period.PeriodId,
             LocationId = e.LocationId,
             ReferenceNo = e.ExpenseNo,
-            Narration = $"{e.CategoryName} -- {e.VendorName}",
+            Narration = string.IsNullOrWhiteSpace(e.Description) ? e.CategoryName : $"{e.CategoryName} -- {e.Description}",
             StatusId = posted.StatusId,
             CreatedByUserId = CurrentUserId(),
             PostedByUserId = CurrentUserId(),
@@ -2863,13 +2876,13 @@ public partial class AccountingController : ApiControllerBase
             new JournalEntryLine
             {
                 EntryId = entry.EntryId, LineNo = 1, AccountId = e.ExpenseAccountId,
-                Description = string.IsNullOrWhiteSpace(e.Description) ? e.VendorName : e.Description,
+                Description = string.IsNullOrWhiteSpace(e.Description) ? e.CategoryName : e.Description,
                 DebitAmount = e.Amount, CreditAmount = 0m
             },
             new JournalEntryLine
             {
                 EntryId = entry.EntryId, LineNo = 2, AccountId = e.PaidFromAccountId,
-                Description = $"Paid to {e.VendorName}",
+                Description = $"Paid -- {e.CategoryName}",
                 DebitAmount = 0m, CreditAmount = e.Amount
             });
         await _db.SaveChangesAsync();
@@ -3011,7 +3024,6 @@ public partial class AccountingController : ApiControllerBase
     private async Task<string?> ValidateExpense(ExpenseRequest body)
     {
         if (body.Amount <= 0) return "An expense needs an amount above zero.";
-        if (string.IsNullOrWhiteSpace(body.VendorName)) return "Who was paid?";
         if (!await _db.Locations.AnyAsync(l => l.LocationId == body.LocationId))
             return "Pick a valid location.";
         /* Not merely "a real account" -- the RIGHT KIND of account. Nothing
@@ -3379,6 +3391,7 @@ public partial class AccountingController : ApiControllerBase
             v.VoucherDate = body.VoucherDate ?? v.VoucherDate;
             v.LocationId = body.LocationId;
             v.PartyUserId = body.PartyId;
+            v.StaffId = body.StaffId;
             v.CashBankAccountId = body.CashBankAccountId;
             v.Amount = body.Amount;
             v.PaymentProvider = body.PaymentProvider;
@@ -3638,12 +3651,13 @@ public partial class AccountingController : ApiControllerBase
         if (v.CashBankAccountId is null)
             return $"{v.VoucherNo} has no cash or bank account, so it cannot be posted.";
 
-        /* The control account the party owes through, or is owed through. */
-        var controlCode = type.IsReceipt ? "1130" : "2101";
+        /* The control account the party owes through, or is owed through --
+           2140 Staff Payables for a member of staff (database/49). */
+        var controlCode = v.StaffId is not null ? LedgerPosting.StaffPayablesCode : type.IsReceipt ? "1130" : "2101";
         var control = await _db.Accounts.AsNoTracking()
             .FirstOrDefaultAsync(a => a.AccountCode == controlCode && !a.IsGroup);
         if (control is null)
-            return $"Account {controlCode} ({(type.IsReceipt ? "Accounts Receivable" : "Accounts Payable")}) is not in the chart of accounts.";
+            return $"Account {controlCode} is not in the chart of accounts.";
 
         var period = await _db.FiscalPeriods
             .FirstOrDefaultAsync(fp => fp.StartDate <= v.VoucherDate && fp.EndDate >= v.VoucherDate);
@@ -3686,7 +3700,7 @@ public partial class AccountingController : ApiControllerBase
                 new JournalEntryLine
                 {
                     EntryId = entry.EntryId, LineNo = 2, AccountId = control.AccountId,
-                    PartyUserId = v.PartyUserId,
+                    PartyUserId = v.PartyUserId, StaffId = v.StaffId,
                     Description = $"Settled by {v.VoucherNo}",
                     DebitAmount = 0m, CreditAmount = v.Amount
                 });
@@ -3697,7 +3711,7 @@ public partial class AccountingController : ApiControllerBase
                 new JournalEntryLine
                 {
                     EntryId = entry.EntryId, LineNo = 1, AccountId = control.AccountId,
-                    PartyUserId = v.PartyUserId,
+                    PartyUserId = v.PartyUserId, StaffId = v.StaffId,
                     Description = $"Settled by {v.VoucherNo}",
                     DebitAmount = v.Amount, CreditAmount = 0m
                 },
@@ -3730,6 +3744,10 @@ public partial class AccountingController : ApiControllerBase
             return "Pick a valid location.";
         if (body.PartyId is not null && !await _db.Parties.AnyAsync(p => p.UserId == body.PartyId))
             return "Pick a valid party.";
+        if (body.StaffId is not null && body.PartyId is not null)
+            return "Pick a party or a member of staff, not both.";
+        if (body.StaffId is not null && !await _db.StaffMembers.AnyAsync(s => s.StaffId == body.StaffId))
+            return "Pick a valid member of staff.";
         if (body.CashBankAccountId is not null
             && !await _db.Accounts.AnyAsync(a => a.AccountId == body.CashBankAccountId && !a.IsGroup))
             return "Pick a valid cash or bank account.";

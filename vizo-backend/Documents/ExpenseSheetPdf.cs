@@ -53,18 +53,18 @@ public static class ExpenseSheetPdf
     private const double Floor = 74;
 
     /* Column edges for the line table: left edges for text, the right edge for
-       the amount. Measured once against a 20-line sheet of real heads and
-       vendors rather than weighted, because the amount column must never be
-       the one that gets squeezed. */
+       the amount. Measured once against a 20-line sheet of real heads rather
+       than weighted, because the amount column must never be the one that
+       gets squeezed. No vendor column since 8 Nov -- the description takes
+       its room. */
     private const double ColNo = 53;         // centred
     private const double ColHead = 66;
-    private const double ColDesc = 180;
-    private const double ColVendor = 318;
-    private const double ColPaid = 410;
+    private const double ColDesc = 196;
+    private const double ColPaid = 390;
     private const double ColAmount = Right - 6;   // right
 
     public sealed record Line(
-        int No, string Head, string HeadCode, string? Description, string Vendor,
+        int No, string Head, string HeadCode, string? Description,
         string PaidFrom, decimal Amount,
         /* A pre-sheet line that was reversed on its own: printed for the record
            and left out of every total. */
@@ -113,10 +113,20 @@ public static class ExpenseSheetPdf
                 reversedBy = x.ReversedByUser != null ? x.ReversedByUser.FullName : null,
                 lines = x.Lines.OrderBy(l => l.ExpenseId).Select(l => new
                 {
-                    head = l.ExpenseAccount.AccountName,
+                    /* The customer, supplier or member of staff, when one was
+                       picked, rather than the control account they sit on. */
+                    head = l.ExpensePartyId != null
+                        ? db.Parties.Where(p => p.UserId == l.ExpensePartyId).Select(p => p.DisplayName ?? p.LegalName).FirstOrDefault()
+                        : l.ExpenseStaffId != null
+                            ? db.StaffMembers.Where(st => st.StaffId == l.ExpenseStaffId).Select(st => st.FullName).FirstOrDefault()
+                            : l.ExpenseAccount.AccountName,
                     code = l.ExpenseAccount.AccountCode,
-                    l.Description, l.VendorName, l.Amount,
-                    paidFrom = l.PaidFromAccount.AccountName,
+                    l.Description, l.Amount,
+                    paidFrom = l.PaidFromPartyId != null
+                        ? db.Parties.Where(p => p.UserId == l.PaidFromPartyId).Select(p => p.DisplayName ?? p.LegalName).FirstOrDefault()
+                        : l.PaidFromStaffId != null
+                            ? db.StaffMembers.Where(st => st.StaffId == l.PaidFromStaffId).Select(st => st.FullName).FirstOrDefault()
+                            : l.PaidFromAccount.AccountName,
                     status = l.Status.StatusKey,
                     entryNo = l.Entry != null ? l.Entry.EntryNo : null
                 }).ToList()
@@ -149,7 +159,7 @@ public static class ExpenseSheetPdf
             s.createdBy, s.CreatedAt, s.approvedBy, s.ApprovedAt,
             s.reversedBy, s.ReversedAt, s.ReversalReason, s.Notes,
             s.lines.Select(l => new Line(
-                ++n, l.head, l.code, l.Description, l.VendorName, l.paidFrom, l.Amount,
+                ++n, l.head ?? "", l.code, l.Description, l.paidFrom ?? "", l.Amount,
                 Excluded: s.status != "REVERSED" && l.status is "REVERSED" or "REJECTED" or "CANCELLED"))
                 .ToList());
 
@@ -416,7 +426,6 @@ public static class ExpenseSheetPdf
         pdf.TextCenter(ColNo, ty, "#", 7.5, White, bold: true);
         pdf.Text(ColHead, ty, "EXPENSE HEAD", 7.5, White, bold: true);
         pdf.Text(ColDesc, ty, "DESCRIPTION", 7.5, White, bold: true);
-        pdf.Text(ColVendor, ty, "VENDOR", 7.5, White, bold: true);
         pdf.Text(ColPaid, ty, "PAID FROM", 7.5, White, bold: true);
         pdf.TextRight(ColAmount, ty, "AMOUNT", 7.5, White, bold: true);
         return y - headHeight;
@@ -437,9 +446,8 @@ public static class ExpenseSheetPdf
         pdf.Text(ColHead, sub, l.HeadCode, 6.8, Faint);
 
         var desc = string.IsNullOrWhiteSpace(l.Description) ? "-" : l.Description!.Replace('\n', ' ');
-        pdf.Text(ColDesc, bottom + 10, pdf.Ellipsis(desc, 8.2, ColVendor - ColDesc - 8), 8.2, ink);
+        pdf.Text(ColDesc, bottom + 10, pdf.Ellipsis(desc, 8.2, ColPaid - ColDesc - 8), 8.2, ink);
 
-        pdf.Text(ColVendor, bottom + 10, pdf.Ellipsis(l.Vendor, 8.2, ColPaid - ColVendor - 8), 8.2, ink);
 
         pdf.Text(ColPaid, top, pdf.Ellipsis(l.PaidFrom, 8, ColAmount - 58 - ColPaid), 8, ink);
         if (l.Excluded) pdf.Text(ColPaid, sub, "reversed on its own", 6.8, Danger);

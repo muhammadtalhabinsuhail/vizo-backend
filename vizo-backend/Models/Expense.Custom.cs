@@ -24,10 +24,12 @@ public partial class Expense
     [ForeignKey(nameof(SheetId))]
     public virtual ExpenseSheet? Sheet { get; set; }
 
-    /// <summary>
-    /// The vendor account (under 2170 Expense Vendors) this expense was paid
-    /// to, if one was picked (database/48). Approval posts the bill and the
-    /// payment through it, so the vendor's ledger shows both.
-    /// </summary>
-    public int? VendorAccountId { get; set; }
+    /* WHO, ON A CONTROL ACCOUNT (database/49, the owner, 8 Nov). The head and
+       the paid-from side may be any account -- including a customer or a
+       supplier (on 1130 / 2101, carried as PartyUserId) or a member of staff
+       (on 2140, carried as StaffId). Null for an ordinary account. */
+    public int? ExpensePartyId { get; set; }
+    public int? ExpenseStaffId { get; set; }
+    public int? PaidFromPartyId { get; set; }
+    public int? PaidFromStaffId { get; set; }
 }

@@ -723,7 +723,8 @@ public static class DocumentBuilder
                 isReceipt = x.VoucherType.IsReceipt,
                 status = x.Status.StatusName,
                 location = x.Location.LocationName,
-                party = x.PartyUser != null ? (x.PartyUser.DisplayName ?? x.PartyUser.LegalName) : null,
+                party = x.PartyUser != null ? (x.PartyUser.DisplayName ?? x.PartyUser.LegalName)
+                    : x.StaffId != null ? db.StaffMembers.Where(st => st.StaffId == x.StaffId).Select(st => st.FullName).FirstOrDefault() : null,
                 partyCode = x.PartyUser != null ? x.PartyUser.PartyCode : null,
                 partyCity = x.PartyUser != null ? x.PartyUser.City.CityName : null,
                 account = x.CashBankAccount != null ? x.CashBankAccount.AccountName : null,
@@ -869,7 +870,7 @@ public static class DocumentBuilder
             .Where(e => e.ExpenseId == id)
             .Select(e => new
             {
-                e.ExpenseNo, e.ExpenseDate, e.CategoryName, e.Amount, e.VendorName, e.Description,
+                e.ExpenseNo, e.ExpenseDate, e.CategoryName, e.Amount, e.Description,
                 status = e.Status.StatusName,
                 location = e.Location.LocationName,
                 expenseAccount = e.ExpenseAccount.AccountName,
@@ -888,7 +889,7 @@ public static class DocumentBuilder
             Title: "Expense Voucher",
             DocNo: x.ExpenseNo,
             StatusName: x.status,
-            Counterparty: new DocumentPdf.Party("Paid To", x.VendorName,
+            Counterparty: new DocumentPdf.Party("Expense", x.CategoryName,
                 Lines(x.CategoryName, x.location)),
             Meta: new[]
             {

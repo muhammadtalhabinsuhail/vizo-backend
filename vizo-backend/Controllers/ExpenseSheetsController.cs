@@ -98,12 +98,10 @@ public class ExpenseSheetsController : ApiControllerBase
             }
             if (!string.IsNullOrWhiteSpace(q))
             {
-                /* A sheet number, or anything on one of its lines -- "who did
-                   we pay K-Electric through last month" is a vendor search. */
+                /* A sheet number, or anything on one of its lines. */
                 var term = q.Trim().ToLower();
                 rows = rows.Where(s => s.SheetNo.ToLower().Contains(term)
-                    || s.Lines.Any(l => l.VendorName.ToLower().Contains(term)
-                                     || (l.Description ?? "").ToLower().Contains(term)
+                    || s.Lines.Any(l => (l.Description ?? "").ToLower().Contains(term)
                                      || l.CategoryName.ToLower().Contains(term)));
             }
 
@@ -174,38 +172,30 @@ public class ExpenseSheetsController : ApiControllerBase
     /// <summary>
     /// The dropdowns for the grid: expense heads, the cash and bank accounts
     /// money can be paid from (each with the payment method it implies), the
-    /// methods, the places this person may open a sheet for, and the vendors
-    /// already on file so the vendor cell can suggest them.
+    /// methods and the places this person may open a sheet for.
     /// </summary>
     [HttpGet("lookups")]
     public async Task<IActionResult> Lookups()
     {
         try
         {
-            /* A head that is somebody's salary account says whose (the owner,
-               1 Nov): an expense booked to it lands on their staff ledger. */
-            var heads = await _db.Accounts.AsNoTracking()
-                .Where(a => a.IsActive && !a.IsGroup && a.AccountType.Group.GroupName == "Expenses")
-                .OrderBy(a => a.AccountCode)
-                .Select(a => new
-                {
-                    id = a.AccountId, code = a.AccountCode, name = a.AccountName,
-                    staffName = _db.StaffMembers.Where(s => s.SalaryAccountId == a.AccountId).Select(s => s.FullName).FirstOrDefault()
-                })
-                .ToListAsync();
-
-            var vendorAccounts = await VendorAccountsQuery()
-                .OrderBy(a => a.AccountName)
-                .Select(a => new { id = a.AccountId, code = a.AccountCode, name = a.AccountName })
-                .ToListAsync();
-
-            /* No payment method on an expense (the owner, 27 Oct): the
-               paid-from account already says cash or which bank. */
-            var paidFrom = await _db.Accounts.AsNoTracking()
-                .Where(a => a.IsActive && !a.IsGroup && a.AccountType.TypeName == "Cash & Bank")
-                .OrderBy(a => a.AccountCode)
-                .Select(a => new { id = a.AccountId, code = a.AccountCode, name = a.AccountName })
-                .ToListAsync();
+            /* EVERY ACCOUNT, GROUPED (the owner, 8 Nov): the head and the
+               paid-from side may be any account, a customer, a supplier or a
+               member of staff -- expenses are booked against customers too.
+               Paid-from leads with Cash on Hand, Meezan and Faysal; the head
+               list with the Expenses group. A head that is somebody's salary
+               account says whose: that line lands on their staff ledger. */
+            var salaryOwners = await _db.StaffMembers.AsNoTracking()
+                .Where(s => s.SalaryAccountId != null)
+                .ToDictionaryAsync(s => s.SalaryAccountId!.Value, s => s.FullName);
+            object Shape(AccountOptions.Option o) => new
+            {
+                key = o.Key, label = o.Label, group = o.Group, accountId = o.AccountId,
+                partyId = o.PartyId, staffId = o.StaffId, hint = o.Hint,
+                staffName = o.PartyId is null && o.StaffId is null ? salaryOwners.GetValueOrDefault(o.AccountId) : null
+            };
+            var heads = (await AccountOptions.AllAsync(_db, expensesFirst: true)).Select(Shape).ToList();
+            var paidFrom = (await AccountOptions.AllAsync(_db, expensesFirst: false)).Select(Shape).ToList();
 
             var (allowed, defaultLocationId) = await AllowedLocationsAsync();
             var locations = await _db.Locations.AsNoTracking()
@@ -214,18 +204,9 @@ public class ExpenseSheetsController : ApiControllerBase
                 .Select(l => new { id = l.LocationId, name = l.LocationName })
                 .ToListAsync();
 
-            /* The names typed before, most used first, so "K-Electric" is typed
-               once and picked every month after. */
-            var vendors = await _db.Expenses.AsNoTracking()
-                .GroupBy(e => e.VendorName)
-                .OrderByDescending(g => g.Count()).ThenBy(g => g.Key)
-                .Select(g => g.Key)
-                .Take(300)
-                .ToListAsync();
-
             return Ok(new
             {
-                heads, paidFrom, locations, defaultLocationId, vendors, vendorAccounts,
+                heads, paidFrom, locations, defaultLocationId,
                 today = Today(),
                 canApprove = CanApprove()
             });
@@ -352,14 +333,24 @@ public class ExpenseSheetsController : ApiControllerBase
                         id = l.ExpenseId,
                         expenseNo = l.ExpenseNo,
                         expenseAccountId = l.ExpenseAccountId,
-                        vendorAccountId = l.VendorAccountId,
-                        head = l.ExpenseAccount.AccountName,
+                        expensePartyId = l.ExpensePartyId,
+                        expenseStaffId = l.ExpenseStaffId,
+                        head = l.ExpensePartyId != null
+                            ? _db.Parties.Where(p => p.UserId == l.ExpensePartyId).Select(p => p.DisplayName ?? p.LegalName).FirstOrDefault()
+                            : l.ExpenseStaffId != null
+                                ? _db.StaffMembers.Where(st => st.StaffId == l.ExpenseStaffId).Select(st => st.FullName).FirstOrDefault()
+                                : l.ExpenseAccount.AccountName,
                         headCode = l.ExpenseAccount.AccountCode,
                         categoryName = l.CategoryName,
                         description = l.Description,
-                        vendorName = l.VendorName,
                         paidFromAccountId = l.PaidFromAccountId,
-                        paidFrom = l.PaidFromAccount.AccountName,
+                        paidFromPartyId = l.PaidFromPartyId,
+                        paidFromStaffId = l.PaidFromStaffId,
+                        paidFrom = l.PaidFromPartyId != null
+                            ? _db.Parties.Where(p => p.UserId == l.PaidFromPartyId).Select(p => p.DisplayName ?? p.LegalName).FirstOrDefault()
+                            : l.PaidFromStaffId != null
+                                ? _db.StaffMembers.Where(st => st.StaffId == l.PaidFromStaffId).Select(st => st.FullName).FirstOrDefault()
+                                : l.PaidFromAccount.AccountName,
                         amount = l.Amount,
                         status = l.Status.StatusKey,
                         entryId = l.EntryId,
@@ -379,8 +370,8 @@ public class ExpenseSheetsController : ApiControllerBase
                 var locked = l.status != Draft || l.entryId is not null;
                 return new
                 {
-                    l.id, l.expenseNo, l.expenseAccountId, l.head, l.headCode, l.categoryName,
-                    l.description, l.vendorName, l.paidFromAccountId, l.paidFrom,
+                    l.id, l.expenseNo, l.expenseAccountId, l.expensePartyId, l.expenseStaffId, l.head, l.headCode, l.categoryName,
+                    l.description, l.paidFromAccountId, l.paidFromPartyId, l.paidFromStaffId, l.paidFrom,
                     l.amount, l.status, l.entryId, l.entryNo, l.createdBy,
                     locked, excluded
                 };
@@ -476,14 +467,13 @@ public class ExpenseSheetsController : ApiControllerBase
             if (body?.Notes is { Length: > 500 })
                 return BadRequest(new { message = "The note is longer than 500 characters." });
 
-            var heads = await _db.Accounts.AsNoTracking()
-                .Where(a => !a.IsGroup && a.AccountType.Group.GroupName == "Expenses")
-                .ToDictionaryAsync(a => a.AccountId, a => a.AccountName);
-            var paidFrom = await _db.Accounts.AsNoTracking()
-                .Where(a => !a.IsGroup && a.AccountType.TypeName == "Cash & Bank")
-                .ToDictionaryAsync(a => a.AccountId, a => a.AccountName);
-            var vendorAccounts = await VendorAccountsQuery()
-                .ToDictionaryAsync(a => a.AccountId, a => a.AccountName);
+            /* Any account, customer, supplier or member of staff, on either
+               side (the owner, 8 Nov) -- the same list the pickers offer. */
+            var options = (await AccountOptions.AllAsync(_db, expensesFirst: false)).ToDictionary(o => o.Key);
+            static string KeyOf(int accountId, int? partyId, int? staffId) =>
+                partyId is int p ? $"p:{p}" : staffId is int s ? $"s:{s}" : $"a:{accountId}";
+            bool Known(int accountId, int? partyId, int? staffId) =>
+                options.TryGetValue(KeyOf(accountId, partyId, staffId), out var o) && o.AccountId == accountId;
 
             var byId = sheet.Lines.ToDictionary(l => l.ExpenseId);
             var errors = new List<LineError>();
@@ -496,16 +486,13 @@ public class ExpenseSheetsController : ApiControllerBase
 
                 if (r.Id is > 0 && !byId.ContainsKey(r.Id.Value))
                     Bad("row", "This line is not on this sheet any more. Reload the sheet.");
-                if (!heads.ContainsKey(r.ExpenseAccountId))
+                if (!Known(r.ExpenseAccountId, r.ExpensePartyId, r.ExpenseStaffId))
                     Bad("expenseAccountId", "Pick an expense head.");
-                if (!paidFrom.ContainsKey(r.PaidFromAccountId))
-                    Bad("paidFromAccountId", "Pick the cash or bank account it was paid from.");
-                if (r.VendorAccountId is int va && !vendorAccounts.ContainsKey(va))
-                    Bad("vendorName", "That vendor account is not open any more. Pick another.");
-                else if (string.IsNullOrWhiteSpace(r.VendorName) && r.VendorAccountId is null)
-                    Bad("vendorName", "Who was paid?");
-                else if ((r.VendorName ?? "").Trim().Length > 150)
-                    Bad("vendorName", "Keep the vendor under 150 characters.");
+                if (!Known(r.PaidFromAccountId, r.PaidFromPartyId, r.PaidFromStaffId))
+                    Bad("paidFromAccountId", "Pick the account it was paid from.");
+                else if (KeyOf(r.ExpenseAccountId, r.ExpensePartyId, r.ExpenseStaffId)
+                         == KeyOf(r.PaidFromAccountId, r.PaidFromPartyId, r.PaidFromStaffId))
+                    Bad("paidFromAccountId", "It cannot be paid from the same account it is booked to.");
                 if (r.Description is { Length: > 500 })
                     Bad("description", "Keep the description under 500 characters.");
                 if (r.Amount <= 0)
@@ -563,7 +550,7 @@ public class ExpenseSheetsController : ApiControllerBase
                     _db.Expenses.Add(line);
                 }
 
-                var head = heads[r.ExpenseAccountId];
+                var head = options[KeyOf(r.ExpenseAccountId, r.ExpensePartyId, r.ExpenseStaffId)].Label;
                 line.ExpenseDate = sheet.SheetDate;
                 line.LocationId = sheet.LocationId;
                 line.ExpenseAccountId = r.ExpenseAccountId;
@@ -571,13 +558,12 @@ public class ExpenseSheetsController : ApiControllerBase
                    own name now, rather than a second word typed by hand that
                    drifted from it ("Utilities (KE)" booked to Rent). */
                 line.CategoryName = head.Length > 80 ? head[..80] : head;
+                line.ExpensePartyId = r.ExpensePartyId;
+                line.ExpenseStaffId = r.ExpenseStaffId;
                 line.PaidFromAccountId = r.PaidFromAccountId;
+                line.PaidFromPartyId = r.PaidFromPartyId;
+                line.PaidFromStaffId = r.PaidFromStaffId;
                 line.Amount = Math.Round(r.Amount, 2, MidpointRounding.AwayFromZero);
-                /* A vendor account, when picked, names the vendor (the owner, 1 Nov). */
-                line.VendorAccountId = r.VendorAccountId;
-                line.VendorName = r.VendorAccountId is int vid
-                    ? vendorAccounts[vid]
-                    : r.VendorName!.Trim();
                 line.Description = string.IsNullOrWhiteSpace(r.Description) ? null : r.Description.Trim();
             }
 
@@ -681,9 +667,11 @@ public class ExpenseSheetsController : ApiControllerBase
                     })
                     .ToListAsync())
                 .ToDictionary(a => a.AccountId);
+            /* Any postable account on either side since 8 Nov -- not a group
+               heading, which takes no postings. */
             var wrong = toPost.Select((l, i) => (l, i))
-                .Where(x => !kinds.TryGetValue(x.l.ExpenseAccountId, out var h) || h.IsGroup || h.group != "Expenses"
-                         || !kinds.TryGetValue(x.l.PaidFromAccountId, out var p) || p.IsGroup || p.type != "Cash & Bank")
+                .Where(x => !kinds.TryGetValue(x.l.ExpenseAccountId, out var h) || h.IsGroup
+                         || !kinds.TryGetValue(x.l.PaidFromAccountId, out var p) || p.IsGroup)
                 .Select(x => x.l.ExpenseNo)
                 .ToList();
             if (wrong.Count > 0)
@@ -729,10 +717,9 @@ public class ExpenseSheetsController : ApiControllerBase
             /* WHOSE MONEY IT WAS (the owner, 1 Nov). A head that is a member
                of staff's salary account goes through 2140 Staff Payables for
                them -- salary due, then paid -- so it lands on their staff
-               ledger. Otherwise a line paid to a vendor account goes through
-               that account -- the bill, then the payment -- so it lands on the
-               vendor's ledger. Either way the pair nets to nothing and the
-               day still credits each cash or bank account once, below. */
+               ledger. The pair nets to nothing and the day still credits each
+               paid-from account once, below. A customer, supplier or member of
+               staff picked directly rides on its line (PartyUserId / StaffId). */
             var heads = toPost.Select(l => l.ExpenseAccountId).Distinct().ToList();
             var staffByHead = await _db.StaffMembers.AsNoTracking()
                 .Where(s => s.SalaryAccountId != null && heads.Contains(s.SalaryAccountId.Value))
@@ -747,15 +734,17 @@ public class ExpenseSheetsController : ApiControllerBase
             foreach (var l in toPost)
             {
                 var what = Cut(string.IsNullOrWhiteSpace(l.Description)
-                    ? $"{l.VendorName} ({l.ExpenseNo})"
-                    : $"{l.VendorName} -- {l.Description} ({l.ExpenseNo})", 300);
+                    ? $"{l.CategoryName} ({l.ExpenseNo})"
+                    : $"{l.CategoryName} -- {l.Description} ({l.ExpenseNo})", 300);
                 _db.JournalEntryLines.Add(new JournalEntryLine
                 {
                     EntryId = entry.EntryId, LineNo = n++, AccountId = l.ExpenseAccountId,
+                    PartyUserId = l.ExpensePartyId, StaffId = l.ExpenseStaffId,
                     Description = what, DebitAmount = l.Amount, CreditAmount = 0m
                 });
 
-                if (staffByHead.TryGetValue(l.ExpenseAccountId, out var person))
+                if (l.ExpensePartyId is null && l.ExpenseStaffId is null
+                    && staffByHead.TryGetValue(l.ExpenseAccountId, out var person))
                 {
                     _db.JournalEntryLines.Add(new JournalEntryLine
                     {
@@ -768,29 +757,17 @@ public class ExpenseSheetsController : ApiControllerBase
                         Description = Cut($"Salary paid -- {what}", 300), DebitAmount = l.Amount, CreditAmount = 0m
                     });
                 }
-                else if (l.VendorAccountId is int vendor)
-                {
-                    _db.JournalEntryLines.Add(new JournalEntryLine
-                    {
-                        EntryId = entry.EntryId, LineNo = n++, AccountId = vendor,
-                        Description = Cut($"Bill -- {what}", 300), DebitAmount = 0m, CreditAmount = l.Amount
-                    });
-                    _db.JournalEntryLines.Add(new JournalEntryLine
-                    {
-                        EntryId = entry.EntryId, LineNo = n++, AccountId = vendor,
-                        Description = Cut($"Paid -- {what}", 300), DebitAmount = l.Amount, CreditAmount = 0m
-                    });
-                }
             }
 
             /* One credit per drawer or bank account, in code order: the cash
                book shows one payment-out for the day per account, which is what
                the cashier counts the drawer against. */
-            foreach (var g in toPost.GroupBy(l => l.PaidFromAccountId)
-                                    .OrderBy(g => accounts.TryGetValue(g.Key, out var a) ? a.AccountCode : ""))
+            foreach (var g in toPost.GroupBy(l => new { l.PaidFromAccountId, l.PaidFromPartyId, l.PaidFromStaffId })
+                                    .OrderBy(g => accounts.TryGetValue(g.Key.PaidFromAccountId, out var a) ? a.AccountCode : ""))
                 _db.JournalEntryLines.Add(new JournalEntryLine
                 {
-                    EntryId = entry.EntryId, LineNo = n++, AccountId = g.Key,
+                    EntryId = entry.EntryId, LineNo = n++, AccountId = g.Key.PaidFromAccountId,
+                    PartyUserId = g.Key.PaidFromPartyId, StaffId = g.Key.PaidFromStaffId,
                     Description = Cut($"Paid out on {sheet.SheetNo} -- {g.Count()} {(g.Count() == 1 ? "expense" : "expenses")}", 300),
                     DebitAmount = 0m, CreditAmount = g.Sum(l => l.Amount)
                 });
@@ -1052,8 +1029,10 @@ public class ExpenseSheetsController : ApiControllerBase
                     ExpenseAccountId = l.ExpenseAccountId,
                     PaidFromAccountId = l.PaidFromAccountId,
                     Amount = l.Amount,
-                    VendorName = l.VendorName,
-                    VendorAccountId = l.VendorAccountId,
+                    ExpensePartyId = l.ExpensePartyId,
+                    ExpenseStaffId = l.ExpenseStaffId,
+                    PaidFromPartyId = l.PaidFromPartyId,
+                    PaidFromStaffId = l.PaidFromStaffId,
                     Description = l.Description,
                     StatusId = draftId,
                     CreatedByUserId = CurrentUserId()
@@ -1177,47 +1156,15 @@ public class ExpenseSheetsController : ApiControllerBase
         return (allowed, preferred);
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  VENDOR ACCOUNTS
-    // ══════════════════════════════════════════════════════════════════
-
-    /// <summary>Open, postable accounts under 2170 Expense Vendors.</summary>
-    private IQueryable<Account> VendorAccountsQuery() =>
-        _db.Accounts.AsNoTracking()
-            .Where(a => a.IsActive && !a.IsGroup && a.ParentAccount != null
-                        && a.ParentAccount.AccountCode == LedgerPosting.ExpenseVendorsCode);
-
-    /// <summary>
-    /// Opens a vendor account ("XYZ Electric") under 2170 Expense Vendors,
-    /// straight from the expense sheet (the owner, 1 Nov). Its ledger then
-    /// shows every bill and payment booked to it.
-    /// </summary>
-    [HttpPost("vendors")]
-    public async Task<IActionResult> CreateVendor([FromBody] VendorRequest body)
-    {
-        try
-        {
-            var (acc, error) = await ChartAccounts.OpenUnderAsync(_db, LedgerPosting.ExpenseVendorsCode, body.Name ?? "");
-            if (acc is null) return BadRequest(new { message = error });
-            await Log("ACCOUNT_CREATED", "Account", acc.AccountCode, $"{acc.AccountName} (vendor)", 2);
-            return Ok(new { id = acc.AccountId, code = acc.AccountCode, name = acc.AccountName,
-                            message = $"{acc.AccountName} opened as vendor account {acc.AccountCode}." });
-        }
-        catch (Exception ex)
-        {
-            return Fail(ex, "open the vendor account");
-        }
-    }
-
-    public record VendorRequest(string? Name);
-
     // ══════════════════════════ request bodies ══════════════════════════
 
     public record SheetOpenRequest(DateOnly? Date, int? LocationId);
 
     public record SheetLineRequest(
-        int? Id, int ExpenseAccountId, string? Description, string? VendorName,
-        int PaidFromAccountId, decimal Amount, int? VendorAccountId = null);
+        int? Id, int ExpenseAccountId, string? Description,
+        int PaidFromAccountId, decimal Amount,
+        int? ExpensePartyId = null, int? ExpenseStaffId = null,
+        int? PaidFromPartyId = null, int? PaidFromStaffId = null);
 
     public record SheetSaveRequest(string? Notes, List<SheetLineRequest>? Lines);
 

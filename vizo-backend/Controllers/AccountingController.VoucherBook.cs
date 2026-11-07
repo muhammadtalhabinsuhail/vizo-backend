@@ -81,8 +81,10 @@ public partial class AccountingController
                 {
                     v.VoucherId, v.VoucherNo,
                     code = v.VoucherType.TypeCode, v.VoucherType.IsReceipt,
-                    party = v.PartyUser != null ? (v.PartyUser.DisplayName ?? v.PartyUser.LegalName) : null,
-                    partyCode = v.PartyUser != null ? v.PartyUser.PartyCode : null,
+                    party = v.PartyUser != null ? (v.PartyUser.DisplayName ?? v.PartyUser.LegalName)
+                        : v.StaffId != null ? _db.StaffMembers.Where(st => st.StaffId == v.StaffId).Select(st => st.FullName).FirstOrDefault() : null,
+                    partyCode = v.PartyUser != null ? v.PartyUser.PartyCode
+                        : v.StaffId != null ? _db.StaffMembers.Where(st => st.StaffId == v.StaffId).Select(st => st.StaffCode).FirstOrDefault() : null,
                     cash = v.CashBankAccount != null ? v.CashBankAccount.AccountCode + " " + v.CashBankAccount.AccountName : null,
                     v.Narration, v.Amount,
                     status = v.Status.StatusKey, statusName = v.Status.StatusName,
@@ -276,7 +278,7 @@ public partial class AccountingController
 
                 var req = new VoucherRequest(type.VoucherTypeId, body.Date, body.LocationId, r.PartyId,
                     r.CashBankAccountId, r.Amount, null, r.Reference, null,
-                    r.Particulars?.Trim(), body.Post, null);
+                    r.Particulars?.Trim(), body.Post, null, r.StaffId);
                 var invalid = await ValidateVoucher(req);
                 if (invalid is not null) return BadRequest(new { message = $"{at}: {invalid}", row = i });
 
@@ -287,6 +289,7 @@ public partial class AccountingController
                     VoucherDate = body.Date,
                     LocationId = body.LocationId,
                     PartyUserId = r.PartyId,
+                    StaffId = r.StaffId,
                     CashBankAccountId = r.CashBankAccountId,
                     Amount = r.Amount,
                     ReferenceNo = r.Reference,
@@ -364,7 +367,7 @@ public partial class AccountingController
         string? CreatedBy, string Url);
 
     public record VoucherBookRow(
-        string Code, int? PartyId, int? CashBankAccountId,
+        string Code, int? PartyId, int? CashBankAccountId, int? StaffId,
         int? DebitAccountId, int? DebitPartyId, int? CreditAccountId, int? CreditPartyId,
         decimal Amount, string? Particulars, string? Reference);
 
